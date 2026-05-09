@@ -5,10 +5,12 @@ import traceback
 import re
 from typing import Any, List, Optional, Tuple
 
-from fastapi import Depends
+from fastapi import Depends, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
 from app import schemas
+from app.api.endpoints.search import _stream_search_events
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
@@ -17,7 +19,7 @@ from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo
-from app.core.security import verify_token
+from app.core.security import verify_resource_token, verify_token
 from app.db import async_db_query, db_query
 from app.db.models.subscribe import Subscribe
 from app.db.models.subscribehistory import SubscribeHistory
@@ -34,7 +36,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -45,6 +47,10 @@ class sourceprioritysubscribe(_PluginBase):
     _original_media_routes: list[Any] = []
     _original_media_route_index: Optional[int] = None
     _plugin_route_registered = False
+    _original_search_routes: dict[str, list[Any]] = {}
+    _original_search_route_indexes: dict[str, int] = {}
+    _original_search_endpoints: dict[str, Any] = {}
+    _plugin_search_route_registered = False
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -160,6 +166,7 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeHistory.exists = classmethod(db_query(_patched_model_exists))
         SubscribeHistory.async_exists = classmethod(async_db_query(_patched_model_async_exists))
         cls._patch_media_seasons_route()
+        cls._patch_search_routes()
         cls._patched = True
         logger.info("订阅外部源优先插件已启用")
 
@@ -183,6 +190,7 @@ class sourceprioritysubscribe(_PluginBase):
         Subscribe.async_exists = cls._originals["model_async_exists"]
         SubscribeHistory.exists = cls._originals["history_exists"]
         SubscribeHistory.async_exists = cls._originals["history_async_exists"]
+        cls._restore_search_routes()
         cls._restore_media_seasons_route()
         cls._originals = {}
         cls._patched = False
@@ -246,6 +254,78 @@ class sourceprioritysubscribe(_PluginBase):
             if getattr(route, "path", None) == detail_path:
                 return min(insert_at, index)
         return insert_at
+
+    @classmethod
+    def _search_route_defs(cls) -> dict[str, dict[str, Any]]:
+        return {
+            f"{settings.API_V1_STR}/search/media/{{mediaid}}": {
+                "endpoint": _patched_search_by_id,
+                "response_model": schemas.Response,
+                "summary": "精确搜索资源",
+                "tags": ["search"],
+            },
+            f"{settings.API_V1_STR}/search/media/{{mediaid}}/stream": {
+                "endpoint": _patched_search_by_id_stream,
+                "response_model": None,
+                "summary": "渐进式精确搜索资源",
+                "tags": ["search"],
+            },
+        }
+
+    @classmethod
+    def _patch_search_routes(cls):
+        if cls._plugin_search_route_registered:
+            return
+        route_defs = cls._search_route_defs()
+        remaining_routes = []
+        cls._original_search_routes = {path: [] for path in route_defs}
+        cls._original_search_route_indexes = {}
+        cls._original_search_endpoints = {}
+        for route in app.routes:
+            path = getattr(route, "path", None)
+            if path in route_defs and "GET" in getattr(route, "methods", set()):
+                if path not in cls._original_search_route_indexes:
+                    cls._original_search_route_indexes[path] = len(remaining_routes)
+                    cls._original_search_endpoints[path] = getattr(route, "endpoint", None)
+                cls._original_search_routes[path].append(route)
+                continue
+            remaining_routes.append(route)
+        app.routes[:] = remaining_routes
+        route_count = len(app.routes)
+        for path, route_def in route_defs.items():
+            app.add_api_route(
+                path,
+                route_def["endpoint"],
+                methods=["GET"],
+                response_model=route_def["response_model"],
+                summary=route_def["summary"],
+                tags=route_def["tags"],
+            )
+        new_routes = app.routes[route_count:]
+        del app.routes[route_count:]
+        for route in new_routes:
+            insert_at = cls._original_search_route_indexes.get(getattr(route, "path", None), len(app.routes))
+            app.routes.insert(min(insert_at, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._plugin_search_route_registered = True
+
+    @classmethod
+    def _restore_search_routes(cls):
+        if not cls._plugin_search_route_registered:
+            return
+        endpoints = {_patched_search_by_id, _patched_search_by_id_stream}
+        app.routes[:] = [
+            route for route in app.routes
+            if getattr(route, "endpoint", None) not in endpoints
+        ]
+        for path, index in sorted(cls._original_search_route_indexes.items(), key=lambda item: item[1]):
+            for offset, route in enumerate(cls._original_search_routes.get(path) or []):
+                app.routes.insert(min(index + offset, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._original_search_routes = {}
+        cls._original_search_route_indexes = {}
+        cls._original_search_endpoints = {}
+        cls._plugin_search_route_registered = False
 
 
 _SOURCE_SUBSCRIBE_CACHE = {
@@ -476,6 +556,118 @@ async def _patched_search_async_process_stream(self: SearchChain, mediainfo: Med
     mediainfo = await _async_ensure_bangumi_search_media(self, mediainfo)
     async for event in sourceprioritysubscribe._originals["search_async_process_stream"](self, mediainfo, *args, **kwargs):
         yield event
+
+
+def _parse_site_list(sites: Optional[str]) -> Optional[List[int]]:
+    return [int(site) for site in sites.split(",") if site] if sites else None
+
+
+def _parse_media_type(mtype: Optional[str]) -> Optional[MediaType]:
+    return MediaType(mtype) if mtype else None
+
+
+def _parse_media_season(season: Optional[str]) -> Optional[int]:
+    return int(season) if season else None
+
+
+def _search_no_exists_for_season(media_season: Optional[int]) -> Optional[dict]:
+    if media_season is None:
+        return None
+    # 原搜索链只用 tmdbid/doubanid 作缺失信息 key；Bangumi-only 用 None 才能复用季过滤。
+    return {
+        None: {
+            media_season: schemas.NotExistMediaInfo(episodes=[])
+        }
+    }
+
+
+async def _bangumi_search_media(search_chain: SearchChain, mediaid: str, mtype: Optional[str],
+                                season: Optional[str]) -> tuple[Optional[MediaInfo], Optional[int], Optional[str]]:
+    bangumiid_text = mediaid.replace("bangumi:", "", 1)
+    if not bangumiid_text.isdigit():
+        return None, None, "BangumiID无效"
+    media_type = _parse_media_type(mtype)
+    media_season = _parse_media_season(season)
+    mediainfo = await _async_media_from_bangumi(search_chain, int(bangumiid_text))
+    if not mediainfo:
+        return None, media_season, "未识别到Bangumi媒体信息"
+    if media_type:
+        mediainfo.type = media_type
+    if media_season is not None:
+        mediainfo.season = media_season
+    logger.info(f"订阅外部源优先插件使用Bangumi详情搜索：{bangumiid_text}")
+    return mediainfo, media_season, None
+
+
+async def _patched_search_by_id(mediaid: str,
+                                mtype: Optional[str] = None,
+                                area: Optional[str] = "title",
+                                title: Optional[str] = None,
+                                year: Optional[str] = None,
+                                season: Optional[str] = None,
+                                sites: Optional[str] = None,
+                                _: schemas.TokenPayload = Depends(verify_token)) -> Any:
+    path = f"{settings.API_V1_STR}/search/media/{{mediaid}}"
+    if not mediaid.startswith("bangumi:"):
+        original = sourceprioritysubscribe._original_search_endpoints.get(path)
+        return await original(mediaid=mediaid, mtype=mtype, area=area, title=title, year=year, season=season,
+                              sites=sites, _=_)
+
+    search_chain = SearchChain()
+    mediainfo, media_season, error = await _bangumi_search_media(search_chain, mediaid, mtype, season)
+    if error:
+        return schemas.Response(success=False, message=error)
+    contexts = await search_chain.async_process(
+        mediainfo=mediainfo,
+        sites=_parse_site_list(sites),
+        area=area,
+        no_exists=_search_no_exists_for_season(media_season),
+    )
+    await search_chain.async_save_cache(contexts, "__search_result__")
+    if not contexts:
+        return schemas.Response(success=False, message="未搜索到任何资源")
+    return schemas.Response(success=True, data=[context.to_dict() for context in contexts])
+
+
+async def _patched_search_by_id_stream(request: Request,
+                                       mediaid: str,
+                                       mtype: Optional[str] = None,
+                                       area: Optional[str] = "title",
+                                       title: Optional[str] = None,
+                                       year: Optional[str] = None,
+                                       season: Optional[str] = None,
+                                       sites: Optional[str] = None,
+                                       _: schemas.TokenPayload = Depends(verify_resource_token)) -> Any:
+    path = f"{settings.API_V1_STR}/search/media/{{mediaid}}/stream"
+    if not mediaid.startswith("bangumi:"):
+        original = sourceprioritysubscribe._original_search_endpoints.get(path)
+        return await original(request=request, mediaid=mediaid, mtype=mtype, area=area, title=title, year=year,
+                              season=season, sites=sites, _=_)
+
+    async def event_source():
+        search_chain = SearchChain()
+        mediainfo, media_season, error = await _bangumi_search_media(search_chain, mediaid, mtype, season)
+        if error:
+            yield {"type": "error", "success": False, "message": error}
+            return
+
+        contexts = []
+        async for event in search_chain.async_process_stream(
+                mediainfo=mediainfo,
+                sites=_parse_site_list(sites),
+                area=area,
+                no_exists=_search_no_exists_for_season(media_season)):
+            if event.get("type") == "done":
+                contexts = event.get("contexts") or []
+                event = {
+                    key: value
+                    for key, value in event.items()
+                    if key != "contexts"
+                }
+            yield event
+        await search_chain.async_save_cache(contexts, "__search_result__")
+
+    return StreamingResponse(_stream_search_events(request, event_source()), media_type="text/event-stream")
 
 
 def _explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
