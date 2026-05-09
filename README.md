@@ -4,7 +4,7 @@
 
 ## 插件列表
 
-- `SourcePrioritySubscribe`：订阅时优先使用 `doubanid` / `bangumiid` 对应详情，避免全部强制转换到 TMDB。
+- `sourceprioritysubscribe`：订阅时优先使用 `doubanid` / `bangumiid` 对应详情，避免全部强制转换到 TMDB。
 
 ## MoviePilot 接入方式
 
@@ -14,7 +14,7 @@
 PLUGIN_LOCAL_REPO_PATHS=/path/to/moviepilot-plugins
 ```
 
-配置后重启 MoviePilot，在插件市场中安装并启用 `SourcePrioritySubscribe`。
+配置后重启 MoviePilot，在插件市场中安装并启用 `sourceprioritysubscribe`。
 
 ## 目录结构
 
