@@ -26,7 +26,7 @@ from app.schemas.types import ContentType, EventType, NotificationType
 from app.helper.subscribe import SubscribeHelper
 
 
-class sourceprioritysubscribe(_PluginBase):
+class SourcePrioritySubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
@@ -165,6 +165,10 @@ class sourceprioritysubscribe(_PluginBase):
         cls._plugin_route_registered = False
 
 
+# MoviePilot 使用类名作为插件运行 ID；市场 ID 保持小写以兼容已发布索引。
+SourcePrioritySubscribe.__name__ = "sourceprioritysubscribe"
+
+
 def _explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
                            mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
@@ -266,7 +270,7 @@ def _patched_subscribe_add(self: SubscribeChain, title: str, year: str, mtype: M
                            message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                            **kwargs) -> Tuple[Optional[int], str]:
     if not doubanid and not bangumiid:
-        return sourceprioritysubscribe._originals["subscribe_add"](
+        return SourcePrioritySubscribe._originals["subscribe_add"](
             self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
             season, channel, source, userid, username, message, exist_ok, **kwargs
         )
@@ -306,7 +310,7 @@ async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: s
                                        message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                                        **kwargs) -> Tuple[Optional[int], str]:
     if not doubanid and not bangumiid:
-        return await sourceprioritysubscribe._originals["subscribe_async_add"](
+        return await SourcePrioritySubscribe._originals["subscribe_async_add"](
             self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
             season, channel, source, userid, username, message, exist_ok, **kwargs
         )
