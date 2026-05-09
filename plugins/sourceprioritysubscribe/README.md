@@ -8,4 +8,4 @@
 - `/api/v1/media/seasons` 支持 `douban:` / `bangumi:` 媒体 ID 的季信息。
 - 补充 Bangumi 订阅查重，避免同一个 Bangumi 条目重复订阅。
 
-启用方式：在插件页面安装并启用 `sourceprioritysubscribe`。
+启用方式：在插件页面安装并启用 `SourcePrioritySubscribe`。
