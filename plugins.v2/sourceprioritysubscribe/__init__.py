@@ -30,7 +30,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -39,6 +39,7 @@ class sourceprioritysubscribe(_PluginBase):
     _patched = False
     _originals: dict[str, Any] = {}
     _original_media_routes: list[Any] = []
+    _original_media_route_index: Optional[int] = None
     _plugin_route_registered = False
 
     def init_plugin(self, config: dict = None):
@@ -133,12 +134,17 @@ class sourceprioritysubscribe(_PluginBase):
             return
         remaining_routes = []
         cls._original_media_routes = []
+        cls._original_media_route_index = None
         for route in app.routes:
             if getattr(route, "path", None) == path and "GET" in getattr(route, "methods", set()):
+                if cls._original_media_route_index is None:
+                    cls._original_media_route_index = len(remaining_routes)
                 cls._original_media_routes.append(route)
                 continue
             remaining_routes.append(route)
         app.routes[:] = remaining_routes
+        insert_at = cls._original_media_route_index if cls._original_media_route_index is not None else len(app.routes)
+        route_count = len(app.routes)
         app.add_api_route(
             path,
             _patched_media_seasons,
@@ -147,6 +153,10 @@ class sourceprioritysubscribe(_PluginBase):
             summary="查询媒体季信息",
             tags=["media"],
         )
+        new_routes = app.routes[route_count:]
+        del app.routes[route_count:]
+        for offset, route in enumerate(new_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
         app.openapi_schema = None
         cls._plugin_route_registered = True
 
@@ -159,9 +169,12 @@ class sourceprioritysubscribe(_PluginBase):
             route for route in app.routes
             if not (getattr(route, "path", None) == path and getattr(route, "endpoint", None) is _patched_media_seasons)
         ]
-        app.routes.extend(cls._original_media_routes)
+        insert_at = cls._original_media_route_index if cls._original_media_route_index is not None else len(app.routes)
+        for offset, route in enumerate(cls._original_media_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
         app.openapi_schema = None
         cls._original_media_routes = []
+        cls._original_media_route_index = None
         cls._plugin_route_registered = False
 
 
