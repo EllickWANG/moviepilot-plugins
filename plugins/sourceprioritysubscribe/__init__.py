@@ -30,7 +30,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -143,7 +143,7 @@ class sourceprioritysubscribe(_PluginBase):
                 continue
             remaining_routes.append(route)
         app.routes[:] = remaining_routes
-        insert_at = cls._original_media_route_index if cls._original_media_route_index is not None else len(app.routes)
+        insert_at = cls._media_seasons_insert_index(app.routes)
         route_count = len(app.routes)
         app.add_api_route(
             path,
@@ -169,13 +169,22 @@ class sourceprioritysubscribe(_PluginBase):
             route for route in app.routes
             if not (getattr(route, "path", None) == path and getattr(route, "endpoint", None) is _patched_media_seasons)
         ]
-        insert_at = cls._original_media_route_index if cls._original_media_route_index is not None else len(app.routes)
+        insert_at = cls._media_seasons_insert_index(app.routes)
         for offset, route in enumerate(cls._original_media_routes):
             app.routes.insert(min(insert_at + offset, len(app.routes)), route)
         app.openapi_schema = None
         cls._original_media_routes = []
         cls._original_media_route_index = None
         cls._plugin_route_registered = False
+
+    @classmethod
+    def _media_seasons_insert_index(cls, routes: list[Any]) -> int:
+        insert_at = cls._original_media_route_index if cls._original_media_route_index is not None else len(routes)
+        detail_path = f"{settings.API_V1_STR}/media/{{mediaid}}"
+        for index, route in enumerate(routes):
+            if getattr(route, "path", None) == detail_path:
+                return min(insert_at, index)
+        return insert_at
 
 
 def _explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
