@@ -4,7 +4,7 @@
 
 ## 插件列表
 
-- `sourceprioritysubscribe`：订阅时优先使用 `doubanid` / `bangumiid` 对应详情，避免全部强制转换到 TMDB。
+- `SourcePrioritySubscribe`：订阅时优先使用 `doubanid` / `bangumiid` 对应详情，避免全部强制转换到 TMDB。
 
 ## MoviePilot 接入方式
 
