@@ -32,7 +32,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -65,9 +65,51 @@ class sourceprioritysubscribe(_PluginBase):
     def get_form(self) -> Tuple[Optional[List[dict]], dict]:
         return [
             {
-                "component": "VSwitch",
-                "model": "enabled",
-                "label": "启用",
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {
+                                    "cols": 12,
+                                    "md": 6,
+                                },
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "enabled",
+                                            "label": "启用插件",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {
+                                    "cols": 12,
+                                },
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "启用后，订阅携带 doubanid 或 bangumiid 时会优先使用对应来源详情，避免强制转换到 TMDB。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
             }
         ], {"enabled": True}
 
