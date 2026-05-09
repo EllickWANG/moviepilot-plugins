@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import traceback
 from typing import Any, List, Optional, Tuple
 
 from fastapi import Depends
@@ -15,6 +16,7 @@ from app.core.context import MediaInfo
 from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_token
+from app.db import async_db_query, db_query
 from app.db.models.subscribe import Subscribe
 from app.db.models.subscribehistory import SubscribeHistory
 from app.db.subscribe_oper import SubscribeOper
@@ -30,7 +32,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -99,10 +101,10 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeOper.async_add = _patched_oper_async_add
         SubscribeOper.exists = _patched_oper_exists
         SubscribeOper.exist_history = _patched_oper_exist_history
-        Subscribe.exists = classmethod(_patched_model_exists)
-        Subscribe.async_exists = classmethod(_patched_model_async_exists)
-        SubscribeHistory.exists = classmethod(_patched_model_exists)
-        SubscribeHistory.async_exists = classmethod(_patched_model_async_exists)
+        Subscribe.exists = classmethod(db_query(_patched_model_exists))
+        Subscribe.async_exists = classmethod(async_db_query(_patched_model_async_exists))
+        SubscribeHistory.exists = classmethod(db_query(_patched_model_exists))
+        SubscribeHistory.async_exists = classmethod(async_db_query(_patched_model_async_exists))
         cls._patch_media_seasons_route()
         cls._patched = True
         logger.info("订阅外部源优先插件已启用")
@@ -316,7 +318,7 @@ def _patched_subscribe_add(self: SubscribeChain, title: str, year: str, mtype: M
         kwargs.update(self._SubscribeChain__get_default_kwargs(mediainfo.type, **kwargs))
         return _create_subscription(self, mediainfo, metainfo, title, year, season, channel, source, userid, username, message, exist_ok, kwargs)
     except Exception as err:
-        logger.exception(f"订阅外部源优先插件添加订阅异常：{err}")
+        logger.error(f"订阅外部源优先插件添加订阅异常：{err}\n{traceback.format_exc()}")
         raise
 
 
@@ -361,7 +363,7 @@ async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: s
         kwargs.update(self._SubscribeChain__get_default_kwargs(mediainfo.type, **kwargs))
         return await _async_create_subscription(self, mediainfo, metainfo, title, year, season, channel, source, userid, username, message, exist_ok, kwargs)
     except Exception as err:
-        logger.exception(f"订阅外部源优先插件添加订阅异常：{err}")
+        logger.error(f"订阅外部源优先插件添加订阅异常：{err}\n{traceback.format_exc()}")
         raise
 
 
