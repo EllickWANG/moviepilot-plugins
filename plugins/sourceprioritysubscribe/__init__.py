@@ -36,7 +36,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -416,6 +416,44 @@ def _apply_subscribe_ids(mediainfo: Optional[MediaInfo], subscribe: Optional[Sub
     return mediainfo
 
 
+def _bangumi_tag_values(info: dict) -> list[str]:
+    values = []
+    for key in ("platform",):
+        value = info.get(key)
+        if value:
+            values.append(str(value))
+    for item in info.get("meta_tags") or []:
+        if item:
+            values.append(str(item))
+    for item in info.get("tags") or []:
+        if isinstance(item, dict):
+            name = item.get("name")
+            if name:
+                values.append(str(name))
+        elif item:
+            values.append(str(item))
+    return values
+
+
+def _has_any_marker(values: list[str], markers: tuple[str, ...]) -> bool:
+    text = "\n".join(values).lower()
+    return any(marker.lower() in text for marker in markers)
+
+
+def _infer_bangumi_media_category(mediainfo: MediaInfo) -> Optional[str]:
+    info = mediainfo.bangumi_info or {}
+    if info.get("type") != 2:
+        return None
+    if mediainfo.type == MediaType.MOVIE:
+        return "动画电影"
+    values = _bangumi_tag_values(info)
+    if _has_any_marker(values, ("中国", "大陆", "国产", "国漫", "中漫", "中国大陆", "台湾", "香港")):
+        return "国漫"
+    if _has_any_marker(values, ("日本", "日漫", "日番")):
+        return "日番"
+    return None
+
+
 def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaInfo]:
     if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
         return mediainfo
@@ -425,6 +463,8 @@ def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaI
             season = next(iter(mediainfo.seasons.keys()), None)
         if season is not None:
             mediainfo.season_years = {season: str(mediainfo.year)}
+    if not mediainfo.category:
+        mediainfo.category = _infer_bangumi_media_category(mediainfo) or mediainfo.category
     if not mediainfo.names:
         mediainfo.names = list(dict.fromkeys([
             item for item in [
@@ -1062,6 +1102,7 @@ def _subscribe_db_payload(mediainfo: MediaInfo, kwargs: dict) -> dict:
         "backdrop": mediainfo.get_backdrop_image(),
         "vote": mediainfo.vote_average,
         "description": mediainfo.overview,
+        "media_category": kwargs.get("media_category") or mediainfo.category,
         "search_imdbid": 1 if kwargs.get("search_imdbid") else 0,
         "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }

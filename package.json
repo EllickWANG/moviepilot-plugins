@@ -2,7 +2,7 @@
   "sourceprioritysubscribe": {
     "name": "订阅外部源优先",
     "description": "订阅时优先使用 doubanid/bangumiid 对应详情，避免全部强制转换到 TMDB。",
-    "version": "1.0.8",
+    "version": "1.0.9",
     "icon": "mdi-heart-cog",
     "author": "Ellick",
     "level": 1,
