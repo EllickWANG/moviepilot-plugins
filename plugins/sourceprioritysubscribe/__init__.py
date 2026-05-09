@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import traceback
+import re
 from typing import Any, List, Optional, Tuple
 
 from fastapi import Depends
@@ -9,6 +10,7 @@ from sqlalchemy import select
 
 from app import schemas
 from app.chain.media import MediaChain
+from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
 from app.chain.tmdb import TmdbChain
 from app.core.config import settings
@@ -32,7 +34,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -127,6 +129,11 @@ class sourceprioritysubscribe(_PluginBase):
             "subscribe_add": SubscribeChain.add,
             "subscribe_async_add": SubscribeChain.async_add,
             "subscribe_exists": SubscribeChain.__dict__["exists"],
+            "subscribe_recognize_media": SubscribeChain.recognize_media,
+            "subscribe_async_recognize_media": SubscribeChain.async_recognize_media,
+            "search_process": SearchChain.process,
+            "search_async_process": SearchChain.async_process,
+            "search_async_process_stream": SearchChain.async_process_stream,
             "oper_add": SubscribeOper.add,
             "oper_async_add": SubscribeOper.async_add,
             "oper_exists": SubscribeOper.exists,
@@ -139,6 +146,11 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeChain.add = _patched_subscribe_add
         SubscribeChain.async_add = _patched_subscribe_async_add
         SubscribeChain.exists = staticmethod(_patched_subscribe_exists)
+        SubscribeChain.recognize_media = _patched_subscribe_recognize_media
+        SubscribeChain.async_recognize_media = _patched_subscribe_async_recognize_media
+        SearchChain.process = _patched_search_process
+        SearchChain.async_process = _patched_search_async_process
+        SearchChain.async_process_stream = _patched_search_async_process_stream
         SubscribeOper.add = _patched_oper_add
         SubscribeOper.async_add = _patched_oper_async_add
         SubscribeOper.exists = _patched_oper_exists
@@ -158,6 +170,11 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeChain.add = cls._originals["subscribe_add"]
         SubscribeChain.async_add = cls._originals["subscribe_async_add"]
         SubscribeChain.exists = cls._originals["subscribe_exists"]
+        SubscribeChain.recognize_media = cls._originals["subscribe_recognize_media"]
+        SubscribeChain.async_recognize_media = cls._originals["subscribe_async_recognize_media"]
+        SearchChain.process = cls._originals["search_process"]
+        SearchChain.async_process = cls._originals["search_async_process"]
+        SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
         SubscribeOper.add = cls._originals["oper_add"]
         SubscribeOper.async_add = cls._originals["oper_async_add"]
         SubscribeOper.exists = cls._originals["oper_exists"]
@@ -231,21 +248,251 @@ class sourceprioritysubscribe(_PluginBase):
         return insert_at
 
 
+_SOURCE_SUBSCRIBE_CACHE = {
+    "time": 0.0,
+    "items": [],
+}
+
+
+def _clear_source_subscribe_cache():
+    _SOURCE_SUBSCRIBE_CACHE["time"] = 0.0
+    _SOURCE_SUBSCRIBE_CACHE["items"] = []
+
+
+def _type_value(value: Any) -> Optional[str]:
+    if isinstance(value, MediaType):
+        return value.value
+    return value
+
+
+def _normalize_match_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\W+", "", str(text).lower())
+
+
+def _title_candidates_from_meta(meta: Any) -> set[str]:
+    if not meta:
+        return set()
+    candidates = {
+        getattr(meta, "name", None),
+        getattr(meta, "title", None),
+        getattr(meta, "cn_name", None),
+        getattr(meta, "org_string", None),
+    }
+    return {_normalize_match_text(item) for item in candidates if _normalize_match_text(item)}
+
+
+def _title_candidates_from_subscribe(subscribe: Subscribe) -> set[str]:
+    candidates = {subscribe.name}
+    try:
+        sub_meta = MetaInfo(subscribe.name)
+        candidates.add(sub_meta.name)
+        candidates.add(sub_meta.title)
+    except Exception:
+        pass
+    return {_normalize_match_text(item) for item in candidates if _normalize_match_text(item)}
+
+
+def _source_only_subscribes() -> list[Subscribe]:
+    now = time.time()
+    if now - _SOURCE_SUBSCRIBE_CACHE["time"] < 10:
+        return _SOURCE_SUBSCRIBE_CACHE["items"]
+    subscribes = [
+        subscribe for subscribe in SubscribeOper().list()
+        if subscribe.bangumiid and not subscribe.tmdbid and not subscribe.doubanid
+    ]
+    _SOURCE_SUBSCRIBE_CACHE["time"] = now
+    _SOURCE_SUBSCRIBE_CACHE["items"] = subscribes
+    return subscribes
+
+
+def _match_subscribe_by_meta(meta: Any, mtype: Optional[MediaType]) -> Optional[Subscribe]:
+    meta_titles = _title_candidates_from_meta(meta)
+    if not meta_titles:
+        return None
+    meta_type = _type_value(mtype) or _type_value(getattr(meta, "type", None))
+    meta_season = getattr(meta, "begin_season", None)
+    for subscribe in _source_only_subscribes():
+        if meta_type and subscribe.type and meta_type != subscribe.type:
+            continue
+        if meta_season is not None and subscribe.season is not None and meta_season != subscribe.season:
+            continue
+        sub_titles = _title_candidates_from_subscribe(subscribe)
+        if meta_titles.intersection(sub_titles):
+            return subscribe
+        for meta_title in meta_titles:
+            if len(meta_title) >= 4 and any(meta_title in sub_title or sub_title in meta_title for sub_title in sub_titles):
+                return subscribe
+    return None
+
+
+def _apply_subscribe_ids(mediainfo: Optional[MediaInfo], subscribe: Optional[Subscribe]) -> Optional[MediaInfo]:
+    if not mediainfo or not subscribe:
+        return mediainfo
+    mediainfo.bangumi_id = subscribe.bangumiid or mediainfo.bangumi_id
+    mediainfo.douban_id = subscribe.doubanid or mediainfo.douban_id
+    mediainfo.tmdb_id = subscribe.tmdbid or mediainfo.tmdb_id
+    return mediainfo
+
+
+def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaInfo]:
+    if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
+        return mediainfo
+    if not mediainfo.names:
+        mediainfo.names = list(dict.fromkeys([
+            item for item in [
+                mediainfo.title,
+                mediainfo.original_title,
+                mediainfo.en_title,
+                mediainfo.hk_title,
+                mediainfo.tw_title,
+                mediainfo.sg_title,
+            ] if item
+        ]))
+    return mediainfo
+
+
+def _media_from_douban(chain: Any, doubanid: str, mtype: Optional[MediaType]) -> Optional[MediaInfo]:
+    info = chain.douban_info(doubanid=doubanid, mtype=mtype)
+    if not info:
+        return None
+    return MediaInfo(douban_info=info)
+
+
+async def _async_media_from_douban(chain: Any, doubanid: str, mtype: Optional[MediaType]) -> Optional[MediaInfo]:
+    info = await chain.async_douban_info(doubanid=doubanid, mtype=mtype)
+    if not info:
+        return None
+    return MediaInfo(douban_info=info)
+
+
+def _media_from_bangumi(chain: Any, bangumiid: int) -> Optional[MediaInfo]:
+    info = chain.bangumi_info(bangumiid=bangumiid)
+    if not info:
+        return None
+    return _mark_bangumi_media_ready(MediaInfo(bangumi_info=info))
+
+
+async def _async_media_from_bangumi(chain: Any, bangumiid: int) -> Optional[MediaInfo]:
+    info = await chain.async_bangumi_info(bangumiid=bangumiid)
+    if not info:
+        return None
+    return _mark_bangumi_media_ready(MediaInfo(bangumi_info=info))
+
+
+def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, mtype: Optional[MediaType] = None,
+                                       tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
+                                       bangumiid: Optional[int] = None, episode_group: Optional[str] = None,
+                                       cache: bool = True) -> Optional[MediaInfo]:
+    if not tmdbid and doubanid:
+        mediainfo = _media_from_douban(self, doubanid, mtype)
+        if mediainfo:
+            return mediainfo
+    if not tmdbid and not doubanid and bangumiid:
+        mediainfo = _media_from_bangumi(self, bangumiid)
+        if mediainfo:
+            return mediainfo
+    if not tmdbid and not doubanid and not bangumiid:
+        subscribe = _match_subscribe_by_meta(meta, mtype)
+        if subscribe:
+            mediainfo = _media_from_bangumi(self, subscribe.bangumiid)
+            if mediainfo:
+                return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+    return _mark_bangumi_media_ready(sourceprioritysubscribe._originals["subscribe_recognize_media"](
+        self,
+        meta=meta,
+        mtype=mtype,
+        tmdbid=tmdbid,
+        doubanid=doubanid,
+        bangumiid=bangumiid,
+        episode_group=episode_group,
+        cache=cache,
+    ))
+
+
+async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: Any = None,
+                                                   mtype: Optional[MediaType] = None,
+                                                   tmdbid: Optional[int] = None,
+                                                   doubanid: Optional[str] = None,
+                                                   bangumiid: Optional[int] = None,
+                                                   episode_group: Optional[str] = None,
+                                                   cache: bool = True) -> Optional[MediaInfo]:
+    if not tmdbid and doubanid:
+        mediainfo = await _async_media_from_douban(self, doubanid, mtype)
+        if mediainfo:
+            return mediainfo
+    if not tmdbid and not doubanid and bangumiid:
+        mediainfo = await _async_media_from_bangumi(self, bangumiid)
+        if mediainfo:
+            return mediainfo
+    if not tmdbid and not doubanid and not bangumiid:
+        subscribe = _match_subscribe_by_meta(meta, mtype)
+        if subscribe:
+            mediainfo = await _async_media_from_bangumi(self, subscribe.bangumiid)
+            if mediainfo:
+                return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+    return _mark_bangumi_media_ready(await sourceprioritysubscribe._originals["subscribe_async_recognize_media"](
+        self,
+        meta=meta,
+        mtype=mtype,
+        tmdbid=tmdbid,
+        doubanid=doubanid,
+        bangumiid=bangumiid,
+        episode_group=episode_group,
+        cache=cache,
+    ))
+
+
+def _ensure_bangumi_search_media(chain: SearchChain, mediainfo: MediaInfo) -> MediaInfo:
+    if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
+        return mediainfo
+    if mediainfo.names and mediainfo.seasons:
+        return mediainfo
+    refreshed = _media_from_bangumi(chain, mediainfo.bangumi_id)
+    return _mark_bangumi_media_ready(refreshed or mediainfo)
+
+
+async def _async_ensure_bangumi_search_media(chain: SearchChain, mediainfo: MediaInfo) -> MediaInfo:
+    if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
+        return mediainfo
+    if mediainfo.names and mediainfo.seasons:
+        return mediainfo
+    refreshed = await _async_media_from_bangumi(chain, mediainfo.bangumi_id)
+    return _mark_bangumi_media_ready(refreshed or mediainfo)
+
+
+def _patched_search_process(self: SearchChain, mediainfo: MediaInfo, *args, **kwargs):
+    mediainfo = _ensure_bangumi_search_media(self, mediainfo)
+    return sourceprioritysubscribe._originals["search_process"](self, mediainfo, *args, **kwargs)
+
+
+async def _patched_search_async_process(self: SearchChain, mediainfo: MediaInfo, *args, **kwargs):
+    mediainfo = await _async_ensure_bangumi_search_media(self, mediainfo)
+    return await sourceprioritysubscribe._originals["search_async_process"](self, mediainfo, *args, **kwargs)
+
+
+async def _patched_search_async_process_stream(self: SearchChain, mediainfo: MediaInfo, *args, **kwargs):
+    mediainfo = await _async_ensure_bangumi_search_media(self, mediainfo)
+    async for event in sourceprioritysubscribe._originals["search_async_process_stream"](self, mediainfo, *args, **kwargs):
+        yield event
+
+
 def _explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
                            mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
-        return chain.recognize_media(doubanid=doubanid, mtype=mtype, cache=False)
+        return _media_from_douban(chain, doubanid, mtype)
     if bangumiid:
-        return chain.recognize_media(bangumiid=bangumiid, mtype=mtype or MediaType.TV, cache=False)
+        return _media_from_bangumi(chain, bangumiid)
     return None
 
 
 async def _async_explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
                                        mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
-        return await chain.async_recognize_media(doubanid=doubanid, mtype=mtype, cache=False)
+        return await _async_media_from_douban(chain, doubanid, mtype)
     if bangumiid:
-        return await chain.async_recognize_media(bangumiid=bangumiid, mtype=mtype or MediaType.TV, cache=False)
+        return await _async_media_from_bangumi(chain, bangumiid)
     return None
 
 
@@ -450,6 +697,7 @@ def _create_subscription(chain: SubscribeChain, mediainfo: MediaInfo, metainfo: 
         "mediainfo": mediainfo.to_dict(),
     })
     SubscribeHelper().sub_reg_async(_subscribe_stat_payload(mediainfo, metainfo, title, year))
+    _clear_source_subscribe_cache()
     return sid, err_msg
 
 
@@ -494,6 +742,7 @@ async def _async_create_subscription(chain: SubscribeChain, mediainfo: MediaInfo
         "mediainfo": mediainfo.to_dict(),
     })
     await SubscribeHelper().async_sub_reg(_subscribe_stat_payload(mediainfo, metainfo, title, year))
+    _clear_source_subscribe_cache()
     return sid, err_msg
 
 
