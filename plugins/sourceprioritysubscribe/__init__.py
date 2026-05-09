@@ -30,7 +30,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -190,22 +190,18 @@ class sourceprioritysubscribe(_PluginBase):
 def _explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
                            mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
-        douban_info = chain.douban_info(doubanid=doubanid, mtype=mtype)
-        return MediaInfo(douban_info=douban_info) if douban_info else None
+        return chain.recognize_media(doubanid=doubanid, mtype=mtype, cache=False)
     if bangumiid:
-        bangumi_info = chain.bangumi_info(bangumiid=bangumiid)
-        return MediaInfo(bangumi_info=bangumi_info) if bangumi_info else None
+        return chain.recognize_media(bangumiid=bangumiid, mtype=mtype or MediaType.TV, cache=False)
     return None
 
 
 async def _async_explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
                                        mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
-        douban_info = await chain.async_douban_info(doubanid=doubanid, mtype=mtype)
-        return MediaInfo(douban_info=douban_info) if douban_info else None
+        return await chain.async_recognize_media(doubanid=doubanid, mtype=mtype, cache=False)
     if bangumiid:
-        bangumi_info = await chain.async_bangumi_info(bangumiid=bangumiid)
-        return MediaInfo(bangumi_info=bangumi_info) if bangumi_info else None
+        return await chain.async_recognize_media(bangumiid=bangumiid, mtype=mtype or MediaType.TV, cache=False)
     return None
 
 
@@ -287,36 +283,41 @@ def _patched_subscribe_add(self: SubscribeChain, title: str, year: str, mtype: M
                            userid: Optional[str] = None, username: Optional[str] = None,
                            message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                            **kwargs) -> Tuple[Optional[int], str]:
-    if not doubanid and not bangumiid:
-        return sourceprioritysubscribe._originals["subscribe_add"](
-            self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
-            season, channel, source, userid, username, message, exist_ok, **kwargs
-        )
-    logger.info(f"开始添加订阅，标题：{title} ...")
-    metainfo = MetaInfo(title)
-    if year:
-        metainfo.year = year
-    if mtype:
-        metainfo.type = mtype
-    if season is not None:
-        metainfo.type = MediaType.TV
-        metainfo.begin_season = season
+    try:
+        if not doubanid and not bangumiid:
+            return sourceprioritysubscribe._originals["subscribe_add"](
+                self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
+                season, channel, source, userid, username, message, exist_ok, **kwargs
+            )
+        logger.info(f"开始添加订阅，标题：{title} ...")
+        metainfo = MetaInfo(title)
+        if year:
+            metainfo.year = year
+        if mtype:
+            metainfo.type = mtype
+        if season is not None:
+            metainfo.type = MediaType.TV
+            metainfo.begin_season = season
 
-    mediainfo = _explicit_source_media(self, doubanid, bangumiid, mtype)
-    if not mediainfo:
-        logger.warn(f"未识别到媒体信息，标题：{title}，doubanid：{doubanid}，bangumiid：{bangumiid}")
-        return None, "未识别到媒体信息"
-    season = _normalize_title_and_season(mediainfo, season)
-    mediainfo, season, error = _fill_total_episode(self, mediainfo, title, tmdbid, doubanid, bangumiid, episode_group, season, kwargs)
-    if error:
-        return None, error
-    self.obtain_images(mediainfo=mediainfo)
-    if doubanid:
-        mediainfo.douban_id = doubanid
-    if bangumiid:
-        mediainfo.bangumi_id = bangumiid
-    kwargs.update(self._SubscribeChain__get_default_kwargs(mediainfo.type, **kwargs))
-    return _create_subscription(self, mediainfo, metainfo, title, year, season, channel, source, userid, username, message, exist_ok, kwargs)
+        mediainfo = _explicit_source_media(self, doubanid, bangumiid, mtype)
+        if not mediainfo:
+            logger.warn(f"未识别到媒体信息，标题：{title}，doubanid：{doubanid}，bangumiid：{bangumiid}")
+            return None, "未识别到媒体信息"
+        season = _normalize_title_and_season(mediainfo, season)
+        mediainfo, season, error = _fill_total_episode(self, mediainfo, title, tmdbid, doubanid, bangumiid, episode_group, season, kwargs)
+        if error:
+            return None, error
+        if not bangumiid:
+            self.obtain_images(mediainfo=mediainfo)
+        if doubanid:
+            mediainfo.douban_id = doubanid
+        if bangumiid:
+            mediainfo.bangumi_id = bangumiid
+        kwargs.update(self._SubscribeChain__get_default_kwargs(mediainfo.type, **kwargs))
+        return _create_subscription(self, mediainfo, metainfo, title, year, season, channel, source, userid, username, message, exist_ok, kwargs)
+    except Exception as err:
+        logger.exception(f"订阅外部源优先插件添加订阅异常：{err}")
+        raise
 
 
 async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: str, mtype: MediaType = None,
@@ -327,36 +328,41 @@ async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: s
                                        userid: Optional[str] = None, username: Optional[str] = None,
                                        message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                                        **kwargs) -> Tuple[Optional[int], str]:
-    if not doubanid and not bangumiid:
-        return await sourceprioritysubscribe._originals["subscribe_async_add"](
-            self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
-            season, channel, source, userid, username, message, exist_ok, **kwargs
-        )
-    logger.info(f"开始添加订阅，标题：{title} ...")
-    metainfo = MetaInfo(title)
-    if year:
-        metainfo.year = year
-    if mtype:
-        metainfo.type = mtype
-    if season is not None:
-        metainfo.type = MediaType.TV
-        metainfo.begin_season = season
+    try:
+        if not doubanid and not bangumiid:
+            return await sourceprioritysubscribe._originals["subscribe_async_add"](
+                self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
+                season, channel, source, userid, username, message, exist_ok, **kwargs
+            )
+        logger.info(f"开始添加订阅，标题：{title} ...")
+        metainfo = MetaInfo(title)
+        if year:
+            metainfo.year = year
+        if mtype:
+            metainfo.type = mtype
+        if season is not None:
+            metainfo.type = MediaType.TV
+            metainfo.begin_season = season
 
-    mediainfo = await _async_explicit_source_media(self, doubanid, bangumiid, mtype)
-    if not mediainfo:
-        logger.warn(f"未识别到媒体信息，标题：{title}，doubanid：{doubanid}，bangumiid：{bangumiid}")
-        return None, "未识别到媒体信息"
-    season = _normalize_title_and_season(mediainfo, season)
-    mediainfo, season, error = await _async_fill_total_episode(self, mediainfo, title, tmdbid, doubanid, bangumiid, episode_group, season, kwargs)
-    if error:
-        return None, error
-    await self.async_obtain_images(mediainfo=mediainfo)
-    if doubanid:
-        mediainfo.douban_id = doubanid
-    if bangumiid:
-        mediainfo.bangumi_id = bangumiid
-    kwargs.update(self._SubscribeChain__get_default_kwargs(mediainfo.type, **kwargs))
-    return await _async_create_subscription(self, mediainfo, metainfo, title, year, season, channel, source, userid, username, message, exist_ok, kwargs)
+        mediainfo = await _async_explicit_source_media(self, doubanid, bangumiid, mtype)
+        if not mediainfo:
+            logger.warn(f"未识别到媒体信息，标题：{title}，doubanid：{doubanid}，bangumiid：{bangumiid}")
+            return None, "未识别到媒体信息"
+        season = _normalize_title_and_season(mediainfo, season)
+        mediainfo, season, error = await _async_fill_total_episode(self, mediainfo, title, tmdbid, doubanid, bangumiid, episode_group, season, kwargs)
+        if error:
+            return None, error
+        if not bangumiid:
+            await self.async_obtain_images(mediainfo=mediainfo)
+        if doubanid:
+            mediainfo.douban_id = doubanid
+        if bangumiid:
+            mediainfo.bangumi_id = bangumiid
+        kwargs.update(self._SubscribeChain__get_default_kwargs(mediainfo.type, **kwargs))
+        return await _async_create_subscription(self, mediainfo, metainfo, title, year, season, channel, source, userid, username, message, exist_ok, kwargs)
+    except Exception as err:
+        logger.exception(f"订阅外部源优先插件添加订阅异常：{err}")
+        raise
 
 
 def _create_subscription(chain: SubscribeChain, mediainfo: MediaInfo, metainfo: MetaInfo, title: str, year: str,
