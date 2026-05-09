@@ -165,10 +165,6 @@ class SourcePrioritySubscribe(_PluginBase):
         cls._plugin_route_registered = False
 
 
-# MoviePilot 使用类名作为插件运行 ID；市场 ID 保持小写以兼容已发布索引。
-SourcePrioritySubscribe.__name__ = "sourceprioritysubscribe"
-
-
 def _explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
                            mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
