@@ -36,7 +36,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -419,6 +419,12 @@ def _apply_subscribe_ids(mediainfo: Optional[MediaInfo], subscribe: Optional[Sub
 def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaInfo]:
     if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
         return mediainfo
+    if mediainfo.type == MediaType.TV and mediainfo.year and not mediainfo.season_years:
+        season = mediainfo.season
+        if season is None and mediainfo.seasons:
+            season = next(iter(mediainfo.seasons.keys()), None)
+        if season is not None:
+            mediainfo.season_years = {season: str(mediainfo.year)}
     if not mediainfo.names:
         mediainfo.names = list(dict.fromkeys([
             item for item in [
