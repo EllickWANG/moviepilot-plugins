@@ -24,6 +24,7 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 | --- | --- | --- | --- |
 | `sourceprioritysubscribefix` | 订阅外部源优先 | 正式使用 | [README](plugins.v2/sourceprioritysubscribefix/README.md) |
 | `siteadapter` | 站点适配器 | 正式使用 | [README](plugins.v2/siteadapter/README.md) |
+| `IYUUAutoSeedPlus` | IYUU自动辅种增强 | 正式使用 | [README](plugins.v2/iyuuautoseedplus/README.md) |
 | `sourceprioritysubscribe` | 订阅外部源优先 | 旧兼容版 | [README](plugins.v2/sourceprioritysubscribe/README.md) |
 
 ## 插件说明
@@ -55,6 +56,19 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 - 支持 XPath、正则、属性读取、JSON 统计块解析和字段类型转换。
 
 详细用法见 [plugins.v2/siteadapter/README.md](plugins.v2/siteadapter/README.md)。
+
+### IYUU自动辅种增强
+
+`IYUUAutoSeedPlus` 复刻官方 `IYUUAutoSeed` 2.15，并增加 IYUU 请求超时和每批 hash 数量配置。
+
+主要能力：
+
+- 保留官方 IYUU 自动辅种流程。
+- `IYUU请求超时(秒)` 可配置，默认 `60` 秒。
+- `每批查询Hash数` 可配置，默认 `50`，用于缓解一次 200 个 hash 查询导致的 IYUU 超时。
+- 超时日志会明确标记为网络或接口超时，不再和“没有可辅种站点”混在一起。
+
+详细用法见 [plugins.v2/iyuuautoseedplus/README.md](plugins.v2/iyuuautoseedplus/README.md)。
 
 ## 目录结构
 
