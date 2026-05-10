@@ -100,8 +100,13 @@ class IyuuHelper(object):
         :param info_hashs:
         :return:
         """
+        info_hashs = [str(info_hash).strip().lower() for info_hash in info_hashs if info_hash]
+        if not info_hashs:
+            return None, "请求IYUU失败，未提供种子Hash"
         if not self._sid_sha1:
             self._sid_sha1 = self.__report_existing()
+        if not self._sid_sha1:
+            return None, "请求IYUU失败，未获取到站点哈希 sid_sha1，本批稍后重试"
         info_hashs.sort()
         json_data = json.dumps(info_hashs, separators=(',', ':'), ensure_ascii=False)
         sha1 = self.get_sha1(json_data)

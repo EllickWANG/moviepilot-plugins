@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.5"
+    plugin_version = "2.15.6"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1122,7 +1122,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             # 判断辅种异常是否是由于Token未认证导致的，由于没有解决接口，只能从返回值来判断
             if self._token and msg == '请求缺少token':
                 logger.warn(f'IYUU辅种失败，疑似站点未绑定插件配置不完整，请先检查是否完成站点绑定！{msg}')
-            elif "超时" in msg or "未获取到返回信息" in msg:
+            elif "超时" in msg or "未获取到返回信息" in msg or "未获取到站点哈希" in msg:
                 logger.warn(f"IYUU查询超时或网络异常，本批 {len(hash_strs)} 个Hash未完成：{msg}")
             else:
                 logger.warn(f"当前种子列表没有可辅种的站点：{msg}")

@@ -170,6 +170,10 @@ IYUU站点域名按子域名匹配
 
 先把“每批查询Hash数”降到 `20`，并把“IYUU请求超时(秒)”提高到 `90`。如果仍然失败，多半是 IYUU 当前服务端繁忙或网络链路抖动。
 
+### 提示站点哈希值 require
+
+这是 IYUU 的站点哈希 `sid_sha1` 没有初始化成功，通常发生在 `/reseed/sites/index` 或 `/reseed/sites/reportExisting` 超时后。增强版会在拿不到 `sid_sha1` 时跳过本批，不再继续发送无效查询；下一批或下一轮任务会重新尝试初始化。
+
 ### qBittorrent 经常 ReadTimeout 或 Forbidden
 
 `IYUU请求超时(秒)` 不控制 qB。qB 相关请求由“下载器请求超时(秒)”控制。插件会把该配置写入当前 qB 客户端的请求参数，并在查询目标 hash 失败时跳过本次添加，避免无法确认是否已存在时重复添加。
@@ -212,6 +216,7 @@ https://github.com/jxxghp/MoviePilot-Plugins/tree/main/plugins.v2/iyuuautoseed
 - 新增 `下载器请求超时(秒)` 配置，用于 qBittorrent API。
 - 新增 `每批查询Hash数` 配置。
 - 新增 `站点域名别名` 配置。
+- IYUU 站点哈希 `sid_sha1` 初始化失败时不再继续发送无效查询，避免 `站点哈希值 require`。
 - 兼容新版 MoviePilot 下载器添加种子返回值，添加失败时不再继续等待查询刚添加的任务 ID。
 - qB 查询目标 hash 失败时跳过本次添加，避免无法确认是否已存在时重复辅种。
 - 配置读取兼容字符串布尔值、单值多选、数字字符串站点 ID 和错误体积输入。
