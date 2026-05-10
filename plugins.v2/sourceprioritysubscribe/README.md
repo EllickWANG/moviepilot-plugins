@@ -7,5 +7,6 @@
 - 未传入 `doubanid` / `bangumiid`：保留原订阅识别逻辑。
 - `/api/v1/media/seasons` 支持 `douban:` / `bangumi:` 媒体 ID 的季信息。
 - 补充 Bangumi 订阅查重，避免同一个 Bangumi 条目重复订阅。
+- 补充 Bangumi 条目的标题别名，用于匹配站点中的英文名、罗马音名等资源标题。
 
 启用方式：在插件页面安装并启用 `sourceprioritysubscribe`。

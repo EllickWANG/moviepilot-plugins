@@ -36,7 +36,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.9"
+    plugin_version = "1.0.10"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -440,6 +440,129 @@ def _has_any_marker(values: list[str], markers: tuple[str, ...]) -> bool:
     return any(marker.lower() in text for marker in markers)
 
 
+_BANGUMI_INFOBOX_ALIAS_KEYS = {
+    "别名",
+    "英文名",
+    "英文名称",
+    "英文标题",
+    "原名",
+    "日文名",
+    "日文名称",
+}
+
+_BANGUMI_ALIAS_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        (
+            "Re:ゼロから始める異世界生活",
+            "Re：从零开始的异世界生活",
+            "Re:从零开始的异世界生活",
+            "从零开始的异世界生活",
+        ),
+        (
+            "Re:Zero -Starting Life in Another World-",
+            "Re ZERO Starting Life in Another World",
+            "Re Zero Starting Life in Another World",
+            "Re:Zero Kara Hajimeru Isekai Seikatsu",
+            "Re Zero Kara Hajimeru Isekai Seikatsu",
+            "Re: Zero kara Hajimeru Isekai Seikatsu",
+            "Re Life in a Different World from Zero",
+            "Re:Life in a Different World from Zero",
+        ),
+    ),
+)
+
+
+def _iter_text_values(value: Any):
+    if value is None:
+        return
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            yield text
+        return
+    if isinstance(value, dict):
+        for key in ("v", "value", "name", "title"):
+            if value.get(key):
+                yield from _iter_text_values(value.get(key))
+                return
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_text_values(item)
+        return
+    text = str(value).strip()
+    if text:
+        yield text
+
+
+def _dedupe_aliases(values: list[Any]) -> list[str]:
+    aliases = []
+    seen = set()
+    for value in values:
+        for text in _iter_text_values(value):
+            key = _normalize_match_text(text)
+            if not key or key in seen:
+                continue
+            aliases.append(text)
+            seen.add(key)
+    return aliases
+
+
+def _bangumi_infobox_aliases(info: dict) -> list[str]:
+    values = []
+    for item in info.get("infobox") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if key in _BANGUMI_INFOBOX_ALIAS_KEYS:
+            values.extend(_iter_text_values(item.get("value")) or [])
+    return _dedupe_aliases(values)
+
+
+def _bangumi_rule_aliases(values: list[Any]) -> list[str]:
+    normalized_values = {
+        _normalize_match_text(text)
+        for value in values
+        for text in _iter_text_values(value)
+        if _normalize_match_text(text)
+    }
+    aliases = []
+    for markers, rule_aliases in _BANGUMI_ALIAS_RULES:
+        normalized_markers = {_normalize_match_text(marker) for marker in markers}
+        if any(
+            marker in value or value in marker
+            for marker in normalized_markers
+            for value in normalized_values
+        ):
+            aliases.extend(rule_aliases)
+    return _dedupe_aliases(aliases)
+
+
+def _english_alias(aliases: list[str]) -> Optional[str]:
+    for alias in aliases:
+        if re.search(r"[A-Za-z]", alias) and not re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", alias):
+            return alias
+    return None
+
+
+def _bangumi_media_aliases(mediainfo: MediaInfo) -> list[str]:
+    info = mediainfo.bangumi_info or {}
+    values = list(mediainfo.names or [])
+    values.extend([
+        mediainfo.title,
+        mediainfo.original_title,
+        mediainfo.en_title,
+        mediainfo.hk_title,
+        mediainfo.tw_title,
+        mediainfo.sg_title,
+        info.get("name_cn"),
+        info.get("name"),
+    ])
+    values.extend(_bangumi_infobox_aliases(info))
+    values.extend(_bangumi_rule_aliases(values))
+    return _dedupe_aliases(values)
+
+
 def _infer_bangumi_media_category(mediainfo: MediaInfo) -> Optional[str]:
     info = mediainfo.bangumi_info or {}
     if info.get("type") != 2:
@@ -465,17 +588,11 @@ def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaI
             mediainfo.season_years = {season: str(mediainfo.year)}
     if not mediainfo.category:
         mediainfo.category = _infer_bangumi_media_category(mediainfo) or mediainfo.category
-    if not mediainfo.names:
-        mediainfo.names = list(dict.fromkeys([
-            item for item in [
-                mediainfo.title,
-                mediainfo.original_title,
-                mediainfo.en_title,
-                mediainfo.hk_title,
-                mediainfo.tw_title,
-                mediainfo.sg_title,
-            ] if item
-        ]))
+    aliases = _bangumi_media_aliases(mediainfo)
+    if aliases:
+        mediainfo.names = aliases
+        if not mediainfo.en_title:
+            mediainfo.en_title = _english_alias(aliases)
     return mediainfo
 
 
@@ -573,6 +690,7 @@ async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: A
 def _ensure_bangumi_search_media(chain: SearchChain, mediainfo: MediaInfo) -> MediaInfo:
     if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
         return mediainfo
+    mediainfo = _mark_bangumi_media_ready(mediainfo)
     if mediainfo.names and mediainfo.seasons:
         return mediainfo
     refreshed = _media_from_bangumi(chain, mediainfo.bangumi_id)
@@ -582,6 +700,7 @@ def _ensure_bangumi_search_media(chain: SearchChain, mediainfo: MediaInfo) -> Me
 async def _async_ensure_bangumi_search_media(chain: SearchChain, mediainfo: MediaInfo) -> MediaInfo:
     if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
         return mediainfo
+    mediainfo = _mark_bangumi_media_ready(mediainfo)
     if mediainfo.names and mediainfo.seasons:
         return mediainfo
     refreshed = await _async_media_from_bangumi(chain, mediainfo.bangumi_id)
