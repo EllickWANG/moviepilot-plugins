@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.35"
+    plugin_version = "1.0.36"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -896,24 +896,43 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
                 f"{getattr(download_history, 'title', '')} 通过下载历史匹配到Bangumi订阅："
                 f"{subscribe.name} bangumi:{subscribe.bangumiid}"
             )
-    bangumiid = _int_or_none(
-        getattr(subscribe, "bangumiid", None)
-        or (source_keyword or {}).get("bangumiid")
-    )
-    if not bangumiid:
-        return None
-    try:
-        mediainfo = _media_from_bangumi(chain, bangumiid)
-    except Exception as err:
-        logger.warn(f"订阅外部源优先插件获取Bangumi详情失败：{bangumiid} - {err}")
-        return None
-    if not mediainfo:
-        return None
     mtype = (
         _media_type_or_none(getattr(download_history, "type", None))
         or _media_type_or_none((source_keyword or {}).get("type"))
         or _media_type_or_none(getattr(subscribe, "type", None))
     )
+    bangumiid = _int_or_none(
+        getattr(subscribe, "bangumiid", None)
+        or (source_keyword or {}).get("bangumiid")
+    )
+    doubanid = (
+        getattr(subscribe, "doubanid", None)
+        or (source_keyword or {}).get("doubanid")
+        or getattr(download_history, "doubanid", None)
+    )
+    tmdbid = _int_or_none(
+        getattr(subscribe, "tmdbid", None)
+        or (source_keyword or {}).get("tmdbid")
+        or getattr(download_history, "tmdbid", None)
+    )
+    try:
+        if bangumiid:
+            mediainfo = _media_from_bangumi(chain, bangumiid)
+        elif doubanid:
+            mediainfo = _media_from_douban(chain, str(doubanid), mtype)
+        elif tmdbid:
+            mediainfo = chain.recognize_media(
+                mtype=mtype,
+                tmdbid=tmdbid,
+                episode_group=getattr(download_history, "episode_group", None),
+            )
+        else:
+            return None
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件获取下载历史媒体详情失败：{getattr(download_history, 'title', '')} - {err}")
+        return None
+    if not mediainfo:
+        return None
     if mtype:
         mediainfo.type = mtype
     season = (
@@ -927,7 +946,72 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
         mediainfo.category = subscribe.media_category
     elif not mediainfo.category and getattr(download_history, "media_category", None):
         mediainfo.category = download_history.media_category
+    if bangumiid and not mediainfo.bangumi_id:
+        mediainfo.bangumi_id = bangumiid
+    if doubanid and not mediainfo.douban_id:
+        mediainfo.douban_id = str(doubanid)
+    if tmdbid and not mediainfo.tmdb_id:
+        mediainfo.tmdb_id = tmdbid
     return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+
+
+def _media_id_value(mediainfo: Optional[MediaInfo], attr: str) -> Optional[str]:
+    if not mediainfo:
+        return None
+    value = getattr(mediainfo, attr, None)
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value).strip()
+
+
+def _media_identity_conflict(current_media: Optional[MediaInfo],
+                             source_media: Optional[MediaInfo]) -> Optional[str]:
+    for attr, label in (
+            ("tmdb_id", "TMDB"),
+            ("douban_id", "豆瓣"),
+            ("bangumi_id", "Bangumi"),
+    ):
+        current_value = _media_id_value(current_media, attr)
+        source_value = _media_id_value(source_media, attr)
+        if current_value and source_value and current_value != source_value:
+            return label
+    if source_media and source_media.bangumi_id and current_media and current_media.tmdb_id and not current_media.bangumi_id:
+        return "Bangumi"
+    if source_media and source_media.douban_id and current_media and current_media.tmdb_id and not current_media.douban_id:
+        return "豆瓣"
+    return None
+
+
+def _merge_source_transfer_media(current_media: Optional[MediaInfo],
+                                 source_media: Optional[MediaInfo]) -> Optional[MediaInfo]:
+    if not current_media or not source_media:
+        return current_media
+    for attr in (
+            "bangumi_id",
+            "douban_id",
+            "episode_group",
+            "genre_ids",
+            "names",
+            "bangumi_info",
+            "seasons",
+            "season_years",
+    ):
+        if not getattr(current_media, attr, None) and getattr(source_media, attr, None):
+            setattr(current_media, attr, getattr(source_media, attr))
+    if source_media.category and current_media.category != source_media.category:
+        logger.info(
+            f"{current_media.title_year or current_media.title} 整理二级分类按下载历史修正："
+            f"{current_media.category or '-'} -> {source_media.category}"
+        )
+        current_media.category = source_media.category
+    return current_media
+
+
+def _set_do_transfer_mediainfo(args_list: list, kwargs: dict, mediainfo: MediaInfo) -> None:
+    if len(args_list) > 2:
+        args_list[2] = mediainfo
+    else:
+        kwargs["mediainfo"] = mediainfo
 
 
 def _source_media_from_source(
@@ -2139,8 +2223,11 @@ def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
     download_hash = kwargs.get("download_hash")
     if download_hash is None and len(args_list) > 14:
         download_hash = args_list[14]
+    manual = kwargs.get("manual")
+    if manual is None and len(args_list) > 17:
+        manual = args_list[17]
 
-    if not mediainfo:
+    if not mediainfo or manual:
         download_history = _download_history_by_hash_or_file(download_hash, fileitem)
         try:
             source_mediainfo = _source_media_from_download_history(self, download_history)
@@ -2148,11 +2235,24 @@ def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
             logger.warn(f"订阅外部源优先插件补齐整理识别失败：{err}")
             source_mediainfo = None
         if source_mediainfo:
-            logger.info(f"{getattr(fileitem, 'name', None) or getattr(fileitem, 'path', '')} 使用订阅来源Bangumi详情补齐整理识别：{source_mediainfo.title_year}")
-            if len(args_list) > 2:
-                args_list[2] = source_mediainfo
+            if not mediainfo:
+                logger.info(
+                    f"{getattr(fileitem, 'name', None) or getattr(fileitem, 'path', '')} "
+                    f"使用下载历史来源补齐整理识别：{source_mediainfo.title_year}"
+                )
+                _set_do_transfer_mediainfo(args_list, kwargs, source_mediainfo)
             else:
-                kwargs["mediainfo"] = source_mediainfo
+                conflict = _media_identity_conflict(mediainfo, source_mediainfo)
+                if conflict:
+                    logger.warn(
+                        f"{getattr(fileitem, 'name', None) or getattr(fileitem, 'path', '')} "
+                        f"手动整理媒体与下载历史{conflict}信息冲突，已使用下载历史来源："
+                        f"{getattr(mediainfo, 'title_year', None) or getattr(mediainfo, 'title', '')} -> "
+                        f"{source_mediainfo.title_year}"
+                    )
+                    _set_do_transfer_mediainfo(args_list, kwargs, source_mediainfo)
+                else:
+                    _merge_source_transfer_media(mediainfo, source_mediainfo)
 
     result = sourceprioritysubscribefix._originals["transfer_do_transfer"](self, *args_list, **kwargs)
     if _transfer_result_success(result):
