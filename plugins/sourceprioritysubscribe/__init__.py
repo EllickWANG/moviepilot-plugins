@@ -30,13 +30,14 @@ from app.plugins import _PluginBase
 from app.schemas import MediaType, MessageChannel
 from app.schemas.types import ContentType, EventType, NotificationType
 from app.helper.subscribe import SubscribeHelper
+from app.helper.torrent import TorrentHelper
 
 
 class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.11"
+    plugin_version = "1.0.12"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -148,6 +149,7 @@ class sourceprioritysubscribe(_PluginBase):
             "model_async_exists": Subscribe.__dict__["async_exists"],
             "history_exists": SubscribeHistory.__dict__["exists"],
             "history_async_exists": SubscribeHistory.__dict__["async_exists"],
+            "torrent_match": TorrentHelper.match_torrent,
         }
         SubscribeChain.add = _patched_subscribe_add
         SubscribeChain.async_add = _patched_subscribe_async_add
@@ -165,6 +167,7 @@ class sourceprioritysubscribe(_PluginBase):
         Subscribe.async_exists = classmethod(async_db_query(_patched_model_async_exists))
         SubscribeHistory.exists = classmethod(db_query(_patched_model_exists))
         SubscribeHistory.async_exists = classmethod(async_db_query(_patched_model_async_exists))
+        TorrentHelper.match_torrent = staticmethod(_patched_match_torrent)
         cls._patch_media_seasons_route()
         cls._patch_search_routes()
         cls._patched = True
@@ -190,6 +193,7 @@ class sourceprioritysubscribe(_PluginBase):
         Subscribe.async_exists = cls._originals["model_async_exists"]
         SubscribeHistory.exists = cls._originals["history_exists"]
         SubscribeHistory.async_exists = cls._originals["history_async_exists"]
+        TorrentHelper.match_torrent = staticmethod(cls._originals["torrent_match"])
         cls._restore_search_routes()
         cls._restore_media_seasons_route()
         cls._originals = {}
@@ -450,39 +454,6 @@ _BANGUMI_INFOBOX_ALIAS_KEYS = {
     "日文名称",
 }
 
-_BANGUMI_ALIAS_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (
-        (
-            "Re:ゼロから始める異世界生活",
-            "Re：从零开始的异世界生活",
-            "Re:从零开始的异世界生活",
-            "从零开始的异世界生活",
-        ),
-        (
-            "Re:Zero -Starting Life in Another World-",
-            "Re ZERO Starting Life in Another World",
-            "Re Zero Starting Life in Another World",
-            "Re:Zero Kara Hajimeru Isekai Seikatsu",
-            "Re Zero Kara Hajimeru Isekai Seikatsu",
-            "Re: Zero kara Hajimeru Isekai Seikatsu",
-            "Re Life in a Different World from Zero",
-            "Re:Life in a Different World from Zero",
-        ),
-    ),
-    (
-        (
-            "嫌な顔されながらおパンツ見せてもらいたい",
-            "一脸嫌弃表情的妹子给你看胖次",
-        ),
-        (
-            "Iya na Kao Sarenagara Opantsu Misete Moraitai",
-            "Iya na Kao Sare Nagara Opantsu Misete Moraitai",
-            "I Want You To Make a Disgusted Face and Show Me Your Underwear",
-        ),
-    ),
-)
-
-
 def _iter_text_values(value: Any):
     if value is None:
         return
@@ -530,22 +501,24 @@ def _bangumi_infobox_aliases(info: dict) -> list[str]:
     return _dedupe_aliases(values)
 
 
-def _bangumi_rule_aliases(values: list[Any]) -> list[str]:
-    normalized_values = {
-        _normalize_match_text(text)
-        for value in values
-        for text in _iter_text_values(value)
-        if _normalize_match_text(text)
-    }
+def _bangumi_generated_aliases(values: list[Any]) -> list[str]:
     aliases = []
-    for markers, rule_aliases in _BANGUMI_ALIAS_RULES:
-        normalized_markers = {_normalize_match_text(marker) for marker in markers}
-        if any(
-            marker in value or value in marker
-            for marker in normalized_markers
-            for value in normalized_values
-        ):
-            aliases.extend(rule_aliases)
+    for value in values:
+        for text in _iter_text_values(value):
+            aliases.append(text)
+            # 常见季标题会把“正片系列名 + 季/篇章名”放在同一个标题里。
+            for pattern in (
+                r"\s*第[一二三四五六七八九十百千万零〇两0-9]+[季期部].*$",
+                r"\s+\d+(?:st|nd|rd|th)\s+season.*$",
+                r"\s+season\s*\d+.*$",
+            ):
+                base = re.sub(pattern, "", text, flags=re.I).strip()
+                if base and base != text:
+                    aliases.append(base)
+            if re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", text):
+                base = re.sub(r"\s*[Rr0-9]+$", "", text).strip()
+                if base and base != text:
+                    aliases.append(base)
     return _dedupe_aliases(aliases)
 
 
@@ -570,8 +543,72 @@ def _bangumi_media_aliases(mediainfo: MediaInfo) -> list[str]:
         info.get("name"),
     ])
     values.extend(_bangumi_infobox_aliases(info))
-    values.extend(_bangumi_rule_aliases(values))
+    values.extend(_bangumi_generated_aliases(values))
     return _dedupe_aliases(values)
+
+
+def _bangumi_match_text_candidates(mediainfo: MediaInfo) -> set[str]:
+    values = list(mediainfo.names or [])
+    values.extend([
+        mediainfo.title,
+        mediainfo.original_title,
+        mediainfo.en_title,
+        mediainfo.hk_title,
+        mediainfo.tw_title,
+        mediainfo.sg_title,
+    ])
+    candidates = set()
+    for alias in _bangumi_generated_aliases(values):
+        normalized = _normalize_match_text(alias)
+        if len(normalized) >= 5:
+            candidates.add(normalized)
+    return candidates
+
+
+def _bangumi_match_guard(mediainfo: MediaInfo, torrent_meta: Any, torrent: Any) -> bool:
+    if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
+        return False
+    if torrent_meta.type == MediaType.TV and mediainfo.type != MediaType.TV:
+        return False
+    if torrent.category == MediaType.TV.value and mediainfo.type != MediaType.TV:
+        return False
+    if not mediainfo.year:
+        return True
+    if mediainfo.type == MediaType.TV:
+        years = {str(year) for year in (mediainfo.season_years or {}).values() if year}
+        if not years and mediainfo.year:
+            years = {str(mediainfo.year)}
+        return not torrent_meta.year or str(torrent_meta.year) in years
+    try:
+        media_year = int(mediainfo.year)
+    except (TypeError, ValueError):
+        return True
+    return str(torrent_meta.year) in {str(media_year - 1), str(media_year), str(media_year + 1)}
+
+
+def _bangumi_normalized_content_match(mediainfo: MediaInfo, torrent_meta: Any, torrent: Any) -> bool:
+    candidates = _bangumi_match_text_candidates(mediainfo)
+    if not candidates:
+        return False
+    content = _normalize_match_text("\n".join([
+        str(torrent.title or ""),
+        str(torrent.description or ""),
+        str(getattr(torrent_meta, "org_string", "") or ""),
+    ]))
+    if not content:
+        return False
+    return any(candidate in content for candidate in candidates)
+
+
+def _patched_match_torrent(mediainfo: MediaInfo, torrent_meta: Any, torrent: Any) -> bool:
+    if sourceprioritysubscribe._originals["torrent_match"](mediainfo, torrent_meta, torrent):
+        return True
+    if not _bangumi_match_guard(mediainfo, torrent_meta, torrent):
+        return False
+    if _bangumi_normalized_content_match(mediainfo, torrent_meta, torrent):
+        logger.info(f"{mediainfo.title} 通过Bangumi归一化标题匹配到资源：{torrent.site_name} - {torrent.title}")
+        return True
+    return False
 
 
 def _infer_bangumi_media_category(mediainfo: MediaInfo) -> Optional[str]:
