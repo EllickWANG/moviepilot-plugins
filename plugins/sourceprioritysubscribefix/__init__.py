@@ -49,7 +49,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.30"
+    plugin_version = "1.0.31"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -1282,6 +1282,71 @@ def _bangumi_genres(mediainfo: MediaInfo) -> list[str]:
     return genres
 
 
+_BANGUMI_TV_SEASON_SUFFIX_PATTERNS = (
+    re.compile(r"\s+第\s*[0-9一二三四五六七八九十百零〇两]+\s*(?:季|期|部|章)\s*.*$", re.I),
+    re.compile(r"\s+\d{1,2}(?:st|nd|rd|th)\s+season\s*.*$", re.I),
+    re.compile(r"\s+season\s*0*\d{1,2}\s*.*$", re.I),
+    re.compile(r"\s+s\s*0*\d{1,2}\s*.*$", re.I),
+    re.compile(r"\s+\d{1,2}\s*(?:季|期|部|章)\s*.*$", re.I),
+)
+
+
+def _normalize_bangumi_title_text(title: Optional[str]) -> str:
+    text = re.sub(r"\s+", " ", str(title or "")).strip()
+    return re.sub(r"\s*[-_·:：]+\s*$", "", text).strip()
+
+
+def _strip_bangumi_tv_season_suffix(title: Optional[str]) -> str:
+    text = _normalize_bangumi_title_text(title)
+    if not text:
+        return ""
+    for pattern in _BANGUMI_TV_SEASON_SUFFIX_PATTERNS:
+        candidate = pattern.sub("", text).strip()
+        candidate = _normalize_bangumi_title_text(candidate)
+        if candidate and candidate != text and len(_normalize_match_text(candidate)) >= 2:
+            return candidate
+    return text
+
+
+def _has_bangumi_tv_season_suffix(title: Optional[str]) -> bool:
+    text = _normalize_bangumi_title_text(title)
+    return bool(text and _strip_bangumi_tv_season_suffix(text) != text)
+
+
+def _bangumi_tv_show_title_candidates(mediainfo: MediaInfo, original: bool = False) -> list[str]:
+    info = mediainfo.bangumi_info or {}
+    localized_values = [
+        info.get("name_cn"),
+        mediainfo.title,
+        mediainfo.hk_title,
+        mediainfo.tw_title,
+        mediainfo.sg_title,
+    ]
+    original_values = [
+        info.get("name"),
+        mediainfo.original_title,
+        mediainfo.en_title,
+    ]
+    if original:
+        values = original_values + _bangumi_infobox_aliases(info) + list(mediainfo.names or []) + localized_values
+    else:
+        values = localized_values + _bangumi_infobox_aliases(info) + list(mediainfo.names or []) + original_values
+    return _dedupe_aliases(values)
+
+
+def _bangumi_tv_show_title(mediainfo: MediaInfo, original: bool = False) -> str:
+    # 媒体服务器用 show title 聚合分集。优先使用 Bangumi 数据里已经存在的系列名，
+    # 避免把“第 N 季/篇章名”写进 showtitle 后被识别成另一部剧。
+    candidates = _bangumi_tv_show_title_candidates(mediainfo, original=original)
+    for candidate in candidates:
+        title = _normalize_bangumi_title_text(candidate)
+        if title and not _has_bangumi_tv_season_suffix(title):
+            return title
+    fallback = mediainfo.original_title if original else mediainfo.title
+    fallback = fallback or mediainfo.title or mediainfo.original_title or ""
+    return _strip_bangumi_tv_season_suffix(fallback)
+
+
 def _bangumi_add_common_nfo(
         doc: minidom.Document,
         root: minidom.Node,
@@ -1318,8 +1383,8 @@ def _bangumi_tv_nfo(mediainfo: MediaInfo) -> minidom.Document:
     doc = minidom.Document()
     root = DomUtils.add_node(doc, doc, "tvshow")
     _bangumi_add_common_nfo(doc, root, mediainfo)
-    _add_text_node(doc, root, "title", mediainfo.title or "")
-    _add_text_node(doc, root, "originaltitle", mediainfo.original_title or "")
+    _add_text_node(doc, root, "title", _bangumi_tv_show_title(mediainfo))
+    _add_text_node(doc, root, "originaltitle", _bangumi_tv_show_title(mediainfo, original=True))
     _add_text_node(doc, root, "season", "-1")
     _add_text_node(doc, root, "episode", "-1")
     return doc
@@ -1357,7 +1422,7 @@ def _bangumi_episode_nfo(mediainfo: MediaInfo, season: int, episode: int) -> min
     _add_text_node(doc, root, "episodeid", episode_id)
     _add_text_node(doc, root, "title", title)
     _add_text_node(doc, root, "originaltitle", title)
-    _add_text_node(doc, root, "showtitle", mediainfo.title or "")
+    _add_text_node(doc, root, "showtitle", _bangumi_tv_show_title(mediainfo))
     _add_text_node(doc, root, "sorttitle", f"S{int(season):02d}E{int(episode):02d}")
     _add_text_node(doc, root, "season", season)
     _add_text_node(doc, root, "episode", episode)
