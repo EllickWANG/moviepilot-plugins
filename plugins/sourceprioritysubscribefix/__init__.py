@@ -49,7 +49,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.32"
+    plugin_version = "1.0.33"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -398,6 +398,7 @@ _SOURCE_SUBSCRIBE_CACHE = {
 
 _MEDIA_SERVER_REFRESH_CACHE: dict[str, float] = {}
 _MEDIA_SERVER_COMPAT_ID_CACHE: dict[str, tuple[float, Optional[int]]] = {}
+_TMDB_EPISODE_STILL_CACHE: dict[str, tuple[float, dict[int, str]]] = {}
 
 
 def _clear_source_subscribe_cache():
@@ -1561,6 +1562,37 @@ def _image_ext(url: Optional[str]) -> str:
     return suffix or ".jpg"
 
 
+def _tmdb_episode_still_url(mediainfo: MediaInfo, season: Optional[int], episode: Optional[int]) -> Optional[str]:
+    if season is None or episode is None:
+        return None
+    tmdbid = _existing_media_server_tmdb_id(mediainfo)
+    if not tmdbid:
+        return None
+    episode_group = getattr(mediainfo, "episode_group", None)
+    cache_key = f"{tmdbid}|{season}|{episode_group or ''}"
+    now = time.time()
+    cached = _TMDB_EPISODE_STILL_CACHE.get(cache_key)
+    if cached and now - cached[0] < 3600:
+        return cached[1].get(int(episode))
+    stills: dict[int, str] = {}
+    try:
+        episodes = TmdbChain().tmdb_episodes(
+            tmdbid=int(tmdbid),
+            season=int(season),
+            episode_group=episode_group,
+        ) or []
+        for item in episodes:
+            episode_number = _int_or_none(getattr(item, "episode_number", None))
+            still_path = getattr(item, "still_path", None)
+            if episode_number is None or not still_path:
+                continue
+            stills[episode_number] = settings.TMDB_IMAGE_URL(still_path)
+    except Exception as err:
+        logger.debug(f"Bangumi分集缩略图查询TMDB失败：{tmdbid} S{season} - {err}")
+    _TMDB_EPISODE_STILL_CACHE[cache_key] = (now, stills)
+    return stills.get(int(episode))
+
+
 def _bangumi_metadata_img(
         mediainfo: MediaInfo,
         season: Optional[int] = None,
@@ -1568,10 +1600,14 @@ def _bangumi_metadata_img(
     if not _is_bangumi_metadata_media(mediainfo):
         return None
     if episode is not None:
-        thumb = mediainfo.backdrop_path or mediainfo.poster_path
+        thumb = (
+            _tmdb_episode_still_url(mediainfo, season, episode)
+            or mediainfo.backdrop_path
+            or mediainfo.poster_path
+        )
         if not thumb:
             return {}
-        return {f"thumb{_image_ext(thumb)}": thumb}
+        return {f"episode-thumb{_image_ext(thumb)}": thumb}
     poster = mediainfo.poster_path
     if season is not None:
         if not poster:
