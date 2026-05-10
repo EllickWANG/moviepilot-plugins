@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import traceback
 import re
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 from fastapi import Depends, Request
@@ -13,7 +14,9 @@ from app import schemas
 from app.api.endpoints.search import _stream_search_events
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
+from app.chain.storage import StorageChain
 from app.chain.subscribe import SubscribeChain
+from app.chain.transfer import TransferChain
 from app.chain.tmdb import TmdbChain
 from app.core.config import settings
 from app.core.context import MediaInfo
@@ -21,9 +24,11 @@ from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_resource_token, verify_token
 from app.db import async_db_query, db_query
+from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.models.subscribe import Subscribe
 from app.db.models.subscribehistory import SubscribeHistory
 from app.db.subscribe_oper import SubscribeOper
+from app.db.transferhistory_oper import TransferHistoryOper
 from app.factory import app
 from app.log import logger
 from app.plugins import _PluginBase
@@ -37,7 +42,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.12"
+    plugin_version = "1.0.13"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -150,6 +155,8 @@ class sourceprioritysubscribe(_PluginBase):
             "history_exists": SubscribeHistory.__dict__["exists"],
             "history_async_exists": SubscribeHistory.__dict__["async_exists"],
             "torrent_match": TorrentHelper.match_torrent,
+            "transfer_do_transfer": TransferChain.do_transfer,
+            "transfer_redo_transfer_history": TransferChain.redo_transfer_history,
         }
         SubscribeChain.add = _patched_subscribe_add
         SubscribeChain.async_add = _patched_subscribe_async_add
@@ -168,6 +175,8 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeHistory.exists = classmethod(db_query(_patched_model_exists))
         SubscribeHistory.async_exists = classmethod(async_db_query(_patched_model_async_exists))
         TorrentHelper.match_torrent = staticmethod(_patched_match_torrent)
+        TransferChain.do_transfer = _patched_transfer_do_transfer
+        TransferChain.redo_transfer_history = _patched_transfer_redo_transfer_history
         cls._patch_media_seasons_route()
         cls._patch_search_routes()
         cls._patched = True
@@ -194,6 +203,8 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeHistory.exists = cls._originals["history_exists"]
         SubscribeHistory.async_exists = cls._originals["history_async_exists"]
         TorrentHelper.match_torrent = staticmethod(cls._originals["torrent_match"])
+        TransferChain.do_transfer = cls._originals["transfer_do_transfer"]
+        TransferChain.redo_transfer_history = cls._originals["transfer_redo_transfer_history"]
         cls._restore_search_routes()
         cls._restore_media_seasons_route()
         cls._originals = {}
@@ -670,6 +681,133 @@ async def _async_media_from_bangumi(chain: Any, bangumiid: int) -> Optional[Medi
     if not info:
         return None
     return _mark_bangumi_media_ready(MediaInfo(bangumi_info=info))
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None and str(value).strip() else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _media_type_or_none(value: Any) -> Optional[MediaType]:
+    if isinstance(value, MediaType):
+        return value
+    if not value:
+        return None
+    try:
+        return MediaType(value)
+    except ValueError:
+        return None
+
+
+def _download_history_source(download_history: Any) -> Optional[str]:
+    note = getattr(download_history, "note", None)
+    if isinstance(note, dict):
+        return note.get("source")
+    return None
+
+
+def _subscribe_from_source_keyword(source_keyword: dict) -> Optional[Subscribe]:
+    sid = _int_or_none(source_keyword.get("id"))
+    if sid:
+        subscribe = SubscribeOper().get(sid)
+        if subscribe:
+            return subscribe
+    return SubscribeOper().get_by(
+        type=source_keyword.get("type"),
+        season=source_keyword.get("season"),
+        tmdbid=source_keyword.get("tmdbid"),
+        doubanid=source_keyword.get("doubanid"),
+        bangumiid=source_keyword.get("bangumiid"),
+    )
+
+
+def _source_media_from_download_history(chain: Any, download_history: Any) -> Optional[MediaInfo]:
+    if not download_history or getattr(download_history, "tmdbid", None) or getattr(download_history, "doubanid", None):
+        return None
+    source_keyword = SubscribeChain.parse_subscribe_source_keyword(_download_history_source(download_history))
+    if not source_keyword:
+        return None
+    subscribe = _subscribe_from_source_keyword(source_keyword)
+    bangumiid = _int_or_none(getattr(subscribe, "bangumiid", None) or source_keyword.get("bangumiid"))
+    if not bangumiid:
+        return None
+    mediainfo = _media_from_bangumi(chain, bangumiid)
+    if not mediainfo:
+        return None
+    mtype = _media_type_or_none(getattr(download_history, "type", None)) or _media_type_or_none(source_keyword.get("type"))
+    if mtype:
+        mediainfo.type = mtype
+    season = _int_or_none(source_keyword.get("season"))
+    if mediainfo.type == MediaType.TV and season is not None:
+        mediainfo.season = season
+    if getattr(download_history, "media_category", None):
+        mediainfo.category = download_history.media_category
+    elif subscribe and getattr(subscribe, "media_category", None):
+        mediainfo.category = subscribe.media_category
+    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+
+
+def _download_history_by_hash_or_file(download_hash: Optional[str], fileitem: Any) -> Optional[Any]:
+    downloadhis = DownloadHistoryOper()
+    if download_hash:
+        history = downloadhis.get_by_hash(download_hash)
+        if history:
+            return history
+    file_path = getattr(fileitem, "path", None)
+    if not file_path:
+        return None
+    try:
+        download_file = downloadhis.get_file_by_fullpath(Path(file_path).as_posix())
+    except Exception:
+        download_file = None
+    if download_file and getattr(download_file, "download_hash", None):
+        return downloadhis.get_by_hash(download_file.download_hash)
+    return None
+
+
+def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
+    args_list = list(args)
+    fileitem = args_list[0] if args_list else kwargs.get("fileitem")
+    mediainfo = kwargs.get("mediainfo")
+    if mediainfo is None and len(args_list) > 2:
+        mediainfo = args_list[2]
+    download_hash = kwargs.get("download_hash")
+    if download_hash is None and len(args_list) > 14:
+        download_hash = args_list[14]
+
+    if not mediainfo:
+        download_history = _download_history_by_hash_or_file(download_hash, fileitem)
+        source_mediainfo = _source_media_from_download_history(self, download_history)
+        if source_mediainfo:
+            logger.info(f"{getattr(fileitem, 'name', None) or getattr(fileitem, 'path', '')} 使用订阅来源Bangumi详情补齐整理识别：{source_mediainfo.title_year}")
+            if len(args_list) > 2:
+                args_list[2] = source_mediainfo
+            else:
+                kwargs["mediainfo"] = source_mediainfo
+
+    return sourceprioritysubscribe._originals["transfer_do_transfer"](self, *args_list, **kwargs)
+
+
+def _patched_transfer_redo_transfer_history(self: TransferChain, history_id: int) -> Tuple[bool, str]:
+    history = TransferHistoryOper().get(history_id)
+    if history:
+        download_history = _download_history_by_hash_or_file(history.download_hash, None)
+        mediainfo = _source_media_from_download_history(self, download_history)
+        if mediainfo and history.src_fileitem:
+            logger.info(f"{history.src} 使用订阅来源Bangumi详情重新整理：{mediainfo.title_year}")
+            if history.dest_fileitem:
+                StorageChain().delete_file(schemas.FileItem(**history.dest_fileitem))
+            return self.do_transfer(
+                fileitem=schemas.FileItem(**history.src_fileitem),
+                mediainfo=mediainfo,
+                download_hash=history.download_hash,
+                force=True,
+                background=False,
+                manual=True,
+            )
+    return sourceprioritysubscribe._originals["transfer_redo_transfer_history"](self, history_id)
 
 
 def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, mtype: Optional[MediaType] = None,
