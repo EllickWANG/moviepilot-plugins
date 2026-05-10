@@ -98,7 +98,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.2"
+    plugin_version = "2.15.3"
     # 插件作者
     plugin_author = "jxxghp,CKun,Ellick"
     # 作者主页
