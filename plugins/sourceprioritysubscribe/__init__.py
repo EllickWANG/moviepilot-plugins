@@ -42,7 +42,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.13"
+    plugin_version = "1.0.14"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -74,7 +74,16 @@ class sourceprioritysubscribe(_PluginBase):
         return []
 
     def get_api(self) -> List[dict]:
-        return []
+        return [
+            {
+                "path": "/sourceprioritysubscribe/redo/{history_id}",
+                "endpoint": _plugin_redo_transfer_history,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "使用订阅来源重新整理",
+                "description": "对 Bangumi-only 订阅下载失败的整理记录，按下载历史中的订阅来源重新整理。",
+            }
+        ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], dict]:
         return [
@@ -156,8 +165,9 @@ class sourceprioritysubscribe(_PluginBase):
             "history_async_exists": SubscribeHistory.__dict__["async_exists"],
             "torrent_match": TorrentHelper.match_torrent,
             "transfer_do_transfer": TransferChain.do_transfer,
-            "transfer_redo_transfer_history": TransferChain.redo_transfer_history,
         }
+        if hasattr(TransferChain, "redo_transfer_history"):
+            cls._originals["transfer_redo_transfer_history"] = TransferChain.redo_transfer_history
         SubscribeChain.add = _patched_subscribe_add
         SubscribeChain.async_add = _patched_subscribe_async_add
         SubscribeChain.exists = staticmethod(_patched_subscribe_exists)
@@ -176,7 +186,8 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeHistory.async_exists = classmethod(async_db_query(_patched_model_async_exists))
         TorrentHelper.match_torrent = staticmethod(_patched_match_torrent)
         TransferChain.do_transfer = _patched_transfer_do_transfer
-        TransferChain.redo_transfer_history = _patched_transfer_redo_transfer_history
+        if "transfer_redo_transfer_history" in cls._originals:
+            TransferChain.redo_transfer_history = _patched_transfer_redo_transfer_history
         cls._patch_media_seasons_route()
         cls._patch_search_routes()
         cls._patched = True
@@ -204,7 +215,8 @@ class sourceprioritysubscribe(_PluginBase):
         SubscribeHistory.async_exists = cls._originals["history_async_exists"]
         TorrentHelper.match_torrent = staticmethod(cls._originals["torrent_match"])
         TransferChain.do_transfer = cls._originals["transfer_do_transfer"]
-        TransferChain.redo_transfer_history = cls._originals["transfer_redo_transfer_history"]
+        if "transfer_redo_transfer_history" in cls._originals:
+            TransferChain.redo_transfer_history = cls._originals["transfer_redo_transfer_history"]
         cls._restore_search_routes()
         cls._restore_media_seasons_route()
         cls._originals = {}
@@ -790,16 +802,16 @@ def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
     return sourceprioritysubscribe._originals["transfer_do_transfer"](self, *args_list, **kwargs)
 
 
-def _patched_transfer_redo_transfer_history(self: TransferChain, history_id: int) -> Tuple[bool, str]:
+def _redo_transfer_history_with_source(chain: TransferChain, history_id: int) -> Optional[Tuple[bool, str]]:
     history = TransferHistoryOper().get(history_id)
     if history:
         download_history = _download_history_by_hash_or_file(history.download_hash, None)
-        mediainfo = _source_media_from_download_history(self, download_history)
+        mediainfo = _source_media_from_download_history(chain, download_history)
         if mediainfo and history.src_fileitem:
             logger.info(f"{history.src} 使用订阅来源Bangumi详情重新整理：{mediainfo.title_year}")
             if history.dest_fileitem:
                 StorageChain().delete_file(schemas.FileItem(**history.dest_fileitem))
-            return self.do_transfer(
+            return chain.do_transfer(
                 fileitem=schemas.FileItem(**history.src_fileitem),
                 mediainfo=mediainfo,
                 download_hash=history.download_hash,
@@ -807,7 +819,22 @@ def _patched_transfer_redo_transfer_history(self: TransferChain, history_id: int
                 background=False,
                 manual=True,
             )
+    return None
+
+
+def _patched_transfer_redo_transfer_history(self: TransferChain, history_id: int) -> Tuple[bool, str]:
+    result = _redo_transfer_history_with_source(self, history_id)
+    if result:
+        return result
     return sourceprioritysubscribe._originals["transfer_redo_transfer_history"](self, history_id)
+
+
+def _plugin_redo_transfer_history(history_id: int) -> Any:
+    result = _redo_transfer_history_with_source(TransferChain(), history_id)
+    if result:
+        state, message = result
+        return schemas.Response(success=state, message=message)
+    return schemas.Response(success=False, message="未找到可用的 Bangumi 订阅来源整理信息")
 
 
 def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, mtype: Optional[MediaType] = None,
