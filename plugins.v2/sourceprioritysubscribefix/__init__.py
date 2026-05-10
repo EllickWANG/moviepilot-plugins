@@ -45,7 +45,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.17"
+    plugin_version = "1.0.18"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -912,33 +912,146 @@ def _component_text(component: str, text: Any, props: Optional[dict] = None) -> 
     return item
 
 
+def _chip(text: Any, color: str = "primary", icon: Optional[str] = None) -> dict:
+    props = {
+        "size": "small",
+        "variant": "tonal",
+        "color": color,
+        "class": "mr-2 mb-2",
+    }
+    if icon:
+        props["prepend-icon"] = icon
+    return {
+        "component": "VChip",
+        "props": props,
+        "text": _safe_page_text(text),
+    }
+
+
+def _detail_line(label: str, value: Any) -> dict:
+    return {
+        "component": "div",
+        "props": {"class": "d-flex align-start py-1"},
+        "content": [
+            _component_text(
+                "div",
+                label,
+                {
+                    "class": "text-caption text-medium-emphasis flex-shrink-0",
+                    "style": "width:4.75em",
+                },
+            ),
+            _component_text(
+                "div",
+                value,
+                {
+                    "class": "text-body-2 flex-grow-1",
+                    "style": "word-break:break-word;min-width:0",
+                },
+            ),
+        ],
+    }
+
+
+def _mobile_item(
+        title: Any,
+        subtitle: Any,
+        chips: list[dict],
+        details: list[dict],
+        action: Optional[dict] = None) -> dict:
+    content = [
+        {
+            "component": "div",
+            "props": {"class": "d-flex align-start justify-space-between ga-2"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "flex-grow-1", "style": "min-width:0"},
+                    "content": [
+                        _component_text(
+                            "div",
+                            title,
+                            {
+                                "class": "text-body-1 font-weight-medium",
+                                "style": "word-break:break-word",
+                            },
+                        ),
+                        _component_text(
+                            "div",
+                            subtitle,
+                            {
+                                "class": "text-caption text-medium-emphasis mt-1",
+                                "style": "word-break:break-word",
+                            },
+                        ),
+                    ],
+                },
+            ],
+        },
+        {
+            "component": "div",
+            "props": {"class": "d-flex flex-wrap mt-3"},
+            "content": chips,
+        },
+        {
+            "component": "div",
+            "props": {"class": "mt-1"},
+            "content": details,
+        },
+    ]
+    if action:
+        content.append({
+            "component": "div",
+            "props": {"class": "mt-3"},
+            "content": [action],
+        })
+    return {
+        "component": "VSheet",
+        "props": {
+            "border": True,
+            "rounded": "lg",
+            "class": "pa-3 mb-3",
+        },
+        "content": content,
+    }
+
+
 def _stat_card(title: str, value: Any, subtitle: str, icon: str, color: str) -> dict:
     return {
         "component": "VCol",
-        "props": {"cols": 12, "sm": 6, "lg": 3},
+        "props": {"cols": 6, "sm": 6, "lg": 3},
         "content": [
             {
                 "component": "VCard",
-                "props": {"variant": "tonal", "color": color},
+                "props": {"variant": "tonal", "color": color, "class": "h-100"},
                 "content": [
                     {
                         "component": "VCardText",
+                        "props": {"class": "pa-3 pa-sm-4"},
                         "content": [
                             {
                                 "component": "div",
-                                "props": {"class": "d-flex align-center justify-space-between"},
+                                "props": {"class": "d-flex align-start justify-space-between ga-2"},
                                 "content": [
                                     {
                                         "component": "div",
+                                        "props": {"style": "min-width:0"},
                                         "content": [
-                                            _component_text("div", title, {"class": "text-caption"}),
-                                            _component_text("div", value, {"class": "text-h5 font-weight-bold mt-1"}),
-                                            _component_text("div", subtitle, {"class": "text-caption mt-1"}),
+                                            _component_text("div", title, {"class": "text-caption text-medium-emphasis"}),
+                                            _component_text("div", value, {"class": "text-h6 text-sm-h5 font-weight-bold mt-1"}),
+                                            _component_text(
+                                                "div",
+                                                subtitle,
+                                                {
+                                                    "class": "text-caption mt-1",
+                                                    "style": "word-break:break-word",
+                                                },
+                                            ),
                                         ],
                                     },
                                     {
                                         "component": "VIcon",
-                                        "props": {"icon": icon, "size": 32},
+                                        "props": {"icon": icon, "size": 28, "class": "flex-shrink-0"},
                                     },
                                 ],
                             }
@@ -979,7 +1092,13 @@ def _td(text: Any, class_name: str = "") -> dict:
     return item
 
 
-def _table_card(title: str, icon: str, headers: list[str], rows: list[dict], empty_text: str) -> dict:
+def _table_card(
+        title: str,
+        icon: str,
+        headers: list[str],
+        rows: list[dict],
+        mobile_items: list[dict],
+        empty_text: str) -> dict:
     content = [
         {
             "component": "div",
@@ -993,7 +1112,7 @@ def _table_card(title: str, icon: str, headers: list[str], rows: list[dict], emp
     if rows:
         content.append({
             "component": "div",
-            "props": {"class": "overflow-x-auto"},
+            "props": {"class": "d-none d-md-block overflow-x-auto"},
             "content": [
                 {
                     "component": "VTable",
@@ -1007,6 +1126,11 @@ def _table_card(title: str, icon: str, headers: list[str], rows: list[dict], emp
                     ],
                 }
             ],
+        })
+        content.append({
+            "component": "div",
+            "props": {"class": "d-flex d-md-none flex-column ga-3"},
+            "content": mobile_items,
         })
     else:
         content.append({
@@ -1023,21 +1147,25 @@ def _table_card(title: str, icon: str, headers: list[str], rows: list[dict], emp
         "content": [
             {
                 "component": "VCardText",
+                "props": {"class": "pa-3 pa-sm-4"},
                 "content": content,
             }
         ],
     }
 
 
-def _redo_button(plugin_id: str, history_id: int) -> dict:
+def _redo_button(plugin_id: str, history_id: int, block: bool = False) -> dict:
+    props = {
+        "size": "small",
+        "variant": "tonal",
+        "color": "primary",
+        "prepend-icon": "mdi-restore",
+    }
+    if block:
+        props["block"] = True
     return {
         "component": "VBtn",
-        "props": {
-            "size": "small",
-            "variant": "tonal",
-            "color": "primary",
-            "prepend-icon": "mdi-restore",
-        },
+        "props": props,
         "text": "重整",
         "events": {
             "click": {
@@ -1048,8 +1176,9 @@ def _redo_button(plugin_id: str, history_id: int) -> dict:
     }
 
 
-def _failed_transfer_rows(plugin_id: str, histories: list[TransferHistory]) -> list[dict]:
+def _failed_transfer_entries(plugin_id: str, histories: list[TransferHistory]) -> tuple[list[dict], list[dict]]:
     rows = []
+    mobile_items = []
     for history in histories:
         source_keyword = _bangumi_source_keyword(_download_history_by_hash_or_file(history.download_hash, None))
         source_text = (
@@ -1071,42 +1200,84 @@ def _failed_transfer_rows(plugin_id: str, histories: list[TransferHistory]) -> l
                 },
             ],
         })
-    return rows
+        mobile_items.append(_mobile_item(
+            title=history.title,
+            subtitle=source_text,
+            chips=[
+                _chip(f"ID {history.id}", "primary", "mdi-pound"),
+                _chip(history.date, "secondary", "mdi-clock-outline"),
+            ],
+            details=[
+                _detail_line("错误", history.errmsg),
+                _detail_line("来源", source_text),
+            ],
+            action=_redo_button(plugin_id, history.id, block=True) if source_keyword else None,
+        ))
+    return rows, mobile_items
 
 
-def _subscribe_rows(subscribes: list[Subscribe]) -> list[dict]:
+def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[dict]]:
     rows = []
+    mobile_items = []
     for subscribe in subscribes:
         progress = f"{(subscribe.total_episode or 0) - (subscribe.lack_episode or 0)} / {subscribe.total_episode or 0}"
+        season_text = f"S{subscribe.season:02d}" if subscribe.season else "-"
         rows.append({
             "component": "tr",
             "content": [
                 _td(subscribe.id, "text-no-wrap"),
                 _td(subscribe.name, "text-no-wrap"),
                 _td(subscribe.year, "text-no-wrap"),
-                _td(f"S{subscribe.season:02d}" if subscribe.season else "-", "text-no-wrap"),
+                _td(season_text, "text-no-wrap"),
                 _td(f"bangumi:{subscribe.bangumiid}", "text-no-wrap"),
                 _td(progress, "text-no-wrap"),
             ],
         })
-    return rows
+        mobile_items.append(_mobile_item(
+            title=subscribe.name,
+            subtitle=f"{subscribe.year or '-'} · {season_text} · {progress}",
+            chips=[
+                _chip(f"ID {subscribe.id}", "primary", "mdi-pound"),
+                _chip(f"bangumi:{subscribe.bangumiid}", "info", "mdi-book-open-page-variant"),
+            ],
+            details=[
+                _detail_line("年份", subscribe.year),
+                _detail_line("季", season_text),
+                _detail_line("进度", progress),
+            ],
+        ))
+    return rows, mobile_items
 
 
-def _download_rows(downloads: list[DownloadHistory]) -> list[dict]:
+def _download_entries(downloads: list[DownloadHistory]) -> tuple[list[dict], list[dict]]:
     rows = []
+    mobile_items = []
     for download in downloads:
         source_keyword = _bangumi_source_keyword(download) or {}
+        source_text = f"bangumi:{source_keyword.get('bangumiid')}"
         rows.append({
             "component": "tr",
             "content": [
                 _td(download.id, "text-no-wrap"),
                 _td(download.title, "text-no-wrap"),
-                _td(f"bangumi:{source_keyword.get('bangumiid')}", "text-no-wrap"),
+                _td(source_text, "text-no-wrap"),
                 _td(download.torrent_name),
                 _td(download.date, "text-no-wrap"),
             ],
         })
-    return rows
+        mobile_items.append(_mobile_item(
+            title=download.title,
+            subtitle=source_text,
+            chips=[
+                _chip(f"ID {download.id}", "primary", "mdi-pound"),
+                _chip(download.date, "secondary", "mdi-clock-outline"),
+            ],
+            details=[
+                _detail_line("资源", download.torrent_name),
+                _detail_line("来源", source_text),
+            ],
+        ))
+    return rows, mobile_items
 
 
 def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
@@ -1115,13 +1286,17 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
     source_download_items = _source_downloads(limit=12)
     bangumi_subscribes = _bangumi_only_subscribes_for_page(limit=20)
     enabled_text = "已启用" if plugin.get_state() else "已停用"
+    failed_rows, failed_mobile_items = _failed_transfer_entries(plugin_id, failed_histories)
+    subscribe_rows, subscribe_mobile_items = _subscribe_entries(bangumi_subscribes)
+    download_rows, download_mobile_items = _download_entries(source_download_items)
 
     return [
         {
             "component": "VRow",
+            "props": {"dense": True},
             "content": [
                 _stat_card("插件状态", enabled_text, f"版本 {plugin.plugin_version}", "mdi-heart-cog", "primary"),
-                _stat_card("Bangumi-only 订阅", len(bangumi_subscribes), "未绑定 TMDB/豆瓣的订阅", "mdi-book-heart", "info"),
+                _stat_card("Bangumi 订阅", len(bangumi_subscribes), "未绑定 TMDB/豆瓣", "mdi-book-heart", "info"),
                 _stat_card("失败整理", len(failed_histories), "最多显示最近 20 条", "mdi-alert-circle", "error"),
                 _stat_card("来源下载", len(source_download_items), "最近 Bangumi 来源下载", "mdi-download-circle", "success"),
             ],
@@ -1137,7 +1312,8 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                             title="失败整理记录",
                             icon="mdi-alert-circle-outline",
                             headers=["ID", "标题", "订阅来源", "错误", "时间", "操作"],
-                            rows=_failed_transfer_rows(plugin_id, failed_histories),
+                            rows=failed_rows,
+                            mobile_items=failed_mobile_items,
                             empty_text="当前没有失败整理记录。",
                         )
                     ],
@@ -1155,7 +1331,8 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                             title="Bangumi-only 订阅",
                             icon="mdi-book-open-page-variant",
                             headers=["ID", "标题", "年份", "季", "Bangumi", "进度"],
-                            rows=_subscribe_rows(bangumi_subscribes),
+                            rows=subscribe_rows,
+                            mobile_items=subscribe_mobile_items,
                             empty_text="暂无 Bangumi-only 订阅。",
                         )
                     ],
@@ -1168,7 +1345,8 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                             title="最近来源下载",
                             icon="mdi-download",
                             headers=["ID", "标题", "Bangumi", "资源名", "时间"],
-                            rows=_download_rows(source_download_items),
+                            rows=download_rows,
+                            mobile_items=download_mobile_items,
                             empty_text="暂无 Bangumi 来源下载记录。",
                         )
                     ],
