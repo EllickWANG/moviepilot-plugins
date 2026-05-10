@@ -24,7 +24,7 @@ from app.chain.tmdb import TmdbChain
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager
-from app.core.metainfo import MetaInfo
+from app.core.metainfo import MetaInfo, MetaInfoPath
 from app.core.security import verify_resource_token, verify_token
 from app.db import async_db_query, db_query
 from app.db.downloadhistory_oper import DownloadHistoryOper
@@ -38,7 +38,7 @@ from app.factory import app
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaType, MessageChannel
-from app.schemas.types import ContentType, EventType, NotificationType
+from app.schemas.types import ContentType, EventType, NotificationType, ScrapingTarget
 from app.helper.subscribe import SubscribeHelper
 from app.helper.torrent import TorrentHelper
 from app.utils.dom import DomUtils
@@ -48,7 +48,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.24"
+    plugin_version = "1.0.25"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -168,6 +168,7 @@ class sourceprioritysubscribefix(_PluginBase):
             "search_async_process": SearchChain.async_process,
             "search_async_process_stream": SearchChain.async_process_stream,
             "download_single": DownloadChain.download_single,
+            "media_handle_tv_episode_file": MediaChain._handle_tv_episode_file,
             "oper_add": SubscribeOper.add,
             "oper_async_add": SubscribeOper.async_add,
             "oper_exists": SubscribeOper.exists,
@@ -190,6 +191,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = _patched_search_async_process
         SearchChain.async_process_stream = _patched_search_async_process_stream
         DownloadChain.download_single = _patched_download_single
+        MediaChain._handle_tv_episode_file = _patched_media_handle_tv_episode_file
         SubscribeOper.add = _patched_oper_add
         SubscribeOper.async_add = _patched_oper_async_add
         SubscribeOper.exists = _patched_oper_exists
@@ -220,6 +222,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = cls._originals["search_async_process"]
         SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
         DownloadChain.download_single = cls._originals["download_single"]
+        MediaChain._handle_tv_episode_file = cls._originals["media_handle_tv_episode_file"]
         SubscribeOper.add = cls._originals["oper_add"]
         SubscribeOper.async_add = cls._originals["oper_async_add"]
         SubscribeOper.exists = cls._originals["oper_exists"]
@@ -957,6 +960,76 @@ def _patched_download_single(self: DownloadChain, *args, **kwargs):
     return sourceprioritysubscribefix._originals["download_single"](self, *args_list, **kwargs)
 
 
+def _patched_media_handle_tv_episode_file(
+        self: MediaChain,
+        fileitem: schemas.FileItem,
+        filepath: Path,
+        mediainfo: MediaInfo,
+        parent: schemas.FileItem,
+        overwrite: bool):
+    if not _is_bangumi_metadata_media(mediainfo):
+        return sourceprioritysubscribefix._originals["media_handle_tv_episode_file"](
+            self, fileitem, filepath, mediainfo, parent, overwrite
+        )
+
+    file_meta = MetaInfoPath(filepath)
+    if not file_meta.begin_episode:
+        logger.warn(f"{filepath.name} 无法识别文件集数！")
+        return
+
+    file_mediainfo = mediainfo
+    if not getattr(file_mediainfo, "bangumi_info", None):
+        try:
+            source_mediainfo = _media_from_bangumi(self, file_mediainfo.bangumi_id)
+        except Exception as err:
+            logger.warn(
+                f"{filepath.name} 获取Bangumi详情失败："
+                f"{file_mediainfo.bangumi_id} - {err}"
+            )
+            source_mediainfo = None
+        if source_mediainfo:
+            source_mediainfo.type = file_mediainfo.type or source_mediainfo.type
+            source_mediainfo.season = (
+                file_mediainfo.season
+                if file_mediainfo.season is not None
+                else source_mediainfo.season
+            )
+            source_mediainfo.category = file_mediainfo.category or source_mediainfo.category
+            file_mediainfo = source_mediainfo
+
+    season_number = (
+        file_meta.begin_season
+        if file_meta.begin_season is not None
+        else file_mediainfo.season if file_mediainfo.season is not None
+        else 1
+    )
+    episode_number = file_meta.begin_episode
+    logger.info(
+        f"{filepath.name} 使用Bangumi本地NFO刮削单集："
+        f"S{int(season_number):02d}E{int(episode_number):02d}"
+    )
+
+    self._scrape_nfo_generic(
+        current_fileitem=fileitem,
+        meta=file_meta,
+        mediainfo=_mark_bangumi_media_ready(file_mediainfo),
+        item_type=ScrapingTarget.EPISODE,
+        parent_fileitem=parent,
+        overwrite=overwrite,
+        season_number=season_number,
+        episode_number=episode_number,
+    )
+    self._scrape_images_generic(
+        current_fileitem=fileitem,
+        mediainfo=file_mediainfo,
+        item_type=ScrapingTarget.EPISODE,
+        parent_fileitem=parent,
+        overwrite=overwrite,
+        season_number=season_number,
+        episode_number=episode_number,
+    )
+
+
 def _is_bangumi_metadata_media(mediainfo: Optional[MediaInfo]) -> bool:
     return bool(mediainfo and mediainfo.bangumi_id)
 
@@ -1059,14 +1132,25 @@ def _bangumi_season_nfo(mediainfo: MediaInfo, season: int) -> minidom.Document:
     return doc
 
 
+def _bangumi_episode_title(episode: int) -> str:
+    return f"第 {episode} 集"
+
+
 def _bangumi_episode_nfo(mediainfo: MediaInfo, season: int, episode: int) -> minidom.Document:
     doc = minidom.Document()
     root = DomUtils.add_node(doc, doc, "episodedetails")
     _bangumi_add_common_nfo(doc, root, mediainfo, f"s{season}e{episode}")
-    _add_text_node(doc, root, "title", f"第 {episode} 集")
+    title = _bangumi_episode_title(episode)
+    _add_text_node(doc, root, "id", f"bangumi-{mediainfo.bangumi_id}-s{season}e{episode}")
+    _add_text_node(doc, root, "title", title)
+    _add_text_node(doc, root, "originaltitle", title)
+    _add_text_node(doc, root, "showtitle", mediainfo.title or "")
     _add_text_node(doc, root, "season", season)
     _add_text_node(doc, root, "episode", episode)
-    _add_text_node(doc, root, "aired", mediainfo.release_date or "")
+    _add_text_node(doc, root, "displayseason", season)
+    _add_text_node(doc, root, "displayepisode", episode)
+    _add_text_node(doc, root, "aired", "")
+    _add_text_node(doc, root, "lockdata", "true")
     return doc
 
 
