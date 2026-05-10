@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.38"
+    plugin_version = "1.0.39"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -459,13 +459,17 @@ def _title_candidates_from_text(text: Any) -> set[str]:
     return {_normalize_match_text(item) for item in candidates if _normalize_match_text(item)}
 
 
+def _is_bangumi_only_subscribe(subscribe: Optional[Subscribe]) -> bool:
+    return bool(subscribe and subscribe.bangumiid and not subscribe.tmdbid and not subscribe.doubanid)
+
+
 def _source_only_subscribes() -> list[Subscribe]:
     now = time.time()
     if now - _SOURCE_SUBSCRIBE_CACHE["time"] < 10:
         return _SOURCE_SUBSCRIBE_CACHE["items"]
     subscribes = [
         subscribe for subscribe in SubscribeOper().list()
-        if subscribe.bangumiid and not subscribe.tmdbid and not subscribe.doubanid
+        if _is_bangumi_only_subscribe(subscribe)
     ]
     _SOURCE_SUBSCRIBE_CACHE["time"] = now
     _SOURCE_SUBSCRIBE_CACHE["items"] = subscribes
@@ -893,6 +897,19 @@ def _source_keyword_has_media_id(source_keyword: Optional[dict]) -> bool:
     return any(source_keyword.get(key) for key in ("bangumiid", "doubanid", "tmdbid"))
 
 
+def _source_keyword_has_bangumi_id(source_keyword: Optional[dict]) -> bool:
+    return bool(source_keyword and _int_or_none(source_keyword.get("bangumiid")))
+
+
+def _source_keyword_targets_bangumi_only(source_keyword: Optional[dict],
+                                         subscribe: Optional[Subscribe]) -> bool:
+    if not _source_keyword_has_bangumi_id(source_keyword):
+        return False
+    if subscribe:
+        return _is_bangumi_only_subscribe(subscribe)
+    return not source_keyword.get("tmdbid") and not source_keyword.get("doubanid")
+
+
 def _source_keyword_matches_subscribe(source_keyword: Optional[dict], subscribe: Optional[Subscribe]) -> bool:
     if not source_keyword or not subscribe:
         return False
@@ -951,8 +968,12 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
         or _media_type_or_none(getattr(trusted_subscribe, "type", None))
     )
     bangumiid = _int_or_none(
-        (source_keyword or {}).get("bangumiid")
-        or getattr(trusted_subscribe, "bangumiid", None)
+        ((source_keyword or {}).get("bangumiid")
+         if _source_keyword_targets_bangumi_only(source_keyword, trusted_subscribe or subscribe)
+         else None)
+        or (getattr(trusted_subscribe, "bangumiid", None)
+            if _is_bangumi_only_subscribe(trusted_subscribe)
+            else None)
     )
     doubanid = (
         (source_keyword or {}).get("doubanid")
@@ -1077,9 +1098,12 @@ def _source_media_from_source(
     trusted_subscribe = _trusted_subscribe_for_source(source_keyword, subscribe)
 
     bangumiid = _int_or_none(
-        (source_keyword or {}).get("bangumiid")
-        or getattr(trusted_subscribe, "bangumiid", None)
-        or getattr(current_media, "bangumi_id", None)
+        ((source_keyword or {}).get("bangumiid")
+         if _source_keyword_targets_bangumi_only(source_keyword, trusted_subscribe or subscribe)
+         else None)
+        or (getattr(trusted_subscribe, "bangumiid", None)
+            if _is_bangumi_only_subscribe(trusted_subscribe)
+            else None)
     )
     doubanid = (
         (source_keyword or {}).get("doubanid")
@@ -2413,6 +2437,10 @@ def _bangumi_source_keyword(download_history: Any) -> Optional[dict]:
     source_keyword = SubscribeChain.parse_subscribe_source_keyword(_download_history_source(download_history))
     if not source_keyword or not _int_or_none(source_keyword.get("bangumiid")):
         return None
+    subscribe = _subscribe_from_source_keyword(source_keyword)
+    trusted_subscribe = _trusted_subscribe_for_source(source_keyword, subscribe)
+    if not _source_keyword_targets_bangumi_only(source_keyword, trusted_subscribe or subscribe):
+        return None
     return source_keyword
 
 
@@ -2436,7 +2464,7 @@ def _bangumi_only_subscribes_for_page(limit: int = 20) -> list[Subscribe]:
     try:
         subscribes = [
             subscribe for subscribe in SubscribeOper().list()
-            if subscribe.bangumiid and not subscribe.tmdbid and not subscribe.doubanid
+            if _is_bangumi_only_subscribe(subscribe)
         ]
         return sorted(subscribes, key=lambda item: item.id or 0, reverse=True)[:limit]
     except Exception as err:

@@ -99,6 +99,7 @@ MoviePilot 原生查重主要依赖 TMDB、豆瓣等字段。插件补充了 Ban
 ### 下载二级分类
 
 下载时插件会从订阅来源和 Bangumi 标签中补齐 `media_category`，使下载目录和后续整理目录尽量保持一致。
+Bangumi 下载修正只对 Bangumi-only 订阅生效，也就是订阅有 `bangumiid` 且没有 `tmdbid` / `doubanid`；已经绑定 TMDB 或豆瓣的订阅继续走对应来源，避免被 Bangumi 详情覆盖。
 
 常见结果包括：
 
@@ -137,6 +138,7 @@ MoviePilot 原生查重主要依赖 TMDB、豆瓣等字段。插件补充了 Ban
 
 - 插件状态和版本。
 - 最近 Bangumi-only 订阅。
+- 最近 Bangumi-only 来源下载。
 - 最近整理失败记录。
 - 可对符合条件的整理历史执行“使用订阅来源重新整理”。
 - 可触发最近 Bangumi 媒体目录刷新。
