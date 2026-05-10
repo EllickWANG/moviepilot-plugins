@@ -36,7 +36,7 @@ class sourceprioritysubscribe(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.10"
+    plugin_version = "1.0.11"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -467,6 +467,17 @@ _BANGUMI_ALIAS_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
             "Re: Zero kara Hajimeru Isekai Seikatsu",
             "Re Life in a Different World from Zero",
             "Re:Life in a Different World from Zero",
+        ),
+    ),
+    (
+        (
+            "嫌な顔されながらおパンツ見せてもらいたい",
+            "一脸嫌弃表情的妹子给你看胖次",
+        ),
+        (
+            "Iya na Kao Sarenagara Opantsu Misete Moraitai",
+            "Iya na Kao Sare Nagara Opantsu Misete Moraitai",
+            "I Want You To Make a Disgusted Face and Show Me Your Underwear",
         ),
     ),
 )
