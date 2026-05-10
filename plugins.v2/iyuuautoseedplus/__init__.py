@@ -37,6 +37,57 @@ def _int_config(value: Any, default: int, min_value: int, max_value: int) -> int
     return max(min_value, min(max_value, number))
 
 
+def _float_config(value: Any, default: float = 0.0, min_value: float = 0.0) -> float:
+    """
+    读取浮点数配置，错误输入按默认值处理。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(min_value, number)
+
+
+def _bool_config(value: Any) -> bool:
+    """
+    兼容布尔值和字符串布尔值，避免表单存储差异导致开关误判。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on", "启用", "开启")
+    return False
+
+
+def _list_config(value: Any) -> list:
+    """
+    兼容多选配置偶发存成单值的情况。
+    """
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _text_config(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _site_id_config(value: Any) -> Any:
+    """
+    站点 ID 可能来自内置站点或自定义站点，数字字符串按数字匹配，其余保持原值。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
 def _normalize_domain(value: Any) -> str:
     """
     归一化域名，用于匹配 IYUU 站点与 MoviePilot 统一站点配置。
@@ -98,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.3"
+    plugin_version = "2.15.4"
     # 插件作者
     plugin_author = "jxxghp,CKun,Ellick"
     # 作者主页
@@ -150,6 +201,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 待校全种子hash清单
     _recheck_torrents = {}
     _is_recheck_running = False
+    _is_auto_seed_running = False
     # 辅种缓存，出错的种子不再重复辅种，可清除
     _error_caches = []
     # 辅种缓存，辅种成功的种子，可清除
@@ -168,40 +220,42 @@ class IYUUAutoSeedPlus(_PluginBase):
 
         # 读取配置
         if config:
-            self._enabled = config.get("enabled")
-            self._skipverify = config.get("skipverify")
-            self._onlyonce = config.get("onlyonce")
-            self._cron = config.get("cron")
-            self._token = config.get("token")
-            self._downloaders = config.get("downloaders")
-            self._auto_downloader = config.get("auto_downloader")
-            self._sites = config.get("sites") or []
-            self._notify = config.get("notify")
-            self._nolabels = config.get("nolabels")
-            self._nopaths = config.get("nopaths")
-            self._labelsafterseed = config.get("labelsafterseed") if config.get("labelsafterseed") else "已整理,辅种"
-            self._categoryafterseed = config.get("categoryafterseed")
-            self._auto_category = config.get("auto_category")
-            self._auto_start = config.get("auto_start")
-            self._addhosttotag = config.get("addhosttotag")
-            self._size = float(config.get("size")) if config.get("size") else 0
+            self._enabled = _bool_config(config.get("enabled"))
+            self._skipverify = _bool_config(config.get("skipverify"))
+            self._onlyonce = _bool_config(config.get("onlyonce"))
+            self._cron = _text_config(config.get("cron"))
+            self._token = _text_config(config.get("token"))
+            self._downloaders = _list_config(config.get("downloaders"))
+            self._auto_downloader = _text_config(config.get("auto_downloader"))
+            self._sites = [_site_id_config(site_id) for site_id in _list_config(config.get("sites"))]
+            self._notify = _bool_config(config.get("notify"))
+            self._nolabels = _text_config(config.get("nolabels"))
+            self._nopaths = _text_config(config.get("nopaths"))
+            self._labelsafterseed = _text_config(config.get("labelsafterseed")) or "已整理,辅种"
+            self._categoryafterseed = _text_config(config.get("categoryafterseed"))
+            self._auto_category = _bool_config(config.get("auto_category"))
+            self._auto_start = _bool_config(config.get("auto_start"))
+            self._addhosttotag = _bool_config(config.get("addhosttotag"))
+            self._size = _float_config(config.get("size"))
             self._request_timeout = _int_config(config.get("request_timeout"), 60, 5, 300)
             self._chunk_size = _int_config(config.get("chunk_size"), 50, 1, 200)
-            self._site_aliases_text = config.get("site_aliases") or ""
+            self._site_aliases_text = _text_config(config.get("site_aliases"))
             self._site_aliases = _parse_site_aliases(self._site_aliases_text)
-            self._clearcache = config.get("clearcache")
+            self._clearcache = _bool_config(config.get("clearcache"))
             self._permanent_error_caches = [] if self._clearcache else config.get("permanent_error_caches") or []
             self._error_caches = [] if self._clearcache else config.get("error_caches") or []
             self._success_caches = [] if self._clearcache else config.get("success_caches") or []
 
             # 过滤掉已删除的站点
-            all_sites = [site.id for site in SiteOper().list_order_by_pri()] + [site.get("id") for site in
-                                                                                self.__custom_sites()]
+            all_sites = [_site_id_config(site.id) for site in SiteOper().list_order_by_pri()] + [
+                _site_id_config(site.get("id")) for site in self.__custom_sites()
+            ]
             self._sites = [site_id for site_id in all_sites if site_id in self._sites]
             self.__update_config()
 
         # 停止现有任务
         self.stop_service()
+        self._event = Event()
 
         # 启动定时任务 & 立即运行一次
         if self.get_state() or self._onlyonce:
@@ -830,105 +884,129 @@ class IYUUAutoSeedPlus(_PluginBase):
         """
         开始辅种
         """
-        if not self.iyuu_helper or not self.service_infos:
+        stop_event = self._event
+        if stop_event.is_set():
+            logger.info("辅种服务已停止，跳过本次任务")
             return
-        logger.info("开始辅种任务 ...")
+        if self._is_auto_seed_running:
+            logger.warn("已有辅种任务正在执行，跳过本次触发")
+            return
+        self._is_auto_seed_running = True
+        try:
+            services = self.service_infos
+            if not self.iyuu_helper or not services:
+                return
+            logger.info("开始辅种任务 ...")
 
-        # 计数器初始化
-        self.total = 0
-        self.realtotal = 0
-        self.success = 0
-        self.exist = 0
-        self.fail = 0
-        self.cached = 0
-        # 扫描下载器辅种
-        for service in self.service_infos.values():
-            downloader = service.name
-            downloader_obj = service.instance
-            logger.info(f"开始扫描下载器 {downloader} ...")
-            # 获取下载器中已完成的种子
-            torrents = downloader_obj.get_completed_torrents()
-            if torrents:
-                logger.info(f"下载器 {downloader} 已完成种子数：{len(torrents)}")
-            else:
-                logger.info(f"下载器 {downloader} 没有已完成种子")
-                continue
-            hash_strs = []
-            for torrent in torrents:
-                if self._event.is_set():
+            # 计数器初始化
+            self.total = 0
+            self.realtotal = 0
+            self.success = 0
+            self.exist = 0
+            self.fail = 0
+            self.cached = 0
+            # 扫描下载器辅种
+            for service in services.values():
+                if stop_event.is_set():
                     logger.info(f"辅种服务停止")
                     return
-                # 获取种子hash
-                hash_str = self.__get_hash(torrent=torrent, dl_type=service.type)
-                if hash_str in self._error_caches or hash_str in self._permanent_error_caches:
-                    logger.info(f"种子 {hash_str} 辅种失败且已缓存，跳过 ...")
+                downloader = service.name
+                downloader_obj = service.instance
+                logger.info(f"开始扫描下载器 {downloader} ...")
+                # 获取下载器中已完成的种子
+                torrents = downloader_obj.get_completed_torrents()
+                if torrents:
+                    logger.info(f"下载器 {downloader} 已完成种子数：{len(torrents)}")
+                else:
+                    logger.info(f"下载器 {downloader} 没有已完成种子")
                     continue
-                save_path = self.__get_save_path(torrent=torrent, dl_type=service.type)
-
-                if self._nopaths and save_path:
-                    # 过滤不需要转移的路径
-                    nopath_skip = False
-                    for nopath in self._nopaths.split('\n'):
-                        if os.path.normpath(save_path).startswith(os.path.normpath(nopath)):
-                            logger.info(f"种子 {hash_str} 保存路径 {save_path} 不需要辅种，跳过 ...")
-                            nopath_skip = True
-                            break
-                    if nopath_skip:
+                hash_strs = []
+                for torrent in torrents:
+                    if stop_event.is_set():
+                        logger.info(f"辅种服务停止")
+                        return
+                    # 获取种子hash
+                    hash_str = self.__get_hash(torrent=torrent, dl_type=service.type)
+                    if hash_str in self._error_caches or hash_str in self._permanent_error_caches:
+                        logger.info(f"种子 {hash_str} 辅种失败且已缓存，跳过 ...")
                         continue
+                    save_path = self.__get_save_path(torrent=torrent, dl_type=service.type)
 
-                # 获取种子标签
-                torrent_labels = self.__get_label(torrent=torrent, dl_type=service.type)
-                if torrent_labels and self._nolabels:
-                    is_skip = False
-                    for label in self._nolabels.split(','):
-                        if label in torrent_labels:
-                            logger.info(f"种子 {hash_str} 含有不辅种标签 {label}，跳过 ...")
-                            is_skip = True
-                            break
-                    if is_skip:
+                    if self._nopaths and save_path:
+                        # 过滤不需要转移的路径
+                        nopath_skip = False
+                        for nopath in [item.strip() for item in self._nopaths.split('\n') if item.strip()]:
+                            if os.path.normpath(save_path).startswith(os.path.normpath(nopath)):
+                                logger.info(f"种子 {hash_str} 保存路径 {save_path} 不需要辅种，跳过 ...")
+                                nopath_skip = True
+                                break
+                        if nopath_skip:
+                            continue
+
+                    # 获取种子标签
+                    torrent_labels = self.__get_label(torrent=torrent, dl_type=service.type)
+                    if torrent_labels and self._nolabels:
+                        is_skip = False
+                        for label in [item.strip() for item in self._nolabels.split(',') if item.strip()]:
+                            if label in torrent_labels:
+                                logger.info(f"种子 {hash_str} 含有不辅种标签 {label}，跳过 ...")
+                                is_skip = True
+                                break
+                        if is_skip:
+                            continue
+                    # 体积排除辅种
+                    torrent_size = self.__get_torrent_size(torrent=torrent, dl_type=service.type) / 1024 / 1024 / 1024
+                    if self._size and torrent_size < self._size:
+                        logger.info(f"种子 {hash_str} 大小:{torrent_size:.2f}GB，小于设定 {self._size}GB，跳过 ...")
                         continue
-                # 体积排除辅种
-                torrent_size = self.__get_torrent_size(torrent=torrent, dl_type=service.type) / 1024 / 1024 / 1024
-                if self._size and torrent_size < self._size:
-                    logger.info(f"种子 {hash_str} 大小:{torrent_size:.2f}GB，小于设定 {self._size}GB，跳过 ...")
-                    continue
-                category = self.__get_category(torrent=torrent, dl_type=service.type) if self._auto_category else None
-                hash_strs.append({
-                    "hash": hash_str,
-                    "save_path": save_path,
-                    "category": category or self._categoryafterseed
-                })
-            if hash_strs:
-                chunk_size = self._chunk_size or 50
-                logger.info(f"总共需要辅种的种子数：{len(hash_strs)}，每批查询：{chunk_size}")
-                # 分组处理，避免单次Hash过多导致IYUU接口超时。
-                for i in range(0, len(hash_strs), chunk_size):
-                    # 切片操作
-                    chunk = hash_strs[i:i + chunk_size]
-                    # 处理分组
-                    self.__seed_torrents(hash_strs=chunk,
-                                         service=service)
-                # 触发校验检查
-                self.check_recheck()
-            else:
-                logger.info(f"没有需要辅种的种子")
+                    category = self.__get_category(torrent=torrent, dl_type=service.type) if self._auto_category else None
+                    hash_strs.append({
+                        "hash": hash_str,
+                        "save_path": save_path,
+                        "category": category or self._categoryafterseed
+                    })
+                if hash_strs:
+                    chunk_size = self._chunk_size or 50
+                    total_batches = (len(hash_strs) + chunk_size - 1) // chunk_size
+                    logger.info(f"总共需要辅种的种子数：{len(hash_strs)}，每批查询：{chunk_size}")
+                    # 分组处理，避免单次Hash过多导致IYUU接口超时。
+                    for batch_index, i in enumerate(range(0, len(hash_strs), chunk_size), start=1):
+                        if stop_event.is_set():
+                            logger.info(f"辅种服务停止")
+                            return
+                        # 切片操作
+                        chunk = hash_strs[i:i + chunk_size]
+                        logger.info(
+                            f"下载器 {downloader} 第 {batch_index}/{total_batches} 批辅种查询，"
+                            f"配置每批：{chunk_size}，本批：{len(chunk)}"
+                        )
+                        # 处理分组
+                        self.__seed_torrents(hash_strs=chunk,
+                                             service=service,
+                                             stop_event=stop_event)
+                    # 触发校验检查
+                    self.check_recheck()
+                else:
+                    logger.info(f"没有需要辅种的种子")
 
-        # 保存缓存
-        self.__update_config()
-        # 发送消息
-        if self._notify:
-            if self.success or self.fail:
-                self.post_message(
-                    mtype=NotificationType.SiteMessage,
-                    title="【IYUU自动辅种任务完成】",
-                    text=f"服务器返回可辅种总数：{self.total}\n"
-                         f"实际可辅种数：{self.realtotal}\n"
-                         f"已存在：{self.exist}\n"
-                         f"成功：{self.success}\n"
-                         f"失败：{self.fail}\n"
-                         f"{self.cached} 条失败记录已加入缓存"
-                )
-        logger.info("辅种任务执行完成")
+            # 保存缓存
+            self.__update_config()
+            # 发送消息
+            if self._notify:
+                if self.success or self.fail:
+                    self.post_message(
+                        mtype=NotificationType.SiteMessage,
+                        title="【IYUU自动辅种任务完成】",
+                        text=f"服务器返回可辅种总数：{self.total}\n"
+                             f"实际可辅种数：{self.realtotal}\n"
+                             f"已存在：{self.exist}\n"
+                             f"成功：{self.success}\n"
+                             f"失败：{self.fail}\n"
+                             f"{self.cached} 条失败记录已加入缓存"
+                    )
+            logger.info("辅种任务执行完成")
+        finally:
+            self._is_auto_seed_running = False
 
     def check_recheck(self):
         """
@@ -945,6 +1023,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             self._is_recheck_running = False
             return
         if not self.service_infos:
+            self._is_recheck_running = False
             return
         for service in self.service_infos.values():
             # 需要检查的种子
@@ -985,11 +1064,14 @@ class IYUUAutoSeedPlus(_PluginBase):
             logger.info(f"下载器 {downloader} 中没有需要检查的校验任务，清空待处理列表 ...")
             self._recheck_torrents[downloader] = []
 
-    def __seed_torrents(self, hash_strs: list, service: ServiceInfo):
+    def __seed_torrents(self, hash_strs: list, service: ServiceInfo, stop_event: Optional[Event] = None):
         """
         执行一批种子的辅种
         """
         if not hash_strs:
+            return
+        if stop_event and stop_event.is_set():
+            logger.info(f"辅种服务停止")
             return
         logger.info(f"下载器 {service.name} 开始查询辅种，数量：{len(hash_strs)} ...")
         # 下载器中的Hashs
@@ -1002,6 +1084,9 @@ class IYUUAutoSeedPlus(_PluginBase):
             save_category[item.get("hash")] = item.get("category")
         # 查询可辅种数据
         seed_list, msg = self.iyuu_helper.get_seed_info(hashs)
+        if stop_event and stop_event.is_set():
+            logger.info(f"辅种服务停止")
+            return
         if not isinstance(seed_list, dict):
             # 判断辅种异常是否是由于Token未认证导致的，由于没有解决接口，只能从返回值来判断
             if self._token and msg == '请求缺少token':
@@ -1015,6 +1100,9 @@ class IYUUAutoSeedPlus(_PluginBase):
             logger.info(f"IYUU返回可辅种数：{len(seed_list)}")
         # 遍历
         for current_hash, seed_info in seed_list.items():
+            if stop_event and stop_event.is_set():
+                logger.info(f"辅种服务停止")
+                return
             if not seed_info:
                 continue
             seed_torrents = seed_info.get("torrent")
@@ -1025,6 +1113,9 @@ class IYUUAutoSeedPlus(_PluginBase):
             success_torrents = []
 
             for seed in seed_torrents:
+                if stop_event and stop_event.is_set():
+                    logger.info(f"辅种服务停止")
+                    return
                 if not seed:
                     continue
                 if not isinstance(seed, dict):
@@ -1117,7 +1208,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     def __download(self, service: ServiceInfo, content: bytes,
                    save_path: str, save_category: str, site_name: str) -> Optional[str]:
 
-        torrent_tags = self._labelsafterseed.split(',')
+        torrent_tags = [tag.strip() for tag in self._labelsafterseed.split(',') if tag.strip()]
 
         # 辅种 tag 叠加站点名
         if self._addhosttotag:
@@ -1648,7 +1739,6 @@ class IYUUAutoSeedPlus(_PluginBase):
                     self._event.set()
                     # 热更新/重载时不要等待正在执行的任务结束，避免安装接口被长任务阻塞。
                     self._scheduler.shutdown(wait=False)
-                    self._event.clear()
                 self._scheduler = None
         except Exception as e:
             print(str(e))
