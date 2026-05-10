@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from app import schemas
 from app.api.endpoints.search import _stream_search_events
+from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
 from app.chain.storage import StorageChain
@@ -45,7 +46,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.22"
+    plugin_version = "1.0.23"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -158,6 +159,7 @@ class sourceprioritysubscribefix(_PluginBase):
             "search_process": SearchChain.process,
             "search_async_process": SearchChain.async_process,
             "search_async_process_stream": SearchChain.async_process_stream,
+            "download_single": DownloadChain.download_single,
             "oper_add": SubscribeOper.add,
             "oper_async_add": SubscribeOper.async_add,
             "oper_exists": SubscribeOper.exists,
@@ -179,6 +181,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.process = _patched_search_process
         SearchChain.async_process = _patched_search_async_process
         SearchChain.async_process_stream = _patched_search_async_process_stream
+        DownloadChain.download_single = _patched_download_single
         SubscribeOper.add = _patched_oper_add
         SubscribeOper.async_add = _patched_oper_async_add
         SubscribeOper.exists = _patched_oper_exists
@@ -208,6 +211,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.process = cls._originals["search_process"]
         SearchChain.async_process = cls._originals["search_async_process"]
         SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
+        DownloadChain.download_single = cls._originals["download_single"]
         SubscribeOper.add = cls._originals["oper_add"]
         SubscribeOper.async_add = cls._originals["oper_async_add"]
         SubscribeOper.exists = cls._originals["oper_exists"]
@@ -808,7 +812,7 @@ def _subscribe_from_source_keyword(source_keyword: dict) -> Optional[Subscribe]:
 
 
 def _source_media_from_download_history(chain: Any, download_history: Any) -> Optional[MediaInfo]:
-    if not download_history or getattr(download_history, "tmdbid", None) or getattr(download_history, "doubanid", None):
+    if not download_history:
         return None
     source_keyword = SubscribeChain.parse_subscribe_source_keyword(_download_history_source(download_history))
     subscribe = _subscribe_from_source_keyword(source_keyword) if source_keyword else None
@@ -846,11 +850,103 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
     )
     if mediainfo.type == MediaType.TV and season is not None:
         mediainfo.season = season
-    if getattr(download_history, "media_category", None):
-        mediainfo.category = download_history.media_category
-    elif subscribe and getattr(subscribe, "media_category", None):
+    if subscribe and getattr(subscribe, "media_category", None):
         mediainfo.category = subscribe.media_category
+    elif not mediainfo.category and getattr(download_history, "media_category", None):
+        mediainfo.category = download_history.media_category
     return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+
+
+def _source_media_from_source(
+        chain: Any,
+        source: Optional[str],
+        current_media: Optional[MediaInfo] = None,
+        meta: Any = None) -> tuple[Optional[MediaInfo], Optional[Subscribe]]:
+    source_keyword = SubscribeChain.parse_subscribe_source_keyword(source)
+    subscribe = _subscribe_from_source_keyword(source_keyword) if source_keyword else None
+    if not subscribe and current_media and current_media.bangumi_id:
+        subscribe = SubscribeOper().get_by(bangumiid=current_media.bangumi_id)
+    if not subscribe and meta:
+        subscribe = _match_subscribe_by_meta(meta, getattr(current_media, "type", None))
+
+    bangumiid = _int_or_none(
+        getattr(subscribe, "bangumiid", None)
+        or (source_keyword or {}).get("bangumiid")
+        or getattr(current_media, "bangumi_id", None)
+    )
+    doubanid = (
+        getattr(subscribe, "doubanid", None)
+        or (source_keyword or {}).get("doubanid")
+        or getattr(current_media, "douban_id", None)
+    )
+    mtype = (
+        _media_type_or_none(getattr(current_media, "type", None))
+        or _media_type_or_none((source_keyword or {}).get("type"))
+        or _media_type_or_none(getattr(subscribe, "type", None))
+    )
+    if bangumiid:
+        mediainfo = _media_from_bangumi(chain, bangumiid)
+    elif doubanid:
+        mediainfo = _media_from_douban(chain, doubanid, mtype)
+    else:
+        return None, subscribe
+    if not mediainfo:
+        return None, subscribe
+    if mtype:
+        mediainfo.type = mtype
+    season = (
+        _int_or_none((source_keyword or {}).get("season"))
+        or _season_number(getattr(subscribe, "season", None))
+        or _season_number(getattr(meta, "begin_season", None))
+    )
+    if mediainfo.type == MediaType.TV and season is not None:
+        mediainfo.season = season
+    if subscribe and getattr(subscribe, "media_category", None):
+        mediainfo.category = subscribe.media_category
+    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe)), subscribe
+
+
+def _apply_download_source_category(chain: Any, context: Any, source: Optional[str]) -> None:
+    if not context or not getattr(context, "media_info", None):
+        return
+    current_media: MediaInfo = context.media_info
+    source_media, subscribe = _source_media_from_source(
+        chain=chain,
+        source=source,
+        current_media=current_media,
+        meta=getattr(context, "meta_info", None),
+    )
+    source_category = (
+        getattr(subscribe, "media_category", None)
+        or getattr(source_media, "category", None)
+    )
+    if not source_category:
+        return
+    old_category = current_media.category
+    if old_category == source_category:
+        return
+    current_media.category = source_category
+    if source_media:
+        current_media.bangumi_id = source_media.bangumi_id or current_media.bangumi_id
+        current_media.douban_id = source_media.douban_id or current_media.douban_id
+        current_media.episode_group = source_media.episode_group or current_media.episode_group
+    logger.info(
+        f"{getattr(current_media, 'title_year', None) or getattr(current_media, 'title', '')} "
+        f"下载二级分类按订阅来源修正：{old_category or '-'} -> {source_category}"
+    )
+
+
+def _patched_download_single(self: DownloadChain, *args, **kwargs):
+    args_list = list(args)
+    context = kwargs.get("context") or (args_list[0] if args_list else None)
+    source = kwargs.get("source")
+    if source is None and len(args_list) > 5:
+        source = args_list[5]
+    try:
+        _apply_download_source_category(self, context, source)
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件修正下载二级分类失败：{err}")
+    return sourceprioritysubscribefix._originals["download_single"](self, *args_list, **kwargs)
 
 
 def _download_history_by_hash_or_file(download_hash: Optional[str], fileitem: Any) -> Optional[Any]:
