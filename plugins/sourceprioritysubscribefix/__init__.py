@@ -49,7 +49,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.31"
+    plugin_version = "1.0.32"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -397,6 +397,7 @@ _SOURCE_SUBSCRIBE_CACHE = {
 }
 
 _MEDIA_SERVER_REFRESH_CACHE: dict[str, float] = {}
+_MEDIA_SERVER_COMPAT_ID_CACHE: dict[str, tuple[float, Optional[int]]] = {}
 
 
 def _clear_source_subscribe_cache():
@@ -1347,6 +1348,104 @@ def _bangumi_tv_show_title(mediainfo: MediaInfo, original: bool = False) -> str:
     return _strip_bangumi_tv_season_suffix(fallback)
 
 
+def _media_server_compat_cache_key(mediainfo: MediaInfo, title: str) -> str:
+    return "|".join([
+        _type_value(getattr(mediainfo, "type", None)) or "",
+        _normalize_match_text(title),
+        str(getattr(mediainfo, "year", None) or ""),
+    ])
+
+
+def _tmdb_id_from_media_server_item(item: Any) -> Optional[int]:
+    tmdbid = getattr(item, "tmdbid", None)
+    if not tmdbid and getattr(item, "trim_id", None):
+        trim_id = str(getattr(item, "trim_id"))
+        if trim_id.startswith(("tt", "tm")) and trim_id[2:].isdigit():
+            tmdbid = trim_id[2:]
+    return _int_or_none(tmdbid)
+
+
+def _lookup_existing_tv_tmdb_id(server: Any, title: str, season: Optional[int]) -> Optional[int]:
+    title_key = _normalize_match_text(title)
+    api = getattr(server, "_api", None)
+    if api and hasattr(api, "search_list"):
+        try:
+            for item in api.search_list(title) or []:
+                item_type = _type_value(getattr(getattr(item, "type", None), "value", getattr(item, "type", None)))
+                if item_type and item_type not in ("TV", MediaType.TV.value):
+                    continue
+                item_title = getattr(item, "title", None)
+                if _normalize_match_text(item_title) != title_key:
+                    continue
+                tmdbid = _tmdb_id_from_media_server_item(item)
+                if tmdbid:
+                    return tmdbid
+        except Exception:
+            pass
+    if not (hasattr(server, "get_tv_episodes") and hasattr(server, "get_iteminfo")):
+        return None
+    try:
+        item_id, _ = server.get_tv_episodes(title=title, year=None, season=season)
+    except Exception:
+        return None
+    if not item_id:
+        return None
+    try:
+        return _tmdb_id_from_media_server_item(server.get_iteminfo(item_id))
+    except Exception:
+        return None
+
+
+def _existing_media_server_tmdb_id(mediainfo: MediaInfo) -> Optional[int]:
+    tmdbid = _int_or_none(getattr(mediainfo, "tmdb_id", None))
+    if tmdbid:
+        return tmdbid
+    media_type = _type_value(getattr(mediainfo, "type", None))
+    if media_type not in (MediaType.TV.value, "TV"):
+        return None
+    title = _bangumi_tv_show_title(mediainfo)
+    if not title:
+        return None
+    cache_key = _media_server_compat_cache_key(mediainfo, title)
+    now = time.time()
+    cached = _MEDIA_SERVER_COMPAT_ID_CACHE.get(cache_key)
+    if cached and now - cached[0] < 600:
+        return cached[1]
+    result = None
+    try:
+        media_chain = MediaServerChain()
+        for module in media_chain.modulemanager.get_running_type_modules(ModuleType.MediaServer):
+            if not hasattr(module, "get_instances"):
+                continue
+            for _, server in (module.get_instances() or {}).items():
+                if not server:
+                    continue
+                result = _lookup_existing_tv_tmdb_id(server, title, getattr(mediainfo, "season", None))
+                if result:
+                    break
+            if result:
+                break
+    except Exception as err:
+        logger.debug(f"Bangumi媒体服务器兼容ID查询失败：{title} - {err}")
+    _MEDIA_SERVER_COMPAT_ID_CACHE[cache_key] = (now, result)
+    if result:
+        logger.info(f"{mediainfo.title_year} 使用现有媒体服务器TMDBID兼容聚合：{result}")
+    return result
+
+
+def _add_tmdb_unique_id(
+        doc: minidom.Document,
+        root: minidom.Node,
+        mediainfo: MediaInfo) -> None:
+    tmdbid = _existing_media_server_tmdb_id(mediainfo)
+    if not tmdbid:
+        return
+    uniqueid = DomUtils.add_node(doc, root, "uniqueid", str(tmdbid))
+    uniqueid.setAttribute("type", "tmdb")
+    uniqueid.setAttribute("default", "false")
+    DomUtils.add_node(doc, root, "tmdbid", str(tmdbid))
+
+
 def _bangumi_add_common_nfo(
         doc: minidom.Document,
         root: minidom.Node,
@@ -1383,6 +1482,7 @@ def _bangumi_tv_nfo(mediainfo: MediaInfo) -> minidom.Document:
     doc = minidom.Document()
     root = DomUtils.add_node(doc, doc, "tvshow")
     _bangumi_add_common_nfo(doc, root, mediainfo)
+    _add_tmdb_unique_id(doc, root, mediainfo)
     _add_text_node(doc, root, "title", _bangumi_tv_show_title(mediainfo))
     _add_text_node(doc, root, "originaltitle", _bangumi_tv_show_title(mediainfo, original=True))
     _add_text_node(doc, root, "season", "-1")
