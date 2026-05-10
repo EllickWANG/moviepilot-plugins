@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.6"
+    plugin_version = "2.15.7"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -222,38 +222,7 @@ class IYUUAutoSeedPlus(_PluginBase):
 
         # 读取配置
         if config:
-            self._enabled = _bool_config(config.get("enabled"))
-            self._skipverify = _bool_config(config.get("skipverify"))
-            self._onlyonce = _bool_config(config.get("onlyonce"))
-            self._cron = _text_config(config.get("cron"))
-            self._token = _text_config(config.get("token"))
-            self._downloaders = _list_config(config.get("downloaders"))
-            self._auto_downloader = _text_config(config.get("auto_downloader"))
-            self._sites = [_site_id_config(site_id) for site_id in _list_config(config.get("sites"))]
-            self._notify = _bool_config(config.get("notify"))
-            self._nolabels = _text_config(config.get("nolabels"))
-            self._nopaths = _text_config(config.get("nopaths"))
-            self._labelsafterseed = _text_config(config.get("labelsafterseed")) or "已整理,辅种"
-            self._categoryafterseed = _text_config(config.get("categoryafterseed"))
-            self._auto_category = _bool_config(config.get("auto_category"))
-            self._auto_start = _bool_config(config.get("auto_start"))
-            self._addhosttotag = _bool_config(config.get("addhosttotag"))
-            self._size = _float_config(config.get("size"))
-            self._request_timeout = _int_config(config.get("request_timeout"), 60, 5, 300)
-            self._downloader_timeout = _int_config(config.get("downloader_timeout"), 15, 3, 300)
-            self._chunk_size = _int_config(config.get("chunk_size"), 50, 1, 200)
-            self._site_aliases_text = _text_config(config.get("site_aliases"))
-            self._site_aliases = _parse_site_aliases(self._site_aliases_text)
-            self._clearcache = _bool_config(config.get("clearcache"))
-            self._permanent_error_caches = [] if self._clearcache else config.get("permanent_error_caches") or []
-            self._error_caches = [] if self._clearcache else config.get("error_caches") or []
-            self._success_caches = [] if self._clearcache else config.get("success_caches") or []
-
-            # 过滤掉已删除的站点
-            all_sites = [_site_id_config(site.id) for site in SiteOper().list_order_by_pri()] + [
-                _site_id_config(site.get("id")) for site in self.__custom_sites()
-            ]
-            self._sites = [site_id for site_id in all_sites if site_id in self._sites]
+            self.__load_config(config)
             self.__update_config()
 
         # 停止现有任务
@@ -290,6 +259,71 @@ class IYUUAutoSeedPlus(_PluginBase):
             # 启动服务
             self._scheduler.print_jobs()
             self._scheduler.start()
+
+    def __load_config(self, config: dict) -> None:
+        """
+        读取并标准化插件配置。
+        """
+        self._enabled = _bool_config(config.get("enabled"))
+        self._skipverify = _bool_config(config.get("skipverify"))
+        self._onlyonce = _bool_config(config.get("onlyonce"))
+        self._cron = _text_config(config.get("cron"))
+        self._token = _text_config(config.get("token"))
+        self._downloaders = _list_config(config.get("downloaders"))
+        self._auto_downloader = _text_config(config.get("auto_downloader"))
+        self._sites = [_site_id_config(site_id) for site_id in _list_config(config.get("sites"))]
+        self._notify = _bool_config(config.get("notify"))
+        self._nolabels = _text_config(config.get("nolabels"))
+        self._nopaths = _text_config(config.get("nopaths"))
+        self._labelsafterseed = _text_config(config.get("labelsafterseed")) or "已整理,辅种"
+        self._categoryafterseed = _text_config(config.get("categoryafterseed"))
+        self._auto_category = _bool_config(config.get("auto_category"))
+        self._auto_start = _bool_config(config.get("auto_start"))
+        self._addhosttotag = _bool_config(config.get("addhosttotag"))
+        self._size = _float_config(config.get("size"))
+        self._request_timeout = _int_config(config.get("request_timeout"), 60, 5, 300)
+        self._downloader_timeout = _int_config(config.get("downloader_timeout"), 15, 3, 300)
+        self._chunk_size = _int_config(config.get("chunk_size"), 50, 1, 200)
+        self._site_aliases_text = _text_config(config.get("site_aliases"))
+        self._site_aliases = _parse_site_aliases(self._site_aliases_text)
+        self._clearcache = _bool_config(config.get("clearcache"))
+        self._permanent_error_caches = [] if self._clearcache else config.get("permanent_error_caches") or []
+        self._error_caches = [] if self._clearcache else config.get("error_caches") or []
+        self._success_caches = [] if self._clearcache else config.get("success_caches") or []
+
+        # 过滤掉已删除的站点
+        all_sites = [_site_id_config(site.id) for site in SiteOper().list_order_by_pri()] + [
+            _site_id_config(site.get("id")) for site in self.__custom_sites()
+        ]
+        self._sites = [site_id for site_id in all_sites if site_id in self._sites]
+
+    def __reload_runtime_config(self) -> None:
+        """
+        每轮任务开始前重新读取配置，让超时、批量、筛选项等配置即时生效。
+        """
+        config = self.get_config() or {}
+        if not config:
+            return
+        old_token = self._token
+        old_request_timeout = self._request_timeout
+        old_downloader_timeout = self._downloader_timeout
+        old_chunk_size = self._chunk_size
+        self.__load_config(config)
+        if (
+                not self.iyuu_helper
+                or old_token != self._token
+                or old_request_timeout != self._request_timeout
+        ):
+            self.iyuu_helper = IyuuHelper(token=self._token, timeout=self._request_timeout)
+        if (
+                old_request_timeout != self._request_timeout
+                or old_downloader_timeout != self._downloader_timeout
+                or old_chunk_size != self._chunk_size
+        ):
+            logger.info(
+                f"IYUU自动辅种增强运行配置已刷新：IYUU请求超时 {self._request_timeout} 秒，"
+                f"下载器请求超时 {self._downloader_timeout} 秒，每批 {self._chunk_size} 个Hash"
+            )
 
     @property
     def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
@@ -924,6 +958,10 @@ class IYUUAutoSeedPlus(_PluginBase):
             return
         self._is_auto_seed_running = True
         try:
+            self.__reload_runtime_config()
+            if not self.get_state():
+                logger.info("辅种配置不完整或插件已禁用，跳过本次任务")
+                return
             services = self.service_infos
             if not self.iyuu_helper or not services:
                 return
