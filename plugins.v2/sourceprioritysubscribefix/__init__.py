@@ -49,7 +49,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.29"
+    plugin_version = "1.0.30"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -472,7 +472,8 @@ def _match_subscribe_by_meta(meta: Any, mtype: Optional[MediaType]) -> Optional[
     meta_type = _type_value(mtype) or _type_value(getattr(meta, "type", None))
     meta_season = getattr(meta, "begin_season", None)
     for subscribe in _source_only_subscribes():
-        if meta_type and subscribe.type and meta_type != subscribe.type:
+        subscribe_type = _type_value(subscribe.type)
+        if meta_type and subscribe_type and meta_type != subscribe_type:
             continue
         if meta_season is not None and subscribe.season is not None and meta_season != subscribe.season:
             continue
@@ -514,7 +515,8 @@ def _match_subscribe_by_download_history(download_history: Any) -> Optional[Subs
     history_year = str(getattr(download_history, "year", "") or "").strip()
 
     for subscribe in _source_only_subscribes():
-        if history_type and subscribe.type and history_type != subscribe.type:
+        subscribe_type = _type_value(subscribe.type)
+        if history_type and subscribe_type and history_type != subscribe_type:
             continue
         if history_season is not None and subscribe.season is not None and history_season != subscribe.season:
             continue
@@ -547,7 +549,8 @@ def _match_subscribe_by_transfer_history(history: Any) -> Optional[Subscribe]:
     history_year = str(getattr(history, "year", "") or "").strip()
 
     for subscribe in _source_only_subscribes():
-        if history_type and subscribe.type and history_type != subscribe.type:
+        subscribe_type = _type_value(subscribe.type)
+        if history_type and subscribe_type and history_type != subscribe_type:
             continue
         if history_season is not None and subscribe.season is not None and history_season != subscribe.season:
             continue
