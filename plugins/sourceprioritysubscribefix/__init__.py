@@ -25,8 +25,10 @@ from app.core.metainfo import MetaInfo
 from app.core.security import verify_resource_token, verify_token
 from app.db import async_db_query, db_query
 from app.db.downloadhistory_oper import DownloadHistoryOper
+from app.db.models.downloadhistory import DownloadHistory
 from app.db.models.subscribe import Subscribe
 from app.db.models.subscribehistory import SubscribeHistory
+from app.db.models.transferhistory import TransferHistory
 from app.db.subscribe_oper import SubscribeOper
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.factory import app
@@ -42,7 +44,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.14"
+    plugin_version = "1.0.15"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -76,7 +78,7 @@ class sourceprioritysubscribefix(_PluginBase):
     def get_api(self) -> List[dict]:
         return [
             {
-                "path": "/sourceprioritysubscribefix/redo/{history_id}",
+                "path": "/redo/{history_id}",
                 "endpoint": _plugin_redo_transfer_history,
                 "methods": ["POST"],
                 "auth": "bear",
@@ -137,7 +139,7 @@ class sourceprioritysubscribefix(_PluginBase):
         ], {"enabled": True}
 
     def get_page(self) -> Optional[List[dict]]:
-        return None
+        return _diagnostic_page(self)
 
     def stop_service(self):
         self._unpatch()
@@ -835,6 +837,329 @@ def _plugin_redo_transfer_history(history_id: int) -> Any:
         state, message = result
         return schemas.Response(success=state, message=message)
     return schemas.Response(success=False, message="未找到可用的 Bangumi 订阅来源整理信息")
+
+
+def _safe_page_text(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    return str(value)
+
+
+def _page_db_items(model: Any, status: Optional[bool] = None, limit: int = 20) -> list[Any]:
+    try:
+        oper = TransferHistoryOper() if model is TransferHistory else DownloadHistoryOper()
+        query = oper._db.query(model)
+        if model is TransferHistory and status is not None:
+            query = query.filter(TransferHistory.status.is_(status))
+        return query.order_by(model.id.desc()).limit(limit).all()
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件读取页面数据失败：{err}")
+        return []
+
+
+def _bangumi_source_keyword(download_history: Any) -> Optional[dict]:
+    source_keyword = SubscribeChain.parse_subscribe_source_keyword(_download_history_source(download_history))
+    if not source_keyword or not _int_or_none(source_keyword.get("bangumiid")):
+        return None
+    return source_keyword
+
+
+def _source_downloads(limit: int = 12) -> list[DownloadHistory]:
+    result = []
+    for history in _page_db_items(DownloadHistory, limit=80):
+        if _bangumi_source_keyword(history):
+            result.append(history)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _bangumi_only_subscribes_for_page(limit: int = 20) -> list[Subscribe]:
+    try:
+        subscribes = [
+            subscribe for subscribe in SubscribeOper().list()
+            if subscribe.bangumiid and not subscribe.tmdbid and not subscribe.doubanid
+        ]
+        return sorted(subscribes, key=lambda item: item.id or 0, reverse=True)[:limit]
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件读取订阅数据失败：{err}")
+        return []
+
+
+def _component_text(component: str, text: Any, props: Optional[dict] = None) -> dict:
+    item = {
+        "component": component,
+        "text": _safe_page_text(text),
+    }
+    if props:
+        item["props"] = props
+    return item
+
+
+def _stat_card(title: str, value: Any, subtitle: str, icon: str, color: str) -> dict:
+    return {
+        "component": "VCol",
+        "props": {"cols": 12, "sm": 6, "lg": 3},
+        "content": [
+            {
+                "component": "VCard",
+                "props": {"variant": "tonal", "color": color},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "d-flex align-center justify-space-between"},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "content": [
+                                            _component_text("div", title, {"class": "text-caption"}),
+                                            _component_text("div", value, {"class": "text-h5 font-weight-bold mt-1"}),
+                                            _component_text("div", subtitle, {"class": "text-caption mt-1"}),
+                                        ],
+                                    },
+                                    {
+                                        "component": "VIcon",
+                                        "props": {"icon": icon, "size": 32},
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _table_header(headers: list[str]) -> dict:
+    return {
+        "component": "thead",
+        "content": [
+            {
+                "component": "tr",
+                "content": [
+                    {
+                        "component": "th",
+                        "props": {"class": "text-start ps-4"},
+                        "text": header,
+                    }
+                    for header in headers
+                ],
+            }
+        ],
+    }
+
+
+def _td(text: Any, class_name: str = "") -> dict:
+    item = {
+        "component": "td",
+        "text": _safe_page_text(text),
+    }
+    if class_name:
+        item["props"] = {"class": class_name}
+    return item
+
+
+def _table_card(title: str, icon: str, headers: list[str], rows: list[dict], empty_text: str) -> dict:
+    content = [
+        {
+            "component": "div",
+            "props": {"class": "d-flex align-center mb-3"},
+            "content": [
+                {"component": "VIcon", "props": {"icon": icon, "class": "mr-2"}},
+                _component_text("div", title, {"class": "text-subtitle-1 font-weight-medium"}),
+            ],
+        }
+    ]
+    if rows:
+        content.append({
+            "component": "div",
+            "props": {"class": "overflow-x-auto"},
+            "content": [
+                {
+                    "component": "VTable",
+                    "props": {"hover": True, "density": "compact"},
+                    "content": [
+                        _table_header(headers),
+                        {
+                            "component": "tbody",
+                            "content": rows,
+                        },
+                    ],
+                }
+            ],
+        })
+    else:
+        content.append({
+            "component": "VAlert",
+            "props": {
+                "type": "info",
+                "variant": "tonal",
+                "text": empty_text,
+            },
+        })
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined"},
+        "content": [
+            {
+                "component": "VCardText",
+                "content": content,
+            }
+        ],
+    }
+
+
+def _redo_button(plugin_id: str, history_id: int) -> dict:
+    return {
+        "component": "VBtn",
+        "props": {
+            "size": "small",
+            "variant": "tonal",
+            "color": "primary",
+            "prepend-icon": "mdi-restore",
+        },
+        "text": "重整",
+        "events": {
+            "click": {
+                "api": f"plugin/{plugin_id}/redo/{history_id}",
+                "method": "post",
+            }
+        },
+    }
+
+
+def _failed_transfer_rows(plugin_id: str, histories: list[TransferHistory]) -> list[dict]:
+    rows = []
+    for history in histories:
+        source_keyword = _bangumi_source_keyword(_download_history_by_hash_or_file(history.download_hash, None))
+        source_text = (
+            f"bangumi:{source_keyword.get('bangumiid')}"
+            if source_keyword
+            else "无 Bangumi 订阅来源"
+        )
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(history.id, "text-no-wrap"),
+                _td(history.title, "text-no-wrap"),
+                _td(source_text, "text-no-wrap"),
+                _td(history.errmsg),
+                _td(history.date, "text-no-wrap"),
+                {
+                    "component": "td",
+                    "content": [_redo_button(plugin_id, history.id)] if source_keyword else [],
+                },
+            ],
+        })
+    return rows
+
+
+def _subscribe_rows(subscribes: list[Subscribe]) -> list[dict]:
+    rows = []
+    for subscribe in subscribes:
+        progress = f"{(subscribe.total_episode or 0) - (subscribe.lack_episode or 0)} / {subscribe.total_episode or 0}"
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(subscribe.id, "text-no-wrap"),
+                _td(subscribe.name, "text-no-wrap"),
+                _td(subscribe.year, "text-no-wrap"),
+                _td(f"S{subscribe.season:02d}" if subscribe.season else "-", "text-no-wrap"),
+                _td(f"bangumi:{subscribe.bangumiid}", "text-no-wrap"),
+                _td(progress, "text-no-wrap"),
+            ],
+        })
+    return rows
+
+
+def _download_rows(downloads: list[DownloadHistory]) -> list[dict]:
+    rows = []
+    for download in downloads:
+        source_keyword = _bangumi_source_keyword(download) or {}
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(download.id, "text-no-wrap"),
+                _td(download.title, "text-no-wrap"),
+                _td(f"bangumi:{source_keyword.get('bangumiid')}", "text-no-wrap"),
+                _td(download.torrent_name),
+                _td(download.date, "text-no-wrap"),
+            ],
+        })
+    return rows
+
+
+def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
+    plugin_id = plugin.__class__.__name__
+    failed_histories = _page_db_items(TransferHistory, status=False, limit=20)
+    source_download_items = _source_downloads(limit=12)
+    bangumi_subscribes = _bangumi_only_subscribes_for_page(limit=20)
+    enabled_text = "已启用" if plugin.get_state() else "已停用"
+
+    return [
+        {
+            "component": "VRow",
+            "content": [
+                _stat_card("插件状态", enabled_text, f"版本 {plugin.plugin_version}", "mdi-heart-cog", "primary"),
+                _stat_card("Bangumi-only 订阅", len(bangumi_subscribes), "未绑定 TMDB/豆瓣的订阅", "mdi-book-heart", "info"),
+                _stat_card("失败整理", len(failed_histories), "最多显示最近 20 条", "mdi-alert-circle", "error"),
+                _stat_card("来源下载", len(source_download_items), "最近 Bangumi 来源下载", "mdi-download-circle", "success"),
+            ],
+        },
+        {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        _table_card(
+                            title="失败整理记录",
+                            icon="mdi-alert-circle-outline",
+                            headers=["ID", "标题", "订阅来源", "错误", "时间", "操作"],
+                            rows=_failed_transfer_rows(plugin_id, failed_histories),
+                            empty_text="当前没有失败整理记录。",
+                        )
+                    ],
+                }
+            ],
+        },
+        {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "lg": 6},
+                    "content": [
+                        _table_card(
+                            title="Bangumi-only 订阅",
+                            icon="mdi-book-open-page-variant",
+                            headers=["ID", "标题", "年份", "季", "Bangumi", "进度"],
+                            rows=_subscribe_rows(bangumi_subscribes),
+                            empty_text="暂无 Bangumi-only 订阅。",
+                        )
+                    ],
+                },
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "lg": 6},
+                    "content": [
+                        _table_card(
+                            title="最近来源下载",
+                            icon="mdi-download",
+                            headers=["ID", "标题", "Bangumi", "资源名", "时间"],
+                            rows=_download_rows(source_download_items),
+                            empty_text="暂无 Bangumi 来源下载记录。",
+                        )
+                    ],
+                },
+            ],
+        },
+    ]
 
 
 def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, mtype: Optional[MediaType] = None,
