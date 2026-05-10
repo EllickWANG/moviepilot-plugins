@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.34"
+    plugin_version = "1.0.35"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -2044,6 +2044,37 @@ def _generate_bangumi_episode_frame_thumbs(histories: list[Any]) -> tuple[int, l
     return generated, messages
 
 
+def _expand_related_bangumi_histories(histories: list[Any]) -> list[Any]:
+    result = []
+    seen = set()
+    titles = set()
+    for history in histories:
+        if not history or not _history_has_bangumi_source(history):
+            continue
+        hid = getattr(history, "id", None)
+        if hid not in seen:
+            result.append(history)
+            seen.add(hid)
+        title = getattr(history, "title", None)
+        if title:
+            titles.add(title)
+    oper = TransferHistoryOper()
+    for title in titles:
+        try:
+            related = oper.get_by_title(title) or []
+        except Exception:
+            related = []
+        for history in related:
+            if not history or not _history_has_bangumi_source(history):
+                continue
+            hid = getattr(history, "id", None)
+            if hid in seen:
+                continue
+            result.append(history)
+            seen.add(hid)
+    return result
+
+
 def _scrape_bangumi_histories_metadata(
         histories: list[Any],
         overwrite: bool = True) -> tuple[int, list[str]]:
@@ -2091,6 +2122,7 @@ def _refresh_recent_bangumi_media_by_hash(download_hash: Optional[str]) -> None:
         return
     try:
         histories = TransferHistoryOper().list_by_hash(download_hash) or []
+        histories = _expand_related_bangumi_histories(histories)
         _scrape_bangumi_histories_metadata(histories=histories, overwrite=True)
         _generate_bangumi_episode_frame_thumbs(histories=histories)
         _refresh_bangumi_histories_media_server(histories=histories, force=False)
