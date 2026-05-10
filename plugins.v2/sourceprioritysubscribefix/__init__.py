@@ -45,7 +45,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.20"
+    plugin_version = "1.0.21"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -944,26 +944,11 @@ def _safe_page_text(value: Any) -> str:
 
 
 def _page_db_items(model: Any, status: Optional[bool] = None, limit: int = 20) -> list[Any]:
-    def _status_equals(value: Any, expected: bool) -> bool:
-        if isinstance(value, bool):
-            return value is expected
-        if value is None:
-            return False
-        text = str(value).strip().lower()
-        if expected:
-            return text in {"1", "true", "yes", "y"}
-        return text in {"0", "false", "no", "n"}
-
     try:
         oper = TransferHistoryOper() if model is TransferHistory else DownloadHistoryOper()
-        query = oper._db.query(model)
         if model is TransferHistory and status is not None:
-            items = query.order_by(model.id.desc()).limit(max(limit * 5, 100)).all()
-            return [
-                item for item in items
-                if _status_equals(getattr(item, "status", None), status)
-            ][:limit]
-        return query.order_by(model.id.desc()).limit(limit).all()
+            return TransferHistory.list_by_page(oper._db, page=1, count=limit, status=status) or []
+        return oper._db.query(model).order_by(model.id.desc()).limit(limit).all()
     except Exception as err:
         logger.warn(f"订阅外部源优先插件读取页面数据失败：{err}")
         return []
