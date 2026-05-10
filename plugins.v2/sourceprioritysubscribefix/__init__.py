@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 import traceback
 import re
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, List, Optional, Tuple
 from xml.dom import minidom
 
@@ -49,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.33"
+    plugin_version = "1.0.34"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -1901,6 +1903,147 @@ def _history_media_root_item(storagechain: StorageChain, history: Any) -> Option
     )
 
 
+def _episode_thumb_path(history: Any) -> Optional[Path]:
+    dest = getattr(history, "dest", None)
+    if not dest:
+        return None
+    path = Path(dest)
+    if not path.suffix:
+        return None
+    return path.with_suffix(".jpg")
+
+
+def _image_is_landscape(path: Path) -> bool:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+        return width > height and width / max(height, 1) >= 1.4
+    except Exception:
+        return False
+
+
+def _should_generate_episode_thumb(history: Any, target: Path) -> bool:
+    if _history_storage(history) != "local":
+        return False
+    video = Path(getattr(history, "dest", "") or "")
+    if not video.exists() or not video.is_file():
+        return False
+    if not target.exists() or target.stat().st_size == 0:
+        return True
+    return not _image_is_landscape(target)
+
+
+def _video_seek_seconds(video: Path) -> float:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        duration = float((result.stdout or "").strip() or 0)
+    except Exception:
+        duration = 0
+    if duration <= 0:
+        return 120
+    if duration < 120:
+        return max(5, duration / 2)
+    return min(max(duration * 0.18, 90), max(duration - 30, 5))
+
+
+def _generate_episode_frame(video: Path, output: Path) -> bool:
+    seek = _video_seek_seconds(video)
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-ss", f"{seek:.3f}",
+        "-i", str(video),
+        "-frames:v", "1",
+        "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
+        "-q:v", "3",
+        str(output),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except Exception as err:
+        logger.warn(f"Bangumi分集缩略图截帧失败：{video.name} - {err}")
+        return False
+    if result.returncode != 0 or not output.exists() or output.stat().st_size == 0:
+        logger.warn(f"Bangumi分集缩略图截帧失败：{video.name} - {(result.stderr or '').strip()}")
+        return False
+    return True
+
+
+def _save_episode_frame_thumb(storagechain: StorageChain, history: Any, temp_path: Path, target: Path) -> bool:
+    parent_item = schemas.FileItem(
+        storage=_history_storage(history),
+        path=target.parent.as_posix(),
+        name=target.parent.name,
+        type="dir",
+    )
+    item = storagechain.upload_file(fileitem=parent_item, path=temp_path, new_name=target.name)
+    return bool(item)
+
+
+def _generate_bangumi_episode_frame_thumbs(histories: list[Any]) -> tuple[int, list[str]]:
+    generated = 0
+    messages = []
+    seen = set()
+    storagechain = StorageChain()
+    for history in histories:
+        if not _history_has_bangumi_source(history):
+            continue
+        target = _episode_thumb_path(history)
+        if not target:
+            continue
+        key = (_history_storage(history), target.as_posix())
+        if key in seen:
+            continue
+        seen.add(key)
+        if not _should_generate_episode_thumb(history, target):
+            continue
+        video = Path(getattr(history, "dest", "") or "")
+        temp_path = None
+        try:
+            with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+                temp_path = Path(temp_file.name)
+            if not _generate_episode_frame(video, temp_path):
+                messages.append(f"{video.name}: 截帧失败")
+                continue
+            if _save_episode_frame_thumb(storagechain, history, temp_path, target):
+                generated += 1
+                messages.append(f"{target.name}: 已生成分集图")
+            else:
+                messages.append(f"{target.name}: 保存分集图失败")
+        except Exception as err:
+            logger.warn(f"Bangumi分集缩略图生成失败：{target} - {err}")
+            messages.append(f"{target.name}: 生成分集图失败")
+        finally:
+            if temp_path:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    return generated, messages
+
+
 def _scrape_bangumi_histories_metadata(
         histories: list[Any],
         overwrite: bool = True) -> tuple[int, list[str]]:
@@ -1949,6 +2092,7 @@ def _refresh_recent_bangumi_media_by_hash(download_hash: Optional[str]) -> None:
     try:
         histories = TransferHistoryOper().list_by_hash(download_hash) or []
         _scrape_bangumi_histories_metadata(histories=histories, overwrite=True)
+        _generate_bangumi_episode_frame_thumbs(histories=histories)
         _refresh_bangumi_histories_media_server(histories=histories, force=False)
     except Exception as err:
         logger.warn(f"Bangumi媒体库自动刷新失败：{err}")
@@ -2036,30 +2180,33 @@ def _plugin_refresh_bangumi_media(
         histories = TransferHistory.list_by_page(oper._db, page=1, count=limit, status=True) or []
     histories = [history for history in histories if history]
     scraped, scrape_messages = _scrape_bangumi_histories_metadata(histories, overwrite=True)
+    thumbs, thumb_messages = _generate_bangumi_episode_frame_thumbs(histories=histories)
     matched, refreshed, messages = _refresh_bangumi_histories_media_server(histories, force=True)
-    details = scrape_messages + messages
+    details = scrape_messages + thumb_messages + messages
     if refreshed:
         return schemas.Response(
             success=True,
             message=(
                 f"已重刮 {scraped} 个Bangumi媒体目录，"
+                f"已生成 {thumbs} 张分集图，"
                 f"已触发 {refreshed} 个媒体服务器刷新，匹配 Bangumi 记录 {matched} 条"
             ),
-            data={"matched": matched, "scraped": scraped, "refreshed": refreshed, "details": details},
+            data={"matched": matched, "scraped": scraped, "thumbs": thumbs, "refreshed": refreshed, "details": details},
         )
     if scraped:
         return schemas.Response(
             success=True,
             message=(
-                f"已重刮 {scraped} 个Bangumi媒体目录，但未触发媒体服务器刷新；"
+                f"已重刮 {scraped} 个Bangumi媒体目录，已生成 {thumbs} 张分集图，"
+                f"但未触发媒体服务器刷新；"
                 + "；".join(messages)
             ),
-            data={"matched": matched, "scraped": scraped, "refreshed": refreshed, "details": details},
+            data={"matched": matched, "scraped": scraped, "thumbs": thumbs, "refreshed": refreshed, "details": details},
         )
     return schemas.Response(
         success=False,
         message=f"未触发媒体库刷新，匹配 Bangumi 记录 {matched} 条；" + "；".join(messages),
-        data={"matched": matched, "scraped": scraped, "refreshed": refreshed, "details": details},
+        data={"matched": matched, "scraped": scraped, "thumbs": thumbs, "refreshed": refreshed, "details": details},
     )
 
 
