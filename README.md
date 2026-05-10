@@ -41,6 +41,7 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 - Bangumi 标题别名参与搜索和资源匹配。
 - 下载与整理阶段按订阅来源修正媒体信息和二级分类。
 - Bangumi NFO、图片、分集图和媒体服务器刷新补齐。
+- 订阅日历预缓存对 Bangumi/豆瓣订阅使用外部来源详情，避免 `tmdbid=None` 时请求 TMDB 分集。
 
 详细用法见 [plugins.v2/sourceprioritysubscribefix/README.md](plugins.v2/sourceprioritysubscribefix/README.md)。
 

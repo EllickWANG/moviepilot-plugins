@@ -24,7 +24,7 @@ from app.chain.storage import StorageChain
 from app.chain.subscribe import SubscribeChain
 from app.chain.transfer import TransferChain
 from app.chain.tmdb import TmdbChain
-from app.core.config import settings
+from app.core.config import settings, global_vars
 from app.core.context import Context, MediaInfo
 from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo, MetaInfoPath
@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.37"
+    plugin_version = "1.0.38"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -172,6 +172,7 @@ class sourceprioritysubscribefix(_PluginBase):
         cls._originals = {
             "subscribe_add": SubscribeChain.add,
             "subscribe_async_add": SubscribeChain.async_add,
+            "subscribe_cache_calendar": SubscribeChain.cache_calendar,
             "subscribe_exists": SubscribeChain.__dict__["exists"],
             "subscribe_recognize_media": SubscribeChain.recognize_media,
             "subscribe_async_recognize_media": SubscribeChain.async_recognize_media,
@@ -198,6 +199,7 @@ class sourceprioritysubscribefix(_PluginBase):
             cls._originals["transfer_redo_transfer_history"] = TransferChain.redo_transfer_history
         SubscribeChain.add = _patched_subscribe_add
         SubscribeChain.async_add = _patched_subscribe_async_add
+        SubscribeChain.cache_calendar = _patched_subscribe_cache_calendar
         SubscribeChain.exists = staticmethod(_patched_subscribe_exists)
         SubscribeChain.recognize_media = _patched_subscribe_recognize_media
         SubscribeChain.async_recognize_media = _patched_subscribe_async_recognize_media
@@ -232,6 +234,7 @@ class sourceprioritysubscribefix(_PluginBase):
             return
         SubscribeChain.add = cls._originals["subscribe_add"]
         SubscribeChain.async_add = cls._originals["subscribe_async_add"]
+        SubscribeChain.cache_calendar = cls._originals["subscribe_cache_calendar"]
         SubscribeChain.exists = cls._originals["subscribe_exists"]
         SubscribeChain.recognize_media = cls._originals["subscribe_recognize_media"]
         SubscribeChain.async_recognize_media = cls._originals["subscribe_async_recognize_media"]
@@ -2989,6 +2992,78 @@ async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: A
         episode_group=episode_group,
         cache=cache,
     ))
+
+
+async def _patched_subscribe_cache_calendar(self: SubscribeChain):
+    """
+    订阅日历预缓存：外部来源订阅不要再用 tmdbid=None 查询 TMDB 分集。
+    """
+    logger.info("开始预缓存订阅日历 ...")
+    for subscribe in await SubscribeOper().async_list():
+        if global_vars.is_system_stopped:
+            break
+        try:
+            mtype = MediaType(subscribe.type)
+        except ValueError:
+            logger.error(f"订阅 {subscribe.name} 类型错误：{subscribe.type}")
+            continue
+
+        if mtype == MediaType.MOVIE:
+            mediainfo = await self.async_recognize_media(
+                mtype=mtype,
+                tmdbid=None if (subscribe.doubanid or subscribe.bangumiid) else subscribe.tmdbid,
+                doubanid=subscribe.doubanid,
+                bangumiid=subscribe.bangumiid,
+                episode_group=subscribe.episode_group,
+                cache=False,
+            )
+            if not mediainfo:
+                logger.warn(
+                    f"未识别到媒体信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，"
+                    f"豆瓣ID：{subscribe.doubanid}，BangumiID：{subscribe.bangumiid}"
+                )
+            continue
+
+        if subscribe.doubanid or subscribe.bangumiid:
+            mediainfo = await self.async_recognize_media(
+                mtype=mtype,
+                tmdbid=None,
+                doubanid=subscribe.doubanid,
+                bangumiid=subscribe.bangumiid,
+                episode_group=subscribe.episode_group,
+                cache=False,
+            )
+            if not mediainfo:
+                logger.warn(
+                    f"未识别到外部来源季集信息，标题：{subscribe.name}，豆瓣ID：{subscribe.doubanid}，"
+                    f"BangumiID：{subscribe.bangumiid}，季：{subscribe.season}"
+                )
+                continue
+
+            season = _season_number(subscribe.season) or _season_number(getattr(mediainfo, "season", None)) or 1
+            episodes = (getattr(mediainfo, "seasons", None) or {}).get(season) or []
+            if not episodes and not getattr(subscribe, "total_episode", None):
+                logger.warn(
+                    f"未识别到外部来源季集信息，标题：{subscribe.name}，豆瓣ID：{subscribe.doubanid}，"
+                    f"BangumiID：{subscribe.bangumiid}，季：{season}"
+                )
+            continue
+
+        if not subscribe.tmdbid:
+            logger.warn(f"订阅缺少TMDB或外部来源ID，跳过日历预缓存：{subscribe.name}")
+            continue
+
+        episodes = await TmdbChain().async_tmdb_episodes(
+            tmdbid=subscribe.tmdbid,
+            season=subscribe.season,
+            episode_group=subscribe.episode_group,
+        )
+        if not episodes:
+            logger.warn(
+                f"未识别到季集信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，"
+                f"豆瓣ID：{subscribe.doubanid}，季：{subscribe.season}"
+            )
+    logger.info("订阅日历预缓存完成")
 
 
 def _ensure_bangumi_search_media(chain: SearchChain, mediainfo: MediaInfo) -> MediaInfo:

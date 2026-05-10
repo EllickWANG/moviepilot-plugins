@@ -81,6 +81,8 @@ MoviePilot 原生查重主要依赖 TMDB、豆瓣等字段。插件补充了 Ban
 - `mediaid=douban:1234567` 可以返回豆瓣条目的季信息。
 - 前端订阅弹窗选择季时不再必须依赖 TMDB 季数据。
 
+订阅日历预缓存也会优先使用 Bangumi / 豆瓣详情。外部来源订阅不会再以 `tmdbid=None` 调用 TMDB 分集接口；只有纯 TMDB 订阅才继续查询 TMDB 分集。
+
 ### 搜索与资源匹配
 
 对 Bangumi-only 媒体，插件会在搜索前刷新 Bangumi 详情，并补齐别名：
@@ -178,6 +180,7 @@ Bangumi
 下载二级分类按订阅来源修正
 Bangumi媒体库刷新
 Bangumi分集缩略图
+订阅日历预缓存
 ```
 
 ## 常见问题
