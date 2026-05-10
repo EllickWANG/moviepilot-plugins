@@ -45,7 +45,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.21"
+    plugin_version = "1.0.22"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -1267,10 +1267,17 @@ def _failed_transfer_entries(plugin_id: str, histories: list[TransferHistory]) -
     rows = []
     mobile_items = []
     for history in histories:
-        source_keyword = _bangumi_source_keyword(_download_history_by_hash_or_file(history.download_hash, None))
-        source_text = (
-            f"bangumi:{source_keyword.get('bangumiid')}"
+        download_history = _download_history_by_hash_or_file(history.download_hash, None)
+        source_keyword = _bangumi_source_keyword(download_history)
+        inferred_subscribe = None if source_keyword else _match_subscribe_by_download_history(download_history)
+        bangumiid = (
+            source_keyword.get("bangumiid")
             if source_keyword
+            else getattr(inferred_subscribe, "bangumiid", None)
+        )
+        source_text = (
+            f"bangumi:{bangumiid}"
+            if bangumiid
             else "无 Bangumi 订阅来源"
         )
         rows.append({
@@ -1283,7 +1290,7 @@ def _failed_transfer_entries(plugin_id: str, histories: list[TransferHistory]) -
                 _td(history.date, "text-no-wrap"),
                 {
                     "component": "td",
-                    "content": [_redo_button(plugin_id, history.id)] if source_keyword else [],
+                    "content": [_redo_button(plugin_id, history.id)] if bangumiid else [],
                 },
             ],
         })
@@ -1298,7 +1305,7 @@ def _failed_transfer_entries(plugin_id: str, histories: list[TransferHistory]) -
                 _detail_line("错误", history.errmsg),
                 _detail_line("来源", source_text),
             ],
-            action=_redo_button(plugin_id, history.id, block=True) if source_keyword else None,
+            action=_redo_button(plugin_id, history.id, block=True) if bangumiid else None,
         ))
     return rows, mobile_items
 
