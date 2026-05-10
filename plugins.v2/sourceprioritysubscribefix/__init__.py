@@ -22,7 +22,7 @@ from app.chain.subscribe import SubscribeChain
 from app.chain.transfer import TransferChain
 from app.chain.tmdb import TmdbChain
 from app.core.config import settings
-from app.core.context import MediaInfo
+from app.core.context import Context, MediaInfo
 from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo, MetaInfoPath
 from app.core.security import verify_resource_token, verify_token
@@ -48,7 +48,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.25"
+    plugin_version = "1.0.26"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -168,6 +168,8 @@ class sourceprioritysubscribefix(_PluginBase):
             "search_async_process": SearchChain.async_process,
             "search_async_process_stream": SearchChain.async_process_stream,
             "download_single": DownloadChain.download_single,
+            "media_recognize_by_meta": MediaChain.recognize_by_meta,
+            "media_recognize_by_path": MediaChain.recognize_by_path,
             "media_handle_tv_episode_file": MediaChain._handle_tv_episode_file,
             "oper_add": SubscribeOper.add,
             "oper_async_add": SubscribeOper.async_add,
@@ -191,6 +193,8 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = _patched_search_async_process
         SearchChain.async_process_stream = _patched_search_async_process_stream
         DownloadChain.download_single = _patched_download_single
+        MediaChain.recognize_by_meta = _patched_media_recognize_by_meta
+        MediaChain.recognize_by_path = _patched_media_recognize_by_path
         MediaChain._handle_tv_episode_file = _patched_media_handle_tv_episode_file
         SubscribeOper.add = _patched_oper_add
         SubscribeOper.async_add = _patched_oper_async_add
@@ -222,6 +226,8 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = cls._originals["search_async_process"]
         SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
         DownloadChain.download_single = cls._originals["download_single"]
+        MediaChain.recognize_by_meta = cls._originals["media_recognize_by_meta"]
+        MediaChain.recognize_by_path = cls._originals["media_recognize_by_path"]
         MediaChain._handle_tv_episode_file = cls._originals["media_handle_tv_episode_file"]
         SubscribeOper.add = cls._originals["oper_add"]
         SubscribeOper.async_add = cls._originals["oper_async_add"]
@@ -737,6 +743,8 @@ def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaI
             mediainfo.season_years = {season: str(mediainfo.year)}
     if not mediainfo.category:
         mediainfo.category = _infer_bangumi_media_category(mediainfo) or mediainfo.category
+    if not mediainfo.genre_ids and (mediainfo.bangumi_info or {}).get("type") == 2:
+        mediainfo.genre_ids = settings.ANIME_GENREIDS or [16]
     aliases = _bangumi_media_aliases(mediainfo)
     if aliases:
         mediainfo.names = aliases
@@ -938,9 +946,15 @@ def _apply_download_source_category(chain: Any, context: Any, source: Optional[s
         return
     current_media.category = source_category
     if source_media:
+        source_media = _mark_bangumi_media_ready(source_media)
         current_media.bangumi_id = source_media.bangumi_id or current_media.bangumi_id
         current_media.douban_id = source_media.douban_id or current_media.douban_id
         current_media.episode_group = source_media.episode_group or current_media.episode_group
+        current_media.genre_ids = current_media.genre_ids or source_media.genre_ids
+        current_media.names = current_media.names or source_media.names
+        current_media.bangumi_info = current_media.bangumi_info or source_media.bangumi_info
+        current_media.seasons = current_media.seasons or source_media.seasons
+        current_media.season_years = current_media.season_years or source_media.season_years
     logger.info(
         f"{getattr(current_media, 'title_year', None) or getattr(current_media, 'title', '')} "
         f"下载二级分类按订阅来源修正：{old_category or '-'} -> {source_category}"
@@ -958,6 +972,67 @@ def _patched_download_single(self: DownloadChain, *args, **kwargs):
     except Exception as err:
         logger.warn(f"订阅外部源优先插件修正下载二级分类失败：{err}")
     return sourceprioritysubscribefix._originals["download_single"](self, *args_list, **kwargs)
+
+
+def _source_media_from_meta(
+        chain: Any,
+        meta: Any,
+        mtype: Optional[MediaType] = None) -> Optional[MediaInfo]:
+    subscribe = _match_subscribe_by_meta(meta, mtype)
+    if not subscribe or not subscribe.bangumiid:
+        return None
+    try:
+        mediainfo = _media_from_bangumi(chain, subscribe.bangumiid)
+    except Exception as err:
+        logger.warn(f"{getattr(meta, 'title', '')} 获取Bangumi订阅来源失败：{err}")
+        return None
+    if not mediainfo:
+        return None
+    media_type = mtype or _media_type_or_none(getattr(subscribe, "type", None))
+    if media_type:
+        mediainfo.type = media_type
+    season = (
+        _season_number(getattr(meta, "begin_season", None))
+        or _season_number(getattr(subscribe, "season", None))
+    )
+    if mediainfo.type == MediaType.TV and season is not None:
+        mediainfo.season = season
+    if getattr(subscribe, "media_category", None):
+        mediainfo.category = subscribe.media_category
+    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+
+
+def _patched_media_recognize_by_meta(
+        self: MediaChain,
+        metainfo: Any,
+        episode_group: Optional[str] = None) -> Optional[MediaInfo]:
+    source_mediainfo = _source_media_from_meta(self, metainfo, getattr(metainfo, "type", None))
+    if source_mediainfo:
+        source_mediainfo.episode_group = episode_group or source_mediainfo.episode_group
+        logger.info(
+            f"{getattr(metainfo, 'title', '')} 使用Bangumi订阅来源识别："
+            f"{source_mediainfo.title_year}"
+        )
+        return source_mediainfo
+    return sourceprioritysubscribefix._originals["media_recognize_by_meta"](
+        self, metainfo, episode_group=episode_group
+    )
+
+
+def _patched_media_recognize_by_path(
+        self: MediaChain,
+        path: str,
+        episode_group: Optional[str] = None) -> Optional[Context]:
+    file_path = Path(path)
+    file_meta = MetaInfoPath(file_path)
+    source_mediainfo = _source_media_from_meta(self, file_meta, getattr(file_meta, "type", None))
+    if source_mediainfo:
+        source_mediainfo.episode_group = episode_group or source_mediainfo.episode_group
+        logger.info(f"{path} 使用Bangumi订阅来源识别：{source_mediainfo.title_year}")
+        return Context(meta_info=file_meta, media_info=source_mediainfo)
+    return sourceprioritysubscribefix._originals["media_recognize_by_path"](
+        self, path, episode_group=episode_group
+    )
 
 
 def _patched_media_handle_tv_episode_file(
