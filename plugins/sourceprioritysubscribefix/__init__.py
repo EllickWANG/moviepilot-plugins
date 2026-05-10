@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.36"
+    plugin_version = "1.0.37"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -884,13 +884,59 @@ def _subscribe_from_source_keyword(source_keyword: dict) -> Optional[Subscribe]:
     )
 
 
+def _source_keyword_has_media_id(source_keyword: Optional[dict]) -> bool:
+    if not source_keyword:
+        return False
+    return any(source_keyword.get(key) for key in ("bangumiid", "doubanid", "tmdbid"))
+
+
+def _source_keyword_matches_subscribe(source_keyword: Optional[dict], subscribe: Optional[Subscribe]) -> bool:
+    if not source_keyword or not subscribe:
+        return False
+    for key, attr in (
+            ("bangumiid", "bangumiid"),
+            ("doubanid", "doubanid"),
+            ("tmdbid", "tmdbid"),
+    ):
+        source_value = source_keyword.get(key)
+        subscribe_value = getattr(subscribe, attr, None)
+        if source_value and subscribe_value and str(source_value) != str(subscribe_value):
+            return False
+    source_type = _type_value(_media_type_or_none(source_keyword.get("type")))
+    subscribe_type = _type_value(_media_type_or_none(getattr(subscribe, "type", None)))
+    if source_type and subscribe_type and source_type != subscribe_type:
+        return False
+    source_season = _season_number(source_keyword.get("season"))
+    subscribe_season = _season_number(getattr(subscribe, "season", None))
+    if source_season is not None and subscribe_season is not None and source_season != subscribe_season:
+        return False
+    source_year = str(source_keyword.get("year") or "").strip()
+    subscribe_year = str(getattr(subscribe, "year", "") or "").strip()
+    if source_year and subscribe_year and source_year != subscribe_year:
+        return False
+    return True
+
+
+def _trusted_subscribe_for_source(source_keyword: Optional[dict],
+                                  subscribe: Optional[Subscribe]) -> Optional[Subscribe]:
+    if not subscribe:
+        return None
+    if not source_keyword:
+        return subscribe
+    if _source_keyword_has_media_id(source_keyword):
+        return subscribe if _source_keyword_matches_subscribe(source_keyword, subscribe) else None
+    return subscribe
+
+
 def _source_media_from_download_history(chain: Any, download_history: Any) -> Optional[MediaInfo]:
     if not download_history:
         return None
     source_keyword = SubscribeChain.parse_subscribe_source_keyword(_download_history_source(download_history))
     subscribe = _subscribe_from_source_keyword(source_keyword) if source_keyword else None
+    trusted_subscribe = _trusted_subscribe_for_source(source_keyword, subscribe)
     if not subscribe:
         subscribe = _match_subscribe_by_download_history(download_history)
+        trusted_subscribe = subscribe
         if subscribe:
             logger.info(
                 f"{getattr(download_history, 'title', '')} 通过下载历史匹配到Bangumi订阅："
@@ -899,21 +945,21 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
     mtype = (
         _media_type_or_none(getattr(download_history, "type", None))
         or _media_type_or_none((source_keyword or {}).get("type"))
-        or _media_type_or_none(getattr(subscribe, "type", None))
+        or _media_type_or_none(getattr(trusted_subscribe, "type", None))
     )
     bangumiid = _int_or_none(
-        getattr(subscribe, "bangumiid", None)
-        or (source_keyword or {}).get("bangumiid")
+        (source_keyword or {}).get("bangumiid")
+        or getattr(trusted_subscribe, "bangumiid", None)
     )
     doubanid = (
-        getattr(subscribe, "doubanid", None)
-        or (source_keyword or {}).get("doubanid")
+        (source_keyword or {}).get("doubanid")
         or getattr(download_history, "doubanid", None)
+        or getattr(trusted_subscribe, "doubanid", None)
     )
     tmdbid = _int_or_none(
-        getattr(subscribe, "tmdbid", None)
-        or (source_keyword or {}).get("tmdbid")
+        (source_keyword or {}).get("tmdbid")
         or getattr(download_history, "tmdbid", None)
+        or getattr(trusted_subscribe, "tmdbid", None)
     )
     try:
         if bangumiid:
@@ -938,12 +984,12 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
     season = (
         _int_or_none((source_keyword or {}).get("season"))
         or _season_number(getattr(download_history, "seasons", None))
-        or _season_number(getattr(subscribe, "season", None))
+        or _season_number(getattr(trusted_subscribe, "season", None))
     )
     if mediainfo.type == MediaType.TV and season is not None:
         mediainfo.season = season
-    if subscribe and getattr(subscribe, "media_category", None):
-        mediainfo.category = subscribe.media_category
+    if trusted_subscribe and getattr(trusted_subscribe, "media_category", None):
+        mediainfo.category = trusted_subscribe.media_category
     elif not mediainfo.category and getattr(download_history, "media_category", None):
         mediainfo.category = download_history.media_category
     if bangumiid and not mediainfo.bangumi_id:
@@ -952,7 +998,7 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
         mediainfo.douban_id = str(doubanid)
     if tmdbid and not mediainfo.tmdb_id:
         mediainfo.tmdb_id = tmdbid
-    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, trusted_subscribe))
 
 
 def _media_id_value(mediainfo: Optional[MediaInfo], attr: str) -> Optional[str]:
@@ -1025,21 +1071,22 @@ def _source_media_from_source(
         subscribe = SubscribeOper().get_by(bangumiid=current_media.bangumi_id)
     if not subscribe and meta:
         subscribe = _match_subscribe_by_meta(meta, getattr(current_media, "type", None))
+    trusted_subscribe = _trusted_subscribe_for_source(source_keyword, subscribe)
 
     bangumiid = _int_or_none(
-        getattr(subscribe, "bangumiid", None)
-        or (source_keyword or {}).get("bangumiid")
+        (source_keyword or {}).get("bangumiid")
+        or getattr(trusted_subscribe, "bangumiid", None)
         or getattr(current_media, "bangumi_id", None)
     )
     doubanid = (
-        getattr(subscribe, "doubanid", None)
-        or (source_keyword or {}).get("doubanid")
+        (source_keyword or {}).get("doubanid")
+        or getattr(trusted_subscribe, "doubanid", None)
         or getattr(current_media, "douban_id", None)
     )
     mtype = (
         _media_type_or_none(getattr(current_media, "type", None))
         or _media_type_or_none((source_keyword or {}).get("type"))
-        or _media_type_or_none(getattr(subscribe, "type", None))
+        or _media_type_or_none(getattr(trusted_subscribe, "type", None))
     )
     if bangumiid:
         mediainfo = _media_from_bangumi(chain, bangumiid)
@@ -1053,14 +1100,14 @@ def _source_media_from_source(
         mediainfo.type = mtype
     season = (
         _int_or_none((source_keyword or {}).get("season"))
-        or _season_number(getattr(subscribe, "season", None))
+        or _season_number(getattr(trusted_subscribe, "season", None))
         or _season_number(getattr(meta, "begin_season", None))
     )
     if mediainfo.type == MediaType.TV and season is not None:
         mediainfo.season = season
-    if subscribe and getattr(subscribe, "media_category", None):
-        mediainfo.category = subscribe.media_category
-    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe)), subscribe
+    if trusted_subscribe and getattr(trusted_subscribe, "media_category", None):
+        mediainfo.category = trusted_subscribe.media_category
+    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, trusted_subscribe)), trusted_subscribe
 
 
 def _apply_download_source_category(chain: Any, context: Any, source: Optional[str]) -> None:
