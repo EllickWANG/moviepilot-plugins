@@ -18,31 +18,38 @@ from app.plugins import _PluginBase
 from app.utils.string import StringUtils
 
 
-class nyxarasiteindexer(_PluginBase):
-    plugin_name = "Nyxara站点索引配置"
-    plugin_desc = "复刻自定义索引站点能力，并提供可配置的站点用户数据解析修复。"
+class siteadapter(_PluginBase):
+    plugin_name = "站点适配器"
+    plugin_desc = "配置化站点索引与用户数据解析适配。"
     plugin_icon = "mdi-database-cog"
     plugin_version = "1.0.0"
-    plugin_author = "Nyxara"
+    plugin_author = "Ellick"
     plugin_order = 31
     auth_level = 1
 
     _enabled = False
     _patch_userdata = True
-    _indexer_conf = ""
-    _userdata_conf = ""
+    _site_conf = ""
 
     _patched = False
     _originals: dict[tuple[type, str], Any] = {}
+    _site_rules: list[dict[str, Any]] = []
     _userdata_rules: list[dict[str, Any]] = []
 
     def init_plugin(self, config: dict = None):
         config = config or {}
         self._enabled = bool(config.get("enabled", True))
         self._patch_userdata = bool(config.get("patch_userdata", True))
-        self._indexer_conf = config.get("indexer_conf") or config.get("confstr") or ""
-        self._userdata_conf = config.get("userdata_conf") or ""
-        self.__class__._userdata_rules = _parse_domain_config(self._userdata_conf)
+        self._site_conf = config.get("site_conf") or _merge_legacy_site_conf(
+            indexer_conf=config.get("indexer_conf") or config.get("confstr") or "",
+            userdata_conf=config.get("userdata_conf") or "",
+        )
+        self.__class__._site_rules = _parse_site_config(self._site_conf)
+        self.__class__._userdata_rules = [
+            {"domain": rule.get("domain"), "config": rule.get("userdata")}
+            for rule in self.__class__._site_rules
+            if isinstance(rule.get("userdata"), dict)
+        ]
 
         if not self._enabled:
             self._unpatch_userdata()
@@ -110,30 +117,10 @@ class nyxarasiteindexer(_PluginBase):
                                     {
                                         "component": "VTextarea",
                                         "props": {
-                                            "model": "indexer_conf",
-                                            "label": "索引站点配置",
-                                            "rows": 10,
-                                            "placeholder": "一行一个站点，格式：域名|配置 json 的 base64 编码（utf-8）。兼容自定义索引站点配置。",
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "userdata_conf",
-                                            "label": "用户数据解析配置",
-                                            "rows": 10,
-                                            "placeholder": "一行一个站点，格式：域名|规则 json 的 base64 编码（utf-8）。规则支持 xpath、regex、json_stats。",
+                                            "model": "site_conf",
+                                            "label": "站点适配配置",
+                                            "rows": 14,
+                                            "placeholder": "一行一个站点，格式：域名|配置 json 的 base64 编码（utf-8）。JSON 可包含 indexer 与 userdata。",
                                         },
                                     }
                                 ],
@@ -152,7 +139,7 @@ class nyxarasiteindexer(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "站点规则全部来自配置；插件本体只负责加载索引规则，并按配置补充上传量、下载量、分享率、魔力值、做种等用户数据。",
+                                            "text": "每个站点一段配置，indexer 负责资源搜索/浏览，userdata 负责上传量、下载量、分享率、魔力值、做种等账号数据。",
                                         },
                                     }
                                 ],
@@ -164,8 +151,7 @@ class nyxarasiteindexer(_PluginBase):
         ], {
             "enabled": True,
             "patch_userdata": True,
-            "indexer_conf": "",
-            "userdata_conf": "",
+            "site_conf": "",
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -176,24 +162,24 @@ class nyxarasiteindexer(_PluginBase):
 
     def _apply_indexers(self):
         count = 0
-        for rule in _parse_domain_config(self._indexer_conf):
+        for rule in self.__class__._site_rules:
             domain = rule.get("domain")
-            indexer = rule.get("config")
+            indexer = rule.get("indexer")
             if not domain or not isinstance(indexer, dict):
                 continue
             try:
                 SitesHelper().add_indexer(domain, indexer)
                 count += 1
             except Exception as err:
-                logger.error(f"Nyxara站点索引配置加载失败：{domain} - {err}")
+                logger.error(f"站点适配器索引配置加载失败：{domain} - {err}")
                 self.systemmessage.put(f"{domain} 索引配置加载失败：{err}", title=self.plugin_name)
         if count:
-            logger.info(f"Nyxara站点索引配置已加载：{count} 个")
+            logger.info(f"站点适配器索引配置已加载：{count} 个")
 
     @classmethod
     def _patch_userdata_parsers(cls):
         if cls._patched:
-            logger.info(f"Nyxara站点用户数据解析规则已更新：{len(cls._userdata_rules)} 个")
+            logger.info(f"站点适配器用户数据解析规则已更新：{len(cls._userdata_rules)} 个")
             return
 
         patched_count = 0
@@ -216,7 +202,7 @@ class nyxarasiteindexer(_PluginBase):
                 patched_count += 1
 
         cls._patched = patched_count > 0
-        logger.info(f"Nyxara站点用户数据解析规则已启用：{len(cls._userdata_rules)} 个，挂载方法 {patched_count} 个")
+        logger.info(f"站点适配器用户数据解析规则已启用：{len(cls._userdata_rules)} 个，挂载方法 {patched_count} 个")
 
     @classmethod
     def _unpatch_userdata(cls):
@@ -226,7 +212,7 @@ class nyxarasiteindexer(_PluginBase):
             setattr(parser_cls, method, original)
         cls._originals = {}
         cls._patched = False
-        logger.info("Nyxara站点用户数据解析规则已停用")
+        logger.info("站点适配器用户数据解析规则已停用")
 
 
 def _iter_site_parser_classes() -> list[type]:
@@ -234,7 +220,7 @@ def _iter_site_parser_classes() -> list[type]:
         from app.modules.indexer import parser as parser_pkg
         from app.modules.indexer.parser import SiteParserBase
     except Exception as err:
-        logger.warning(f"Nyxara站点用户数据解析无法加载解析器基类：{err}")
+        logger.warning(f"站点适配器无法加载解析器基类：{err}")
         return []
 
     classes: list[type] = []
@@ -243,7 +229,7 @@ def _iter_site_parser_classes() -> list[type]:
         try:
             module = importlib.import_module(module_name)
         except Exception as err:
-            logger.warning(f"Nyxara站点用户数据解析跳过解析器模块：{module_name} - {err}")
+            logger.warning(f"站点适配器跳过解析器模块：{module_name} - {err}")
             continue
         for _, obj in inspect.getmembers(module, inspect.isclass):
             if obj is SiteParserBase:
@@ -258,7 +244,7 @@ def _iter_site_parser_classes() -> list[type]:
     return list(dict.fromkeys(classes))
 
 
-def _parse_domain_config(conf_text: str) -> list[dict[str, Any]]:
+def _parse_site_config(conf_text: str) -> list[dict[str, Any]]:
     conf_text = (conf_text or "").strip()
     if not conf_text:
         return []
@@ -267,7 +253,107 @@ def _parse_domain_config(conf_text: str) -> list[dict[str, Any]]:
     if conf_text[0] in "[{":
         try:
             data = json.loads(conf_text)
-            return _normalize_config_items(data)
+            return _normalize_site_items(data)
+        except Exception:
+            pass
+
+    items: list[dict[str, Any]] = []
+    for line in conf_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            if not line.startswith("{") and "|" in line:
+                domain, raw_config = line.split("|", 1)
+                config = json.loads(base64.b64decode(raw_config.strip()).decode("utf-8"))
+                if normalized := _normalize_site_item(domain, config):
+                    items.append(normalized)
+            else:
+                items.extend(_normalize_site_items(json.loads(line)))
+        except Exception as err:
+            logger.error(f"站点适配器配置格式错误：{err}")
+    return [item for item in items if item.get("domain")]
+
+
+def _normalize_site_items(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict) and isinstance(data.get("sites"), list):
+        data = data.get("sites")
+    elif isinstance(data, dict) and isinstance(data.get("rules"), list):
+        data = data.get("rules")
+    elif isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        domain = item.get("domain") or item.get("site") or item.get("host")
+        if "config" in item and not any(key in item for key in ("indexer", "userdata", "user_data")):
+            config = item.get("config")
+        else:
+            config = {key: value for key, value in item.items() if key not in {"domain", "site", "host"}}
+        if normalized := _normalize_site_item(domain, config):
+            items.append(normalized)
+    return items
+
+
+def _normalize_site_item(domain: Any, config: Any) -> Optional[dict[str, Any]]:
+    domain = _normalize_domain(domain)
+    if not domain or not isinstance(config, dict):
+        return None
+
+    indexer = config.get("indexer")
+    userdata = config.get("userdata") or config.get("user_data")
+
+    if indexer is None and userdata is None:
+        if _looks_like_indexer(config):
+            indexer = config
+        else:
+            userdata = config
+
+    return {
+        "domain": domain,
+        "indexer": indexer if isinstance(indexer, dict) else None,
+        "userdata": userdata if isinstance(userdata, dict) else None,
+    }
+
+
+def _looks_like_indexer(config: dict[str, Any]) -> bool:
+    return any(key in config for key in ("torrents", "search", "browse", "category", "schema"))
+
+
+def _merge_legacy_site_conf(indexer_conf: str, userdata_conf: str) -> str:
+    merged: dict[str, dict[str, Any]] = {}
+
+    for rule in _parse_legacy_domain_config(indexer_conf):
+        domain = rule.get("domain")
+        if not domain:
+            continue
+        merged.setdefault(domain, {})["indexer"] = rule.get("config")
+
+    for rule in _parse_legacy_domain_config(userdata_conf):
+        domain = rule.get("domain")
+        if not domain:
+            continue
+        merged.setdefault(domain, {})["userdata"] = rule.get("config")
+
+    lines = []
+    for domain, config in merged.items():
+        raw = base64.b64encode(json.dumps(config, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode()
+        lines.append(f"{domain}|{raw}")
+    return "\n".join(lines)
+
+
+def _parse_legacy_domain_config(conf_text: str) -> list[dict[str, Any]]:
+    conf_text = (conf_text or "").strip()
+    if not conf_text:
+        return []
+
+    if conf_text[0] in "[{":
+        try:
+            return _normalize_legacy_items(json.loads(conf_text))
         except Exception:
             pass
 
@@ -282,13 +368,13 @@ def _parse_domain_config(conf_text: str) -> list[dict[str, Any]]:
                 config = json.loads(base64.b64decode(raw_config.strip()).decode("utf-8"))
                 items.append({"domain": _normalize_domain(domain), "config": config})
             else:
-                items.extend(_normalize_config_items(json.loads(line)))
+                items.extend(_normalize_legacy_items(json.loads(line)))
         except Exception as err:
-            logger.error(f"Nyxara站点配置格式错误：{err}")
+            logger.error(f"站点适配器旧配置格式错误：{err}")
     return [item for item in items if item.get("domain")]
 
 
-def _normalize_config_items(data: Any) -> list[dict[str, Any]]:
+def _normalize_legacy_items(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, dict) and isinstance(data.get("sites"), list):
         data = data.get("sites")
     elif isinstance(data, dict) and isinstance(data.get("rules"), list):
@@ -325,7 +411,7 @@ def _apply_site_userdata_rules(parser: Any, html_text: str, rules: list[dict[str
     try:
         html = etree.HTML(html_text)
     except Exception as err:
-        logger.warning(f"Nyxara站点用户数据 HTML 解析失败：{parser_domain} - {err}")
+        logger.warning(f"站点适配器用户数据 HTML 解析失败：{parser_domain} - {err}")
         return
     if html is None:
         return
@@ -340,7 +426,7 @@ def _apply_site_userdata_rules(parser: Any, html_text: str, rules: list[dict[str
             if config.get("calculate_ratio") and not getattr(parser, "ratio", 0) and getattr(parser, "download", 0):
                 parser.ratio = round(getattr(parser, "upload", 0) / getattr(parser, "download", 0), 3)
     except Exception as err:
-        logger.warning(f"Nyxara站点用户数据规则执行失败：{parser_domain} - {err}")
+        logger.warning(f"站点适配器用户数据规则执行失败：{parser_domain} - {err}")
     finally:
         del html
 

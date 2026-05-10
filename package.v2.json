@@ -15,12 +15,12 @@
     "author": "Ellick",
     "level": 1
   },
-  "nyxarasiteindexer": {
-    "name": "Nyxara站点索引配置",
-    "description": "复刻自定义索引站点能力，并提供可配置的站点用户数据解析修复。",
+  "siteadapter": {
+    "name": "站点适配器",
+    "description": "配置化站点索引与用户数据解析适配。",
     "version": "1.0.0",
     "icon": "mdi-database-cog",
-    "author": "Nyxara",
+    "author": "Ellick",
     "level": 1
   }
 }
