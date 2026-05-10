@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import traceback
 import re
@@ -44,7 +45,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.15"
+    plugin_version = "1.0.16"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -719,6 +720,15 @@ def _download_history_source(download_history: Any) -> Optional[str]:
     note = getattr(download_history, "note", None)
     if isinstance(note, dict):
         return note.get("source")
+    if isinstance(note, str):
+        if note.startswith("Subscribe|"):
+            return note
+        try:
+            note_data = json.loads(note)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(note_data, dict):
+            return note_data.get("source")
     return None
 
 
@@ -866,7 +876,7 @@ def _bangumi_source_keyword(download_history: Any) -> Optional[dict]:
 
 def _source_downloads(limit: int = 12) -> list[DownloadHistory]:
     result = []
-    for history in _page_db_items(DownloadHistory, limit=80):
+    for history in _page_db_items(DownloadHistory, limit=500):
         if _bangumi_source_keyword(history):
             result.append(history)
         if len(result) >= limit:
