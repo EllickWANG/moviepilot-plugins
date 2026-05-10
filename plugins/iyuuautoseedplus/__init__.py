@@ -145,15 +145,15 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件名称
     plugin_name = "IYUU自动辅种增强"
     # 插件描述
-    plugin_desc = "复刻官方IYUU自动辅种，增加请求超时和每批Hash数量配置。"
+    plugin_desc = "复刻官方IYUU自动辅种，增加IYUU/下载器请求超时和每批Hash数量配置。"
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.4"
+    plugin_version = "2.15.5"
     # 插件作者
-    plugin_author = "jxxghp,CKun,Ellick"
+    plugin_author = "Ellick"
     # 作者主页
-    author_url = "https://github.com/jxxghp"
+    author_url = "https://github.com/EllickWANG"
     # 插件配置项ID前缀
     plugin_config_prefix = "iyuuautoseedplus_"
     # 加载顺序
@@ -186,9 +186,11 @@ class IYUUAutoSeedPlus(_PluginBase):
     _clearcache = False
     _auto_start = False
     _request_timeout = 60
+    _downloader_timeout = 15
     _chunk_size = 50
     _site_aliases_text = ""
     _site_aliases = {}
+    _applied_downloader_timeouts = {}
     # 退出事件
     _event = Event()
     # 种子链接xpaths
@@ -238,6 +240,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             self._addhosttotag = _bool_config(config.get("addhosttotag"))
             self._size = _float_config(config.get("size"))
             self._request_timeout = _int_config(config.get("request_timeout"), 60, 5, 300)
+            self._downloader_timeout = _int_config(config.get("downloader_timeout"), 15, 3, 300)
             self._chunk_size = _int_config(config.get("chunk_size"), 50, 1, 200)
             self._site_aliases_text = _text_config(config.get("site_aliases"))
             self._site_aliases = _parse_site_aliases(self._site_aliases_text)
@@ -256,12 +259,16 @@ class IYUUAutoSeedPlus(_PluginBase):
         # 停止现有任务
         self.stop_service()
         self._event = Event()
+        self._applied_downloader_timeouts = {}
 
         # 启动定时任务 & 立即运行一次
         if self.get_state() or self._onlyonce:
             self.iyuu_helper = IyuuHelper(token=self._token, timeout=self._request_timeout)
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            logger.info(f"IYUU自动辅种增强配置：请求超时 {self._request_timeout} 秒，每批 {self._chunk_size} 个Hash")
+            logger.info(
+                f"IYUU自动辅种增强配置：IYUU请求超时 {self._request_timeout} 秒，"
+                f"下载器请求超时 {self._downloader_timeout} 秒，每批 {self._chunk_size} 个Hash"
+            )
 
             if self._onlyonce:
                 logger.info(f"辅种服务启动，立即运行一次")
@@ -303,6 +310,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             if service_info.instance.is_inactive():
                 logger.warning(f"下载器 {service_name} 未连接，请检查配置")
             else:
+                self.__apply_downloader_timeout(service_info)
                 active_services[service_name] = service_info
 
         if not active_services:
@@ -328,6 +336,7 @@ class IYUUAutoSeedPlus(_PluginBase):
         if service.instance.is_inactive():
             logger.warning(f"下载器 {service.name} 未连接，请检查配置")
             return None
+        self.__apply_downloader_timeout(service)
         return service
 
     def get_state(self) -> bool:
@@ -475,7 +484,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 6
+                                    'md': 4
                                 },
                                 'content': [
                                     {
@@ -495,7 +504,27 @@ class IYUUAutoSeedPlus(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 6
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'downloader_timeout',
+                                            'label': '下载器请求超时(秒)',
+                                            'type': 'number',
+                                            'min': 3,
+                                            'max': 300,
+                                            'placeholder': '默认15秒'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
                                 },
                                 'content': [
                                     {
@@ -845,6 +874,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "categoryafterseed": "",
             "size": "",
             "request_timeout": 60,
+            "downloader_timeout": 15,
             "chunk_size": 50,
             "site_aliases": ""
         }
@@ -873,6 +903,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "auto_start": self._auto_start,
             "size": self._size,
             "request_timeout": self._request_timeout,
+            "downloader_timeout": self._downloader_timeout,
             "chunk_size": self._chunk_size,
             "site_aliases": self._site_aliases_text,
             "success_caches": self._success_caches,
@@ -1223,17 +1254,23 @@ class IYUUAutoSeedPlus(_PluginBase):
 
             torrent_tags.append(tag)
 
-            state = service.instance.add_torrent(content=content,
-                                                 download_dir=save_path,
-                                                 is_paused=True,
-                                                 tag=torrent_tags,
-                                                 category=save_category,
-                                                 is_skip_checking=self._skipverify)
+            state, added_torrent_ids = self.__parse_add_torrent_result(
+                service.instance.add_torrent(content=content,
+                                             download_dir=save_path,
+                                             is_paused=True,
+                                             tag=torrent_tags,
+                                             category=save_category,
+                                             is_skip_checking=self._skipverify)
+            )
             if not state:
                 return None
             else:
                 # 获取种子Hash
-                torrent_hash = service.instance.get_torrent_id_by_tag(tags=tag)
+                torrent_hash = next(iter(added_torrent_ids), None)
+                if torrent_hash:
+                    service.instance.delete_torrents_tag(torrent_hash, tag)
+                else:
+                    torrent_hash = service.instance.get_torrent_id_by_tag(tags=tag)
                 if not torrent_hash:
                     logger.error(f"{service.name} 下载任务添加成功，但获取任务信息失败！")
                     return None
@@ -1251,6 +1288,43 @@ class IYUUAutoSeedPlus(_PluginBase):
 
         logger.error(f"不支持的下载器：{service.type}")
         return None
+
+    @staticmethod
+    def __parse_add_torrent_result(result: Any) -> tuple[bool, list[str]]:
+        """
+        兼容不同 MoviePilot 版本的下载器添加返回值。
+        """
+        if isinstance(result, tuple):
+            state = bool(result[0]) if result else False
+            added_ids = result[1] if len(result) > 1 else []
+            if not isinstance(added_ids, list):
+                added_ids = list(added_ids) if added_ids else []
+            return state, [str(item) for item in added_ids if item]
+        return bool(result), []
+
+    def __apply_downloader_timeout(self, service: Optional[ServiceInfo]) -> None:
+        """
+        调整 qBittorrent API 请求超时，避免辅种批量任务长时间阻塞在下载器接口。
+        """
+        if not service or service.type != "qbittorrent" or not service.instance:
+            return
+        qbc = getattr(service.instance, "qbc", None)
+        if not qbc:
+            return
+        request_args = getattr(qbc, "_REQUESTS_ARGS", None)
+        if not isinstance(request_args, dict):
+            try:
+                setattr(qbc, "_REQUESTS_ARGS", {})
+                request_args = getattr(qbc, "_REQUESTS_ARGS")
+            except Exception as err:
+                logger.debug(f"设置下载器请求超时失败：{service.name} - {err}")
+                return
+        service_key = f"{service.name}:{id(qbc)}"
+        if self._applied_downloader_timeouts.get(service_key) == self._downloader_timeout:
+            return
+        request_args["timeout"] = self._downloader_timeout
+        self._applied_downloader_timeouts[service_key] = self._downloader_timeout
+        logger.info(f"下载器 {service.name} 请求超时设置为 {self._downloader_timeout} 秒")
 
     def __site_candidates(self, site_url: str) -> list[str]:
         """
@@ -1344,7 +1418,11 @@ class IYUUAutoSeedPlus(_PluginBase):
         self.realtotal += 1
         # 查询hash值是否已经在下载器中
         downloader_obj = service.instance
-        torrent_info, _ = downloader_obj.get_torrents(ids=[seed.get("info_hash")])
+        torrent_info, query_error = downloader_obj.get_torrents(ids=[seed.get("info_hash")])
+        if query_error:
+            logger.warn(f"下载器 {service.name} 查询种子失败，跳过本次辅种添加，避免重复添加：{seed.get('info_hash')}")
+            self.fail += 1
+            return False
         if torrent_info:
             logger.info(f"{seed.get('info_hash')} 已在下载器中，跳过 ...")
             self.exist += 1
