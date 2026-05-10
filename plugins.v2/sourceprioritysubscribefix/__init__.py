@@ -49,7 +49,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.28"
+    plugin_version = "1.0.29"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -1783,9 +1783,8 @@ def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
 def _redo_transfer_history_with_source(chain: TransferChain, history_id: int) -> Optional[Tuple[bool, str]]:
     history = TransferHistoryOper().get(history_id)
     if history:
-        download_history = _download_history_by_hash_or_file(history.download_hash, None)
         try:
-            mediainfo = _source_media_from_download_history(chain, download_history)
+            mediainfo = _source_media_from_transfer_history(chain, history)
         except Exception as err:
             logger.warn(f"订阅外部源优先插件重新整理识别失败：{err}")
             mediainfo = None
