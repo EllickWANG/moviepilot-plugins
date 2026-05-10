@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.39"
+    plugin_version = "1.0.40"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -2875,7 +2875,7 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                 _stat_card("插件状态", enabled_text, f"版本 {plugin.plugin_version}", "mdi-heart-cog", "primary"),
                 _stat_card("Bangumi 订阅", len(bangumi_subscribes), "未绑定 TMDB/豆瓣", "mdi-book-heart", "info"),
                 _stat_card("失败整理", len(failed_histories), "最多显示最近 20 条", "mdi-alert-circle", "error"),
-                _stat_card("来源下载", len(source_download_items), "最近 Bangumi 来源下载", "mdi-download-circle", "success"),
+                _stat_card("来源下载", len(source_download_items), "最近 Bangumi-only 来源下载", "mdi-download-circle", "success"),
             ],
         },
         {
@@ -2945,12 +2945,12 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                     "props": {"cols": 12, "lg": 6},
                     "content": [
                         _table_card(
-                            title="最近来源下载",
+                            title="最近 Bangumi-only 来源下载",
                             icon="mdi-download",
                             headers=["ID", "标题", "Bangumi", "资源名", "时间"],
                             rows=download_rows,
                             mobile_items=download_mobile_items,
-                            empty_text="暂无 Bangumi 来源下载记录。",
+                            empty_text="暂无 Bangumi-only 来源下载记录。",
                         )
                     ],
                 },
