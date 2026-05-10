@@ -49,7 +49,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.27"
+    plugin_version = "1.0.28"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -180,6 +180,7 @@ class sourceprioritysubscribefix(_PluginBase):
             "media_recognize_by_meta": MediaChain.recognize_by_meta,
             "media_recognize_by_path": MediaChain.recognize_by_path,
             "media_handle_tv_episode_file": MediaChain._handle_tv_episode_file,
+            "media_initialize_tv_directory_metadata": MediaChain._initialize_tv_directory_metadata,
             "oper_add": SubscribeOper.add,
             "oper_async_add": SubscribeOper.async_add,
             "oper_exists": SubscribeOper.exists,
@@ -205,6 +206,7 @@ class sourceprioritysubscribefix(_PluginBase):
         MediaChain.recognize_by_meta = _patched_media_recognize_by_meta
         MediaChain.recognize_by_path = _patched_media_recognize_by_path
         MediaChain._handle_tv_episode_file = _patched_media_handle_tv_episode_file
+        MediaChain._initialize_tv_directory_metadata = _patched_media_initialize_tv_directory_metadata
         SubscribeOper.add = _patched_oper_add
         SubscribeOper.async_add = _patched_oper_async_add
         SubscribeOper.exists = _patched_oper_exists
@@ -238,6 +240,7 @@ class sourceprioritysubscribefix(_PluginBase):
         MediaChain.recognize_by_meta = cls._originals["media_recognize_by_meta"]
         MediaChain.recognize_by_path = cls._originals["media_recognize_by_path"]
         MediaChain._handle_tv_episode_file = cls._originals["media_handle_tv_episode_file"]
+        MediaChain._initialize_tv_directory_metadata = cls._originals["media_initialize_tv_directory_metadata"]
         SubscribeOper.add = cls._originals["oper_add"]
         SubscribeOper.async_add = cls._originals["oper_async_add"]
         SubscribeOper.exists = cls._originals["oper_exists"]
@@ -1149,6 +1152,92 @@ def _patched_media_handle_tv_episode_file(
     )
 
 
+def _bangumi_tv_root_candidates(mediainfo: Optional[MediaInfo]) -> set[str]:
+    if not mediainfo:
+        return set()
+    raw_titles = {
+        getattr(mediainfo, "title", None),
+        getattr(mediainfo, "original_title", None),
+        getattr(mediainfo, "en_title", None),
+    }
+    for name in getattr(mediainfo, "names", None) or []:
+        raw_titles.add(name)
+
+    candidates = set()
+    year = str(getattr(mediainfo, "year", "") or "").strip()
+    for title in raw_titles:
+        normalized = _normalize_match_text(title)
+        if not normalized:
+            continue
+        candidates.add(normalized)
+        if year:
+            candidates.add(_normalize_match_text(f"{title}{year}"))
+            candidates.add(_normalize_match_text(f"{title} ({year})"))
+    title_year = getattr(mediainfo, "title_year", None)
+    if title_year:
+        candidates.add(_normalize_match_text(title_year))
+    return candidates
+
+
+def _is_bangumi_tv_root_directory(filepath: Path, mediainfo: Optional[MediaInfo]) -> bool:
+    if not _is_bangumi_metadata_media(mediainfo) or mediainfo.type != MediaType.TV:
+        return False
+    return _normalize_match_text(filepath.name) in _bangumi_tv_root_candidates(mediainfo)
+
+
+def _delete_wrong_bangumi_root_season_nfo(
+        storagechain: StorageChain,
+        fileitem: schemas.FileItem,
+        filepath: Path) -> None:
+    try:
+        wrong_nfo = storagechain.get_file_item(
+            storage=fileitem.storage,
+            path=filepath / "season.nfo",
+        )
+        if wrong_nfo and wrong_nfo.type == "file":
+            storagechain.delete_file(wrong_nfo)
+            logger.info(f"已清理Bangumi剧集根目录错误季NFO：{wrong_nfo.path}")
+    except Exception as err:
+        logger.warn(f"清理Bangumi剧集根目录错误季NFO失败：{filepath} - {err}")
+
+
+def _patched_media_initialize_tv_directory_metadata(
+        self: MediaChain,
+        fileitem: schemas.FileItem,
+        filepath: Path,
+        meta: Any,
+        mediainfo: MediaInfo,
+        parent: schemas.FileItem,
+        overwrite: bool):
+    if not _is_bangumi_tv_root_directory(filepath, mediainfo):
+        return sourceprioritysubscribefix._originals["media_initialize_tv_directory_metadata"](
+            self,
+            fileitem=fileitem,
+            filepath=filepath,
+            meta=meta,
+            mediainfo=mediainfo,
+            parent=parent,
+            overwrite=overwrite,
+        )
+
+    # Bangumi 条目的标题常自带“第 N 季”，不能让根目录被当成季目录。
+    logger.info(f"{filepath.name} 作为Bangumi剧集根目录刮削")
+    _delete_wrong_bangumi_root_season_nfo(self.storagechain, fileitem, filepath)
+    self._scrape_nfo_generic(
+        current_fileitem=fileitem,
+        meta=meta,
+        mediainfo=_mark_bangumi_media_ready(mediainfo),
+        item_type=ScrapingTarget.TV,
+        overwrite=overwrite,
+    )
+    self._scrape_images_generic(
+        current_fileitem=fileitem,
+        mediainfo=mediainfo,
+        item_type=ScrapingTarget.TV,
+        overwrite=overwrite,
+    )
+
+
 def _is_bangumi_metadata_media(mediainfo: Optional[MediaInfo]) -> bool:
     return bool(mediainfo and mediainfo.bangumi_id)
 
@@ -1376,6 +1465,47 @@ def _dedupe_refresh_items(items: list[schemas.RefreshMediaItem]) -> list[schemas
     return deduped
 
 
+def _media_server_scan_running(server: Any) -> bool:
+    api = getattr(server, "_api", None)
+    if not api or not hasattr(api, "task_running"):
+        return False
+    try:
+        return bool(api.task_running())
+    except Exception:
+        return False
+
+
+def _media_server_refresh_diag(server: Any) -> str:
+    try:
+        authenticated = server.is_authenticated() if hasattr(server, "is_authenticated") else None
+    except Exception:
+        authenticated = None
+    userinfo = getattr(server, "_userinfo", None)
+    admin = getattr(userinfo, "is_admin", None)
+    libraries = getattr(server, "_libraries", None) or {}
+    library_desc = []
+    for lib in list(libraries.values())[:5]:
+        library_desc.append(
+            f"{getattr(lib, 'name', '-')}:"
+            f"{getattr(lib, 'category', '-')}:"
+            f"{getattr(lib, 'dir_list', None)}"
+        )
+    return (
+        f"authenticated={authenticated}, admin={admin}, "
+        f"libraries={library_desc or '[]'}"
+    )
+
+
+def _call_media_server_refresh(server: Any, items: list[schemas.RefreshMediaItem]) -> Optional[bool]:
+    try:
+        try:
+            return server.refresh_library_by_items(items, scan_mode=3)
+        except TypeError:
+            return server.refresh_library_by_items(items)
+    except Exception:
+        raise
+
+
 def _refresh_media_server_for_items(
         items: list[schemas.RefreshMediaItem],
         force: bool = False) -> tuple[int, list[str]]:
@@ -1403,15 +1533,37 @@ def _refresh_media_server_for_items(
             if not server or not hasattr(server, "refresh_library_by_items"):
                 continue
             try:
-                try:
-                    result = server.refresh_library_by_items(items, scan_mode=3)
-                except TypeError:
-                    result = server.refresh_library_by_items(items)
+                result = _call_media_server_refresh(server, items)
             except Exception as err:
                 logger.warn(f"Bangumi媒体库刷新失败：{module_name} {server_name} - {err}")
                 messages.append(f"{module_name} {server_name}: 失败")
                 continue
+            if result is None:
+                logger.warn(
+                    f"Bangumi媒体库刷新未触发：{module_name} {server_name} - "
+                    f"{_media_server_refresh_diag(server)}"
+                )
+                messages.append(f"{module_name} {server_name}: 未连接")
+                continue
             if result is False:
+                if _media_server_scan_running(server):
+                    refreshed += 1
+                    messages.append(f"{module_name} {server_name}: 已有扫描任务")
+                    continue
+                fallback = None
+                if hasattr(server, "refresh_root_library"):
+                    try:
+                        fallback = server.refresh_root_library()
+                    except Exception as err:
+                        logger.warn(f"Bangumi媒体库全库刷新失败：{module_name} {server_name} - {err}")
+                if fallback is not None and fallback is not False:
+                    refreshed += 1
+                    messages.append(f"{module_name} {server_name}: 已触发全库")
+                    continue
+                logger.warn(
+                    f"Bangumi媒体库刷新返回失败：{module_name} {server_name} - "
+                    f"{_media_server_refresh_diag(server)}"
+                )
                 messages.append(f"{module_name} {server_name}: 失败")
                 continue
             refreshed += 1
@@ -1440,16 +1592,6 @@ def _refresh_bangumi_histories_media_server(
     return matched, refreshed, messages
 
 
-def _refresh_recent_bangumi_media_by_hash(download_hash: Optional[str]) -> None:
-    if not download_hash:
-        return
-    try:
-        histories = TransferHistoryOper().list_by_hash(download_hash) or []
-        _refresh_bangumi_histories_media_server(histories=histories, force=False)
-    except Exception as err:
-        logger.warn(f"Bangumi媒体库自动刷新失败：{err}")
-
-
 def _download_history_by_hash_or_file(download_hash: Optional[str], fileitem: Any) -> Optional[Any]:
     downloadhis = DownloadHistoryOper()
     if download_hash:
@@ -1466,6 +1608,146 @@ def _download_history_by_hash_or_file(download_hash: Optional[str], fileitem: An
     if download_file and getattr(download_file, "download_hash", None):
         return downloadhis.get_by_hash(download_file.download_hash)
     return None
+
+
+def _source_media_from_transfer_history(chain: Any, history: Any) -> Optional[MediaInfo]:
+    download_history = _download_history_by_hash_or_file(
+        getattr(history, "download_hash", None),
+        None,
+    )
+    mediainfo = _source_media_from_download_history(chain, download_history)
+    if mediainfo:
+        return mediainfo
+
+    subscribe = _match_subscribe_by_transfer_history(history)
+    if not subscribe or not getattr(subscribe, "bangumiid", None):
+        return None
+    try:
+        mediainfo = _media_from_bangumi(chain, subscribe.bangumiid)
+    except Exception as err:
+        logger.warn(f"整理记录 {getattr(history, 'id', '')} 获取Bangumi详情失败：{subscribe.bangumiid} - {err}")
+        return None
+    if not mediainfo:
+        return None
+    mtype = (
+        _media_type_or_none(getattr(history, "type", None))
+        or _media_type_or_none(getattr(subscribe, "type", None))
+    )
+    if mtype:
+        mediainfo.type = mtype
+    season = (
+        _season_number(getattr(history, "seasons", None))
+        or _season_number(getattr(subscribe, "season", None))
+    )
+    if mediainfo.type == MediaType.TV and season is not None:
+        mediainfo.season = season
+    if getattr(subscribe, "media_category", None):
+        mediainfo.category = subscribe.media_category
+    elif not mediainfo.category and getattr(history, "category", None):
+        mediainfo.category = history.category
+    return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+
+
+def _history_storage(history: Any) -> str:
+    dest_fileitem = getattr(history, "dest_fileitem", None) or {}
+    if getattr(history, "dest_storage", None):
+        return history.dest_storage
+    if isinstance(dest_fileitem, dict) and dest_fileitem.get("storage"):
+        return dest_fileitem["storage"]
+    if getattr(dest_fileitem, "storage", None):
+        return dest_fileitem.storage
+    return "local"
+
+
+def _is_standalone_season_directory(name: str) -> bool:
+    normalized = str(name or "").strip()
+    if not normalized:
+        return False
+    if normalized in settings.RENAME_FORMAT_S0_NAMES:
+        return True
+    return bool(
+        re.fullmatch(r"(?i)(season|s)\s*0*\d+", normalized)
+        or re.fullmatch(r"第\s*[0-9一二三四五六七八九十零〇]+\s*季", normalized)
+    )
+
+
+def _history_media_root_path(history: Any) -> Optional[Path]:
+    dest = getattr(history, "dest", None)
+    if not dest:
+        return None
+    parent = Path(dest).parent
+    if _is_standalone_season_directory(parent.name):
+        return parent.parent
+    return parent
+
+
+def _history_media_root_item(storagechain: StorageChain, history: Any) -> Optional[schemas.FileItem]:
+    root_path = _history_media_root_path(history)
+    if not root_path:
+        return None
+    storage = _history_storage(history)
+    item = storagechain.get_file_item(storage=storage, path=root_path)
+    if item:
+        return item
+    return schemas.FileItem(
+        storage=storage,
+        path=root_path.as_posix(),
+        name=root_path.name,
+        type="dir",
+    )
+
+
+def _scrape_bangumi_histories_metadata(
+        histories: list[Any],
+        overwrite: bool = True) -> tuple[int, list[str]]:
+    scraped = 0
+    messages = []
+    seen = set()
+    media_chain = MediaChain()
+    storagechain = StorageChain()
+    for history in histories:
+        if not _history_has_bangumi_source(history):
+            continue
+        root_item = _history_media_root_item(storagechain, history)
+        if not root_item:
+            messages.append(f"整理记录 {getattr(history, 'id', '')}: 未找到媒体目录")
+            continue
+        mediainfo = _source_media_from_transfer_history(media_chain, history)
+        if not mediainfo:
+            messages.append(f"整理记录 {getattr(history, 'id', '')}: 未找到Bangumi详情")
+            continue
+        key = (
+            getattr(root_item, "storage", None),
+            getattr(root_item, "path", None),
+            getattr(mediainfo, "bangumi_id", None),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            media_chain.scrape_metadata(
+                fileitem=root_item,
+                mediainfo=mediainfo,
+                overwrite=overwrite,
+                recursive=True,
+            )
+            scraped += 1
+            messages.append(f"{root_item.name}: 已重刮")
+        except Exception as err:
+            logger.warn(f"Bangumi媒体库元数据重刮失败：{root_item.path} - {err}")
+            messages.append(f"{root_item.name}: 重刮失败")
+    return scraped, messages
+
+
+def _refresh_recent_bangumi_media_by_hash(download_hash: Optional[str]) -> None:
+    if not download_hash:
+        return
+    try:
+        histories = TransferHistoryOper().list_by_hash(download_hash) or []
+        _scrape_bangumi_histories_metadata(histories=histories, overwrite=True)
+        _refresh_bangumi_histories_media_server(histories=histories, force=False)
+    except Exception as err:
+        logger.warn(f"Bangumi媒体库自动刷新失败：{err}")
 
 
 def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
@@ -1550,17 +1832,31 @@ def _plugin_refresh_bangumi_media(
     else:
         histories = TransferHistory.list_by_page(oper._db, page=1, count=limit, status=True) or []
     histories = [history for history in histories if history]
+    scraped, scrape_messages = _scrape_bangumi_histories_metadata(histories, overwrite=True)
     matched, refreshed, messages = _refresh_bangumi_histories_media_server(histories, force=True)
+    details = scrape_messages + messages
     if refreshed:
         return schemas.Response(
             success=True,
-            message=f"已触发 {refreshed} 个媒体服务器刷新，匹配 Bangumi 记录 {matched} 条",
-            data={"matched": matched, "refreshed": refreshed, "details": messages},
+            message=(
+                f"已重刮 {scraped} 个Bangumi媒体目录，"
+                f"已触发 {refreshed} 个媒体服务器刷新，匹配 Bangumi 记录 {matched} 条"
+            ),
+            data={"matched": matched, "scraped": scraped, "refreshed": refreshed, "details": details},
+        )
+    if scraped:
+        return schemas.Response(
+            success=True,
+            message=(
+                f"已重刮 {scraped} 个Bangumi媒体目录，但未触发媒体服务器刷新；"
+                + "；".join(messages)
+            ),
+            data={"matched": matched, "scraped": scraped, "refreshed": refreshed, "details": details},
         )
     return schemas.Response(
         success=False,
         message=f"未触发媒体库刷新，匹配 Bangumi 记录 {matched} 条；" + "；".join(messages),
-        data={"matched": matched, "refreshed": refreshed, "details": messages},
+        data={"matched": matched, "scraped": scraped, "refreshed": refreshed, "details": details},
     )
 
 
