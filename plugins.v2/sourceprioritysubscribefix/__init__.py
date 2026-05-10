@@ -45,7 +45,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.16"
+    plugin_version = "1.0.17"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -876,7 +876,13 @@ def _bangumi_source_keyword(download_history: Any) -> Optional[dict]:
 
 def _source_downloads(limit: int = 12) -> list[DownloadHistory]:
     result = []
-    for history in _page_db_items(DownloadHistory, limit=500):
+    try:
+        histories = DownloadHistoryOper().list_by_page(page=1, count=500) or []
+        histories = sorted(histories, key=lambda item: item.id or 0, reverse=True)
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件读取下载历史失败：{err}")
+        histories = []
+    for history in histories:
         if _bangumi_source_keyword(history):
             result.append(history)
         if len(result) >= limit:
