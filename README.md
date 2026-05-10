@@ -59,13 +59,16 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 
 ### IYUU自动辅种增强
 
-`IYUUAutoSeedPlus` 复刻官方 `IYUUAutoSeed` 2.15，并增加 IYUU 请求超时和每批 hash 数量配置。
+`IYUUAutoSeedPlus` 复刻官方 `IYUUAutoSeed` 2.15，并增加 IYUU 请求超时、每批 hash 数量和站点域名匹配配置。
 
 主要能力：
 
 - 保留官方 IYUU 自动辅种流程。
 - `IYUU请求超时(秒)` 可配置，默认 `60` 秒。
 - `每批查询Hash数` 可配置，默认 `50`，用于缓解一次 200 个 hash 查询导致的 IYUU 超时。
+- `站点域名别名` 可配置，用于处理 IYUU 返回域名与 MoviePilot 统一站点域名不一致的问题。
+- 下载链接统一使用安全 URL 拼接，避免出现 `example.comdownload.php` 这类错误。
+- 站点详情页取下载链接时也使用插件请求超时配置。
 - 超时日志会明确标记为网络或接口超时，不再和“没有可辅种站点”混在一起。
 
 详细用法见 [plugins.v2/iyuuautoseedplus/README.md](plugins.v2/iyuuautoseedplus/README.md)。

@@ -3,7 +3,7 @@ import re
 from datetime import datetime, timedelta
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -37,6 +37,59 @@ def _int_config(value: Any, default: int, min_value: int, max_value: int) -> int
     return max(min_value, min(max_value, number))
 
 
+def _normalize_domain(value: Any) -> str:
+    """
+    归一化域名，用于匹配 IYUU 站点与 MoviePilot 统一站点配置。
+    """
+    value = str(value or "").strip().lower()
+    if not value:
+        return ""
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = parsed.netloc or parsed.path.split("/", 1)[0]
+    return host.split("@")[-1].split(":", 1)[0].strip()
+
+
+def _without_www(domain: str) -> str:
+    return domain[4:] if domain.startswith("www.") else domain
+
+
+def _join_url(base_url: Any, path: Any) -> Optional[str]:
+    """
+    安全拼接站点 URL 和相对下载路径，避免 example.comdownload.php 这类错误。
+    """
+    path = str(path or "").strip()
+    if not path:
+        return None
+    if re.match(r"(?i)^https?://", path):
+        return path
+    base_url = str(base_url or "").strip()
+    if not base_url:
+        return path
+    if not base_url.endswith("/"):
+        base_url = f"{base_url}/"
+    return urljoin(base_url, path)
+
+
+def _parse_site_aliases(value: Any) -> dict[str, str]:
+    """
+    解析一行一个的域名别名配置：IYUU域名=MoviePilot站点域名。
+    """
+    aliases: dict[str, str] = {}
+    for line in str(value or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        separator = next((sep for sep in ("=>", "=", ",") if sep in line), None)
+        if not separator:
+            continue
+        source, target = line.split(separator, 1)
+        source_domain = _normalize_domain(source)
+        target_domain = _normalize_domain(target)
+        if source_domain and target_domain:
+            aliases[source_domain] = target_domain
+    return aliases
+
+
 class IYUUAutoSeedPlus(_PluginBase):
     # 插件名称
     plugin_name = "IYUU自动辅种增强"
@@ -45,7 +98,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.1"
+    plugin_version = "2.15.2"
     # 插件作者
     plugin_author = "jxxghp,CKun,Ellick"
     # 作者主页
@@ -83,6 +136,8 @@ class IYUUAutoSeedPlus(_PluginBase):
     _auto_start = False
     _request_timeout = 60
     _chunk_size = 50
+    _site_aliases_text = ""
+    _site_aliases = {}
     # 退出事件
     _event = Event()
     # 种子链接xpaths
@@ -132,6 +187,8 @@ class IYUUAutoSeedPlus(_PluginBase):
             self._size = float(config.get("size")) if config.get("size") else 0
             self._request_timeout = _int_config(config.get("request_timeout"), 60, 5, 300)
             self._chunk_size = _int_config(config.get("chunk_size"), 50, 1, 200)
+            self._site_aliases_text = config.get("site_aliases") or ""
+            self._site_aliases = _parse_site_aliases(self._site_aliases_text)
             self._clearcache = config.get("clearcache")
             self._permanent_error_caches = [] if self._clearcache else config.get("permanent_error_caches") or []
             self._error_caches = [] if self._clearcache else config.get("error_caches") or []
@@ -329,6 +386,28 @@ class IYUUAutoSeedPlus(_PluginBase):
                                         'props': {
                                             'model': 'onlyonce',
                                             'label': '立即运行一次',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'site_aliases',
+                                            'label': '站点域名别名',
+                                            'rows': 3,
+                                            'placeholder': '一行一个：IYUU返回域名=MoviePilot站点域名，例如 www.example.com=example.com'
                                         }
                                     }
                                 ]
@@ -712,7 +791,8 @@ class IYUUAutoSeedPlus(_PluginBase):
             "categoryafterseed": "",
             "size": "",
             "request_timeout": 60,
-            "chunk_size": 50
+            "chunk_size": 50,
+            "site_aliases": ""
         }
 
     def get_page(self) -> List[dict]:
@@ -740,6 +820,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "size": self._size,
             "request_timeout": self._request_timeout,
             "chunk_size": self._chunk_size,
+            "site_aliases": self._site_aliases_text,
             "success_caches": self._success_caches,
             "error_caches": self._error_caches,
             "permanent_error_caches": self._permanent_error_caches
@@ -1080,6 +1161,59 @@ class IYUUAutoSeedPlus(_PluginBase):
         logger.error(f"不支持的下载器：{service.type}")
         return None
 
+    def __site_candidates(self, site_url: str) -> list[str]:
+        """
+        生成 IYUU 站点域名到 MoviePilot 站点域名的候选列表。
+        """
+        domain = _normalize_domain(site_url)
+        candidates = []
+
+        def add(candidate: str):
+            candidate = _normalize_domain(candidate)
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        add(domain)
+        add(_without_www(domain))
+        alias = self._site_aliases.get(domain) or self._site_aliases.get(_without_www(domain))
+        if alias:
+            add(alias)
+            add(_without_www(alias))
+        return candidates
+
+    def __get_site_info(self, sites_helper: SitesHelper, site_url: str) -> tuple[Optional[CommentedMap], str]:
+        """
+        按 IYUU 域名查找 MoviePilot 统一站点配置，支持 www 归一化、别名和子域名兜底。
+        """
+        source_domain = _normalize_domain(site_url)
+        for candidate in self.__site_candidates(site_url):
+            site_info = sites_helper.get_indexer(candidate)
+            if site_info and site_info.get("url"):
+                if candidate != source_domain:
+                    logger.info(f"IYUU站点域名映射：{source_domain} -> {candidate}")
+                return site_info, candidate
+
+        try:
+            for site in SiteOper().list_order_by_pri():
+                configured_domain = _normalize_domain(getattr(site, "domain", None) or getattr(site, "url", None))
+                if not configured_domain:
+                    continue
+                if source_domain.endswith(f".{configured_domain}") or _without_www(source_domain) == configured_domain:
+                    site_info = sites_helper.get_indexer(configured_domain)
+                    if site_info and site_info.get("url"):
+                        logger.info(f"IYUU站点域名按子域名匹配：{source_domain} -> {configured_domain}")
+                        return site_info, configured_domain
+        except Exception as err:
+            logger.debug(f"IYUU站点域名兜底匹配失败：{source_domain} - {err}")
+
+        return None, source_domain
+
+    @staticmethod
+    def __append_https_param(torrent_url: str) -> str:
+        if not torrent_url or "https=1" in torrent_url:
+            return torrent_url
+        return f"{torrent_url}{'&' if '?' in torrent_url else '?'}https=1"
+
     def __download_torrent(self, seed: dict, service: ServiceInfo, save_path: str, save_category: str):
         """
         下载种子
@@ -1107,11 +1241,9 @@ class IYUUAutoSeedPlus(_PluginBase):
             self.fail += 1
             self.cached += 1
             return False
-        # 查询站点
-        site_domain = StringUtils.get_url_domain(site_url)
         # 站点信息
         sites_helper = SitesHelper()
-        site_info = sites_helper.get_indexer(site_domain)
+        site_info, site_domain = self.__get_site_info(sites_helper, site_url)
         if not site_info or not site_info.get('url'):
             logger.debug(f"没有维护种子对应的站点：{site_url}")
             return False
@@ -1144,10 +1276,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             return False
         # 强制使用Https
         if __is_special_site(torrent_url):
-            if "?" in torrent_url:
-                torrent_url += "&https=1"
-            else:
-                torrent_url += "?https=1"
+            torrent_url = self.__append_https_param(torrent_url)
         # 下载种子文件
         _, content, _, _, error_msg = TorrentHelper().download_torrent(
             url=torrent_url,
@@ -1317,8 +1446,9 @@ class IYUUAutoSeedPlus(_PluginBase):
                     'User-Agent': f'{ua}',
                     'Accept': 'application/json, text/plain, */*',
                     'x-api-key': apikey
-                }
-            ).post_res(f"{api_url}api/torrent/genDlToken", params={
+                },
+                timeout=self._request_timeout
+            ).post_res(_join_url(api_url, "api/torrent/genDlToken"), params={
                 'id': tid
             })
             if not res:
@@ -1336,7 +1466,7 @@ class IYUUAutoSeedPlus(_PluginBase):
 
             rss_match = re.search(r'/rss/\d+\.(\w+)', rssurl)
             rsskey = rss_match.group(1)
-            return f"{site.get('url')}torrents/download/{tid}.{rsskey}"
+            return _join_url(site.get('url'), f"torrents/download/{tid}.{rsskey}")
 
         def __get_gpw_torrent_url_from_page(seed: dict, site: dict):
             """
@@ -1347,13 +1477,14 @@ class IYUUAutoSeedPlus(_PluginBase):
                 return None
             
             try:
-                page_url = f"{site.get('url')}torrents.php?torrentid={seed.get('torrent_id')}&hit=1"
+                page_url = _join_url(site.get('url'), f"torrents.php?torrentid={seed.get('torrent_id')}&hit=1")
                 logger.info(f"正在获取种子下载链接：{page_url} ...")
 
                 res = RequestUtils(
                     cookies=site.get("cookie"),
                     ua=site.get("ua") or settings.USER_AGENT,
-                    proxies=settings.PROXY if site.get("proxy") else None
+                    proxies=settings.PROXY if site.get("proxy") else None,
+                    timeout=self._request_timeout
                 ).get_res(url=page_url)
 
 
@@ -1393,7 +1524,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                     logger.warning(f"未找到与 torrent_id={torrent_id} 对应的下载链接")
                     return None    
                 
-                final_url = urljoin(site['url'], matched_url)
+                final_url = _join_url(site.get('url'), matched_url)
 
                 logger.info(f"获取种子下载链接成功：{final_url}")
                 return final_url
@@ -1457,7 +1588,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                                              download_url,
                                              flags=re.IGNORECASE),
                                       flags=re.IGNORECASE)
-                return f"{site.get('url')}{download_url}"
+                return _join_url(site.get('url'), download_url)
         except Exception as e:
             logger.warn(
                 f"{site.get('name')} Url转换失败，{str(e)}：site_url={site.get('url')}，base_url={base_url}, seed={seed}")
@@ -1471,12 +1602,13 @@ class IYUUAutoSeedPlus(_PluginBase):
             logger.warn(f"站点 {site.get('name')} 未获取站点地址，无法获取种子下载链接")
             return None
         try:
-            page_url = f"{site.get('url')}details.php?id={seed.get('torrent_id')}&hit=1"
+            page_url = _join_url(site.get('url'), f"details.php?id={seed.get('torrent_id')}&hit=1")
             logger.info(f"正在获取种子下载链接：{page_url} ...")
             res = RequestUtils(
                 cookies=site.get("cookie"),
                 ua=site.get("ua") or settings.USER_AGENT,
-                proxies=settings.PROXY if site.get("proxy") else None
+                proxies=settings.PROXY if site.get("proxy") else None,
+                timeout=self._request_timeout
             ).get_res(url=page_url)
             if res is not None and res.status_code in (200, 500):
                 if "charset=utf-8" in res.text or "charset=UTF-8" in res.text:
@@ -1494,10 +1626,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                         download_url = download_url[0]
                         logger.info(f"获取种子下载链接成功：{download_url}")
                         if not download_url.startswith("http"):
-                            if download_url.startswith("/"):
-                                download_url = f"{site.get('url')}{download_url[1:]}"
-                            else:
-                                download_url = f"{site.get('url')}{download_url}"
+                            download_url = _join_url(site.get('url'), download_url)
                         return download_url
                 logger.warn(f"获取种子下载链接失败，未找到下载链接：{page_url}")
                 return None
