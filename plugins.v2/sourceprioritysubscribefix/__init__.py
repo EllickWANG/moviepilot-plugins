@@ -45,7 +45,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.18"
+    plugin_version = "1.0.19"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -404,6 +404,19 @@ def _title_candidates_from_subscribe(subscribe: Subscribe) -> set[str]:
     return {_normalize_match_text(item) for item in candidates if _normalize_match_text(item)}
 
 
+def _title_candidates_from_text(text: Any) -> set[str]:
+    candidates = {text}
+    try:
+        meta = MetaInfo(str(text))
+        candidates.add(meta.name)
+        candidates.add(meta.title)
+        candidates.add(meta.cn_name)
+        candidates.add(meta.org_string)
+    except Exception:
+        pass
+    return {_normalize_match_text(item) for item in candidates if _normalize_match_text(item)}
+
+
 def _source_only_subscribes() -> list[Subscribe]:
     now = time.time()
     if now - _SOURCE_SUBSCRIBE_CACHE["time"] < 10:
@@ -433,6 +446,53 @@ def _match_subscribe_by_meta(meta: Any, mtype: Optional[MediaType]) -> Optional[
             return subscribe
         for meta_title in meta_titles:
             if len(meta_title) >= 4 and any(meta_title in sub_title or sub_title in meta_title for sub_title in sub_titles):
+                return subscribe
+    return None
+
+
+def _season_number(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"(\d+)", text)
+    if not match:
+        return None
+    return _int_or_none(match.group(1))
+
+
+def _match_subscribe_by_download_history(download_history: Any) -> Optional[Subscribe]:
+    if not download_history:
+        return None
+    history_titles = _title_candidates_from_text(getattr(download_history, "title", None))
+    torrent_name = getattr(download_history, "torrent_name", None)
+    if torrent_name:
+        history_titles.update(_title_candidates_from_text(torrent_name))
+    if not history_titles:
+        return None
+
+    history_type = _type_value(_media_type_or_none(getattr(download_history, "type", None)))
+    history_season = _season_number(getattr(download_history, "seasons", None))
+    history_year = str(getattr(download_history, "year", "") or "").strip()
+
+    for subscribe in _source_only_subscribes():
+        if history_type and subscribe.type and history_type != subscribe.type:
+            continue
+        if history_season is not None and subscribe.season is not None and history_season != subscribe.season:
+            continue
+        if history_year and subscribe.year and str(subscribe.year) != history_year:
+            continue
+        sub_titles = _title_candidates_from_subscribe(subscribe)
+        if history_titles.intersection(sub_titles):
+            return subscribe
+        for history_title in history_titles:
+            if len(history_title) >= 4 and any(
+                    history_title in sub_title or sub_title in history_title
+                    for sub_title in sub_titles
+            ):
                 return subscribe
     return None
 
@@ -751,19 +811,39 @@ def _source_media_from_download_history(chain: Any, download_history: Any) -> Op
     if not download_history or getattr(download_history, "tmdbid", None) or getattr(download_history, "doubanid", None):
         return None
     source_keyword = SubscribeChain.parse_subscribe_source_keyword(_download_history_source(download_history))
-    if not source_keyword:
-        return None
-    subscribe = _subscribe_from_source_keyword(source_keyword)
-    bangumiid = _int_or_none(getattr(subscribe, "bangumiid", None) or source_keyword.get("bangumiid"))
+    subscribe = _subscribe_from_source_keyword(source_keyword) if source_keyword else None
+    if not subscribe:
+        subscribe = _match_subscribe_by_download_history(download_history)
+        if subscribe:
+            logger.info(
+                f"{getattr(download_history, 'title', '')} 通过下载历史匹配到Bangumi订阅："
+                f"{subscribe.name} bangumi:{subscribe.bangumiid}"
+            )
+    bangumiid = _int_or_none(
+        getattr(subscribe, "bangumiid", None)
+        or (source_keyword or {}).get("bangumiid")
+    )
     if not bangumiid:
         return None
-    mediainfo = _media_from_bangumi(chain, bangumiid)
+    try:
+        mediainfo = _media_from_bangumi(chain, bangumiid)
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件获取Bangumi详情失败：{bangumiid} - {err}")
+        return None
     if not mediainfo:
         return None
-    mtype = _media_type_or_none(getattr(download_history, "type", None)) or _media_type_or_none(source_keyword.get("type"))
+    mtype = (
+        _media_type_or_none(getattr(download_history, "type", None))
+        or _media_type_or_none((source_keyword or {}).get("type"))
+        or _media_type_or_none(getattr(subscribe, "type", None))
+    )
     if mtype:
         mediainfo.type = mtype
-    season = _int_or_none(source_keyword.get("season"))
+    season = (
+        _int_or_none((source_keyword or {}).get("season"))
+        or _season_number(getattr(download_history, "seasons", None))
+        or _season_number(getattr(subscribe, "season", None))
+    )
     if mediainfo.type == MediaType.TV and season is not None:
         mediainfo.season = season
     if getattr(download_history, "media_category", None):
@@ -803,7 +883,11 @@ def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
 
     if not mediainfo:
         download_history = _download_history_by_hash_or_file(download_hash, fileitem)
-        source_mediainfo = _source_media_from_download_history(self, download_history)
+        try:
+            source_mediainfo = _source_media_from_download_history(self, download_history)
+        except Exception as err:
+            logger.warn(f"订阅外部源优先插件补齐整理识别失败：{err}")
+            source_mediainfo = None
         if source_mediainfo:
             logger.info(f"{getattr(fileitem, 'name', None) or getattr(fileitem, 'path', '')} 使用订阅来源Bangumi详情补齐整理识别：{source_mediainfo.title_year}")
             if len(args_list) > 2:
@@ -818,7 +902,11 @@ def _redo_transfer_history_with_source(chain: TransferChain, history_id: int) ->
     history = TransferHistoryOper().get(history_id)
     if history:
         download_history = _download_history_by_hash_or_file(history.download_hash, None)
-        mediainfo = _source_media_from_download_history(chain, download_history)
+        try:
+            mediainfo = _source_media_from_download_history(chain, download_history)
+        except Exception as err:
+            logger.warn(f"订阅外部源优先插件重新整理识别失败：{err}")
+            mediainfo = None
         if mediainfo and history.src_fileitem:
             logger.info(f"{history.src} 使用订阅来源Bangumi详情重新整理：{mediainfo.title_year}")
             if history.dest_fileitem:
@@ -860,7 +948,11 @@ def _page_db_items(model: Any, status: Optional[bool] = None, limit: int = 20) -
         oper = TransferHistoryOper() if model is TransferHistory else DownloadHistoryOper()
         query = oper._db.query(model)
         if model is TransferHistory and status is not None:
-            query = query.filter(TransferHistory.status.is_(status))
+            items = query.order_by(model.id.desc()).limit(max(limit * 5, 100)).all()
+            return [
+                item for item in items
+                if bool(getattr(item, "status", True)) is bool(status)
+            ][:limit]
         return query.order_by(model.id.desc()).limit(limit).all()
     except Exception as err:
         logger.warn(f"订阅外部源优先插件读取页面数据失败：{err}")
