@@ -6,6 +6,7 @@ import traceback
 import re
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+from xml.dom import minidom
 
 from fastapi import Depends, Request
 from fastapi.responses import StreamingResponse
@@ -40,13 +41,14 @@ from app.schemas import MediaType, MessageChannel
 from app.schemas.types import ContentType, EventType, NotificationType
 from app.helper.subscribe import SubscribeHelper
 from app.helper.torrent import TorrentHelper
+from app.utils.dom import DomUtils
 
 
 class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.23"
+    plugin_version = "1.0.24"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -142,6 +144,12 @@ class sourceprioritysubscribefix(_PluginBase):
 
     def get_page(self) -> Optional[List[dict]]:
         return _diagnostic_page(self)
+
+    def get_module(self) -> dict[str, Any]:
+        return {
+            "metadata_nfo": _bangumi_metadata_nfo,
+            "metadata_img": _bangumi_metadata_img,
+        }
 
     def stop_service(self):
         self._unpatch()
@@ -947,6 +955,171 @@ def _patched_download_single(self: DownloadChain, *args, **kwargs):
     except Exception as err:
         logger.warn(f"订阅外部源优先插件修正下载二级分类失败：{err}")
     return sourceprioritysubscribefix._originals["download_single"](self, *args_list, **kwargs)
+
+
+def _is_bangumi_metadata_media(mediainfo: Optional[MediaInfo]) -> bool:
+    return bool(mediainfo and mediainfo.bangumi_id)
+
+
+def _add_cdata(doc: minidom.Document, root: minidom.Node, name: str, value: Any) -> None:
+    node = DomUtils.add_node(doc, root, name)
+    node.appendChild(doc.createCDATASection(str(value or "")))
+
+
+def _add_text_node(doc: minidom.Document, root: minidom.Node, name: str, value: Any) -> None:
+    DomUtils.add_node(doc, root, name, str(value or ""))
+
+
+def _bangumi_unique_id(
+        doc: minidom.Document,
+        root: minidom.Node,
+        mediainfo: MediaInfo,
+        suffix: Optional[str] = None) -> None:
+    bid = str(mediainfo.bangumi_id)
+    value = f"{bid}-{suffix}" if suffix else bid
+    uniqueid = DomUtils.add_node(doc, root, "uniqueid", value)
+    uniqueid.setAttribute("type", "bangumi")
+    uniqueid.setAttribute("default", "true")
+    DomUtils.add_node(doc, root, "bangumiid", bid)
+
+
+def _bangumi_genres(mediainfo: MediaInfo) -> list[str]:
+    genres = []
+    seen = set()
+    for value in _bangumi_tag_values(mediainfo.bangumi_info or {}):
+        value = str(value).strip()
+        key = _normalize_match_text(value)
+        if not key or key in seen:
+            continue
+        genres.append(value)
+        seen.add(key)
+        if len(genres) >= 12:
+            break
+    return genres
+
+
+def _bangumi_add_common_nfo(
+        doc: minidom.Document,
+        root: minidom.Node,
+        mediainfo: MediaInfo,
+        unique_suffix: Optional[str] = None) -> None:
+    _bangumi_unique_id(doc, root, mediainfo, unique_suffix)
+    _add_cdata(doc, root, "plot", mediainfo.overview or "")
+    _add_cdata(doc, root, "outline", mediainfo.overview or "")
+    _add_text_node(doc, root, "rating", mediainfo.vote_average or "0")
+    _add_text_node(doc, root, "premiered", mediainfo.release_date or "")
+    _add_text_node(doc, root, "year", mediainfo.year or "")
+    for genre in _bangumi_genres(mediainfo):
+        _add_text_node(doc, root, "genre", genre)
+    for actor in mediainfo.actors or []:
+        name = actor.get("name") or actor.get("name_cn") or actor.get("subject_name")
+        if not name:
+            continue
+        xactor = DomUtils.add_node(doc, root, "actor")
+        _add_text_node(doc, xactor, "name", name)
+        _add_text_node(doc, xactor, "type", "Actor")
+        role = actor.get("character") or actor.get("role") or actor.get("career")
+        if isinstance(role, list):
+            role = "、".join(str(item) for item in role if item)
+        _add_text_node(doc, xactor, "role", role or "")
+        images = actor.get("images") or {}
+        thumb = images.get("medium") or images.get("large") or images.get("small")
+        if thumb:
+            _add_text_node(doc, xactor, "thumb", thumb)
+        if actor.get("id"):
+            _add_text_node(doc, xactor, "profile", f"https://bgm.tv/person/{actor.get('id')}")
+
+
+def _bangumi_tv_nfo(mediainfo: MediaInfo) -> minidom.Document:
+    doc = minidom.Document()
+    root = DomUtils.add_node(doc, doc, "tvshow")
+    _bangumi_add_common_nfo(doc, root, mediainfo)
+    _add_text_node(doc, root, "title", mediainfo.title or "")
+    _add_text_node(doc, root, "originaltitle", mediainfo.original_title or "")
+    _add_text_node(doc, root, "season", "-1")
+    _add_text_node(doc, root, "episode", "-1")
+    return doc
+
+
+def _bangumi_movie_nfo(mediainfo: MediaInfo) -> minidom.Document:
+    doc = minidom.Document()
+    root = DomUtils.add_node(doc, doc, "movie")
+    _bangumi_add_common_nfo(doc, root, mediainfo)
+    _add_text_node(doc, root, "title", mediainfo.title or "")
+    _add_text_node(doc, root, "originaltitle", mediainfo.original_title or "")
+    return doc
+
+
+def _bangumi_season_nfo(mediainfo: MediaInfo, season: int) -> minidom.Document:
+    doc = minidom.Document()
+    root = DomUtils.add_node(doc, doc, "season")
+    _bangumi_add_common_nfo(doc, root, mediainfo, f"s{season}")
+    _add_text_node(doc, root, "title", f"第 {season} 季")
+    _add_text_node(doc, root, "seasonnumber", season)
+    return doc
+
+
+def _bangumi_episode_nfo(mediainfo: MediaInfo, season: int, episode: int) -> minidom.Document:
+    doc = minidom.Document()
+    root = DomUtils.add_node(doc, doc, "episodedetails")
+    _bangumi_add_common_nfo(doc, root, mediainfo, f"s{season}e{episode}")
+    _add_text_node(doc, root, "title", f"第 {episode} 集")
+    _add_text_node(doc, root, "season", season)
+    _add_text_node(doc, root, "episode", episode)
+    _add_text_node(doc, root, "aired", mediainfo.release_date or "")
+    return doc
+
+
+def _bangumi_metadata_nfo(
+        meta: Any,
+        mediainfo: MediaInfo,
+        season: Optional[int] = None,
+        episode: Optional[int] = None) -> Optional[str]:
+    if not _is_bangumi_metadata_media(mediainfo):
+        return None
+    if mediainfo.type == MediaType.MOVIE:
+        doc = _bangumi_movie_nfo(mediainfo)
+    elif season is not None and episode is not None:
+        doc = _bangumi_episode_nfo(mediainfo, season, episode)
+    elif season is not None:
+        doc = _bangumi_season_nfo(mediainfo, season)
+    else:
+        doc = _bangumi_tv_nfo(mediainfo)
+    logger.info(f"{mediainfo.title_year} 使用Bangumi生成NFO元数据")
+    return doc.toprettyxml(indent="  ", encoding="utf-8")
+
+
+def _image_ext(url: Optional[str]) -> str:
+    if not url:
+        return ".jpg"
+    suffix = Path(str(url).split("?", 1)[0]).suffix
+    return suffix or ".jpg"
+
+
+def _bangumi_metadata_img(
+        mediainfo: MediaInfo,
+        season: Optional[int] = None,
+        episode: Optional[int] = None) -> Optional[dict]:
+    if not _is_bangumi_metadata_media(mediainfo):
+        return None
+    if episode is not None:
+        return {}
+    poster = mediainfo.poster_path
+    if season is not None:
+        if not poster:
+            return {}
+        image_name = (
+            "season-specials-poster"
+            if season == 0
+            else f"season{str(season).rjust(2, '0')}-poster"
+        )
+        return {f"{image_name}{_image_ext(poster)}": poster}
+    images = {}
+    if poster:
+        images[f"poster{_image_ext(poster)}"] = poster
+    if mediainfo.backdrop_path:
+        images[f"backdrop{_image_ext(mediainfo.backdrop_path)}"] = mediainfo.backdrop_path
+    return images
 
 
 def _download_history_by_hash_or_file(download_hash: Optional[str], fileitem: Any) -> Optional[Any]:
