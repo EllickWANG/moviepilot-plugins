@@ -10,7 +10,7 @@
   "sourceprioritysubscribefix": {
     "name": "订阅外部源优先",
     "description": "订阅时优先使用 doubanid/bangumiid 对应详情，并在整理阶段按订阅来源回填 Bangumi 信息。",
-    "version": "1.0.26",
+    "version": "1.0.27",
     "icon": "mdi-heart-cog",
     "author": "Ellick",
     "level": 1
