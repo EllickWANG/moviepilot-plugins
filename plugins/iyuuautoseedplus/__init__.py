@@ -1646,7 +1646,8 @@ class IYUUAutoSeedPlus(_PluginBase):
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
                     self._event.set()
-                    self._scheduler.shutdown()
+                    # 热更新/重载时不要等待正在执行的任务结束，避免安装接口被长任务阻塞。
+                    self._scheduler.shutdown(wait=False)
                     self._event.clear()
                 self._scheduler = None
         except Exception as e:
