@@ -17,7 +17,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断工具集合，当前支持测试已有站点 RSS 订阅是否正常。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -247,17 +247,16 @@ def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
     rss_url = _normalize_rss_url(site.url, site.rss)
     source = "saved"
     fixed = False
+    should_write_back = False
     if not rss_url and sitetoolbox._auto_discover:
         rss_url, message = _discover_rss_url(site)
         if not rss_url:
             return _result(site=site, state="error", message=message or "未获取到RSS链接", seconds=_elapsed(start))
         source = "discovered"
         if repair or sitetoolbox._save_discovered:
-            SiteOper().update_rss(site.domain, rss_url)
-            fixed = True
+            should_write_back = True
     elif repair and rss_url and rss_url != (site.rss or "").strip():
-        SiteOper().update_rss(site.domain, rss_url)
-        fixed = True
+        should_write_back = True
 
     if not rss_url:
         return _result(site=site, state="error", message="站点未配置RSS地址", seconds=_elapsed(start))
@@ -271,8 +270,7 @@ def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
                 rss_url = discovered_url
                 items = discovered_items
                 source = "repaired"
-                SiteOper().update_rss(site.domain, rss_url)
-                fixed = True
+                should_write_back = True
         logger.info(f"{site.name} RSS修复尝试：{message or '已尝试重新生成'}")
     if items is None:
         return _result(site=site, state="error", message="RSS链接已过期", rss_url=rss_url, source=source, fixed=fixed, seconds=_elapsed(start))
@@ -289,6 +287,9 @@ def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
         }
         for item in items[:5]
     ]
+    if should_write_back:
+        SiteOper().update_rss(site.domain, rss_url)
+        fixed = True
     return _result(
         site=site,
         state="success",
@@ -520,7 +521,22 @@ def _discover_rss_url(site: Any) -> Tuple[str, str]:
         proxy=bool(site.proxy),
         timeout=sitetoolbox._timeout,
     )
-    return (urljoin(site.url, rss_url), message) if rss_url else ("", message)
+    if not rss_url:
+        return "", message
+    rss_url = urljoin(site.url, rss_url)
+    if _is_site_home_url(site.url, rss_url):
+        return "", "获取RSS链接失败：生成地址不是RSS链接"
+    return rss_url, message
+
+
+def _is_site_home_url(site_url: str, rss_url: str) -> bool:
+    site = urlparse(site_url)
+    rss = urlparse(rss_url)
+    return (
+        site.netloc == rss.netloc
+        and (rss.path in {"", "/"})
+        and not rss.query
+    )
 
 
 def _parse_rss(site: Any, rss_url: str):
