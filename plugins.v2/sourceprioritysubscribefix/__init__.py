@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.40"
+    plugin_version = "1.0.41"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -854,6 +854,12 @@ def _media_type_or_none(value: Any) -> Optional[MediaType]:
         return value
     if not value:
         return None
+    agent_type = MediaType.from_agent(str(value))
+    if agent_type:
+        return agent_type
+    enum_name = str(value).strip().upper()
+    if enum_name in MediaType.__members__:
+        return MediaType[enum_name]
     try:
         return MediaType(value)
     except ValueError:
@@ -3135,7 +3141,7 @@ def _parse_site_list(sites: Optional[str]) -> Optional[List[int]]:
 
 
 def _parse_media_type(mtype: Optional[str]) -> Optional[MediaType]:
-    return MediaType(mtype) if mtype else None
+    return _media_type_or_none(mtype)
 
 
 def _parse_media_season(season: Optional[str]) -> Optional[int]:
