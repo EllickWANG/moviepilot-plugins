@@ -17,7 +17,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断工具集合，当前支持测试已有站点 RSS 订阅是否正常。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -70,6 +70,22 @@ class sitetoolbox(_PluginBase):
                 "auth": "bear",
                 "summary": "测试单个站点RSS",
                 "description": "测试指定站点 RSS 是否可以获取并解析。",
+            },
+            {
+                "path": "/repair/rss",
+                "endpoint": _api_repair_selected_rss,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "尝试修复已选站点RSS",
+                "description": "重新生成或规范化已选站点 RSS 地址，成功后写回站点配置并测试解析。",
+            },
+            {
+                "path": "/repair/rss/{site_id}",
+                "endpoint": _api_repair_one_rss,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "尝试修复单个站点RSS",
+                "description": "重新生成或规范化指定站点 RSS 地址，成功后写回站点配置并测试解析。",
             },
         ]
 
@@ -190,7 +206,35 @@ def _api_test_one_rss(site_id: int) -> schemas.Response:
     return schemas.Response(success=result.get("state") == "success", message=result.get("message"), data=result)
 
 
-def _test_site_rss(site_id: int) -> Dict[str, Any]:
+def _api_repair_selected_rss(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    site_ids = _int_list((payload or {}).get("site_ids")) or plugin._site_ids
+    if not site_ids:
+        return schemas.Response(success=False, message="未选择站点")
+    results = [_test_site_rss(site_id, repair=True) for site_id in site_ids]
+    plugin._save_results(results)
+    ok_count = len([item for item in results if item.get("state") == "success"])
+    fixed_count = len([item for item in results if item.get("fixed")])
+    return schemas.Response(
+        success=ok_count == len(results),
+        message=f"RSS修复完成：成功 {ok_count}/{len(results)}，写回 {fixed_count} 个",
+        data=results,
+    )
+
+
+def _api_repair_one_rss(site_id: int) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    result = _test_site_rss(site_id, repair=True)
+    kept = [item for item in sitetoolbox._latest_results if item.get("site_id") != site_id]
+    plugin._save_results([result, *kept][:100])
+    return schemas.Response(success=result.get("state") == "success", message=result.get("message"), data=result)
+
+
+def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
     start = time.monotonic()
     site = SiteOper().get(site_id)
     if not site:
@@ -200,40 +244,42 @@ def _test_site_rss(site_id: int) -> Dict[str, Any]:
     if not site.url:
         return _result(site=site, state="error", message="站点地址为空", seconds=_elapsed(start))
 
-    rss_url = (site.rss or "").strip()
+    rss_url = _normalize_rss_url(site.url, site.rss)
     source = "saved"
+    fixed = False
     if not rss_url and sitetoolbox._auto_discover:
-        rss_url, message = RssHelper().get_rss_link(
-            url=site.url,
-            cookie=site.cookie or "",
-            ua=site.ua or "",
-            proxy=bool(site.proxy),
-            timeout=sitetoolbox._timeout,
-        )
+        rss_url, message = _discover_rss_url(site)
         if not rss_url:
             return _result(site=site, state="error", message=message or "未获取到RSS链接", seconds=_elapsed(start))
-        rss_url = urljoin(site.url, rss_url)
         source = "discovered"
-        if sitetoolbox._save_discovered:
+        if repair or sitetoolbox._save_discovered:
             SiteOper().update_rss(site.domain, rss_url)
+            fixed = True
+    elif repair and rss_url and rss_url != (site.rss or "").strip():
+        SiteOper().update_rss(site.domain, rss_url)
+        fixed = True
 
     if not rss_url:
         return _result(site=site, state="error", message="站点未配置RSS地址", seconds=_elapsed(start))
 
-    headers = {"Cookie": site.cookie} if site.cookie else None
-    items = RssHelper().parse(
-        url=rss_url,
-        proxy=bool(site.proxy),
-        timeout=sitetoolbox._timeout,
-        headers=headers,
-        ua=site.ua or None,
-    )
+    items = _parse_rss(site, rss_url)
+    if repair and items is False and source == "saved" and sitetoolbox._auto_discover:
+        discovered_url, message = _discover_rss_url(site)
+        if discovered_url and discovered_url != rss_url:
+            discovered_items = _parse_rss(site, discovered_url)
+            if discovered_items not in (None, False):
+                rss_url = discovered_url
+                items = discovered_items
+                source = "repaired"
+                SiteOper().update_rss(site.domain, rss_url)
+                fixed = True
+        logger.info(f"{site.name} RSS修复尝试：{message or '已尝试重新生成'}")
     if items is None:
-        return _result(site=site, state="error", message="RSS链接已过期", rss_url=rss_url, source=source, seconds=_elapsed(start))
+        return _result(site=site, state="error", message="RSS链接已过期", rss_url=rss_url, source=source, fixed=fixed, seconds=_elapsed(start))
     if items is False:
-        return _result(site=site, state="error", message="RSS请求或解析失败", rss_url=rss_url, source=source, seconds=_elapsed(start))
+        return _result(site=site, state="error", message="RSS请求或解析失败", rss_url=rss_url, source=source, fixed=fixed, seconds=_elapsed(start))
     if not items:
-        return _result(site=site, state="warning", message="RSS可访问但没有解析到条目", rss_url=rss_url, source=source, count=0, seconds=_elapsed(start))
+        return _result(site=site, state="warning", message="RSS可访问但没有解析到条目", rss_url=rss_url, source=source, fixed=fixed, count=0, seconds=_elapsed(start))
 
     samples = [
         {
@@ -249,6 +295,7 @@ def _test_site_rss(site_id: int) -> Dict[str, Any]:
         message="RSS正常",
         rss_url=rss_url,
         source=source,
+        fixed=fixed,
         count=len(items),
         samples=samples,
         seconds=_elapsed(start),
@@ -257,7 +304,7 @@ def _test_site_rss(site_id: int) -> Dict[str, Any]:
 
 def _result(site: Any = None, site_id: Optional[int] = None, state: str = "error", message: str = "",
             rss_url: str = "", source: str = "", count: Optional[int] = None, samples: Optional[List[dict]] = None,
-            seconds: float = 0) -> Dict[str, Any]:
+            fixed: bool = False, seconds: float = 0) -> Dict[str, Any]:
     return {
         "site_id": getattr(site, "id", None) or site_id,
         "site_name": getattr(site, "name", None) or "",
@@ -266,6 +313,7 @@ def _result(site: Any = None, site_id: Optional[int] = None, state: str = "error
         "message": message,
         "rss_url": _mask_url(rss_url),
         "source": source,
+        "fixed": fixed,
         "count": count,
         "samples": samples or [],
         "seconds": seconds,
@@ -293,19 +341,40 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             "component": "VRow",
             "content": [
                 _col(12, None, {
-                    "component": "VBtn",
-                    "props": {
-                        "variant": "tonal",
-                        "color": "primary",
-                        "prepend-icon": "mdi-rss",
-                    },
-                    "text": "测试已选站点 RSS",
-                    "events": {
-                        "click": {
-                            "api": "plugin/sitetoolbox/test/rss",
-                            "method": "post",
-                        }
-                    },
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap ga-2"},
+                    "content": [
+                        {
+                            "component": "VBtn",
+                            "props": {
+                                "variant": "tonal",
+                                "color": "primary",
+                                "prepend-icon": "mdi-rss",
+                            },
+                            "text": "测试已选站点 RSS",
+                            "events": {
+                                "click": {
+                                    "api": "plugin/sitetoolbox/test/rss",
+                                    "method": "post",
+                                }
+                            },
+                        },
+                        {
+                            "component": "VBtn",
+                            "props": {
+                                "variant": "tonal",
+                                "color": "warning",
+                                "prepend-icon": "mdi-wrench",
+                            },
+                            "text": "尝试修复 RSS",
+                            "events": {
+                                "click": {
+                                    "api": "plugin/sitetoolbox/repair/rss",
+                                    "method": "post",
+                                }
+                            },
+                        },
+                    ],
                 })
             ],
         },
@@ -325,6 +394,7 @@ def _result_table(results: List[Dict[str, Any]]) -> dict:
                 _td(item.get("message") or "-"),
                 _td(str(item.get("count") if item.get("count") is not None else "-"), "text-no-wrap"),
                 _td(item.get("source") or "-", "text-no-wrap"),
+                _td("是" if item.get("fixed") else "-", "text-no-wrap"),
                 _td(item.get("seconds"), "text-no-wrap"),
                 _td(item.get("tested_at") or "-", "text-no-wrap"),
             ],
@@ -362,6 +432,7 @@ def _result_table(results: List[Dict[str, Any]]) -> dict:
                                         _th("说明"),
                                         _th("条目"),
                                         _th("来源"),
+                                        _th("写回"),
                                         _th("耗时"),
                                         _th("时间"),
                                     ],
@@ -432,6 +503,35 @@ def _mask_url(url: str) -> str:
             value = "***"
         masked_query.append((key, value))
     return urlunparse(parsed._replace(query=urlencode(masked_query)))
+
+
+def _normalize_rss_url(site_url: str, rss_url: Optional[str]) -> str:
+    rss_url = (rss_url or "").strip()
+    if not rss_url or rss_url == "#" or rss_url.lower().startswith("javascript:"):
+        return ""
+    return urljoin(site_url, rss_url)
+
+
+def _discover_rss_url(site: Any) -> Tuple[str, str]:
+    rss_url, message = RssHelper().get_rss_link(
+        url=site.url,
+        cookie=site.cookie or "",
+        ua=site.ua or "",
+        proxy=bool(site.proxy),
+        timeout=sitetoolbox._timeout,
+    )
+    return (urljoin(site.url, rss_url), message) if rss_url else ("", message)
+
+
+def _parse_rss(site: Any, rss_url: str):
+    headers = {"Cookie": site.cookie} if site.cookie else None
+    return RssHelper().parse(
+        url=rss_url,
+        proxy=bool(site.proxy),
+        timeout=sitetoolbox._timeout,
+        headers=headers,
+        ua=site.ua or None,
+    )
 
 
 def _elapsed(start: float) -> float:

@@ -29,7 +29,7 @@
   "sitetoolbox": {
     "name": "站点工具箱",
     "description": "站点诊断工具集合，当前支持测试已有站点RSS订阅是否正常。",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "mdi-toolbox",
     "author": "Ellick",
     "level": 1,

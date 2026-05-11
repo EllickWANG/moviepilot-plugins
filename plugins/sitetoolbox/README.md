@@ -10,6 +10,7 @@
 - 优先测试站点已保存的 RSS 地址。
 - 如果站点没有保存 RSS，可按 MoviePilot 内置规则尝试生成 RSS 链接。
 - 可选择是否把自动获取到的 RSS 地址保存回站点配置。
+- 可一键尝试修复无效 RSS：忽略 `#`、补全相对路径、重新生成 RSS 地址并写回。
 - 显示最近一次测试结果：站点、域名、状态、条目数、RSS 来源、耗时和测试时间。
 
 ## 配置
@@ -40,6 +41,20 @@ POST /api/v1/plugin/sitetoolbox/test/rss
 ```http
 POST /api/v1/plugin/sitetoolbox/test/rss/{site_id}
 ```
+
+尝试修复已选站点：
+
+```http
+POST /api/v1/plugin/sitetoolbox/repair/rss
+```
+
+尝试修复单个站点：
+
+```http
+POST /api/v1/plugin/sitetoolbox/repair/rss/{site_id}
+```
+
+修复会在 RSS 解析成功后写回站点配置。对于站点本身返回 `403`、`404`、Cookie 失效、站点没有生成 RSS 能力等问题，插件只会报告失败，不会强行写入无效地址。
 
 ## 状态说明
 
