@@ -26,6 +26,15 @@
     "level": 1,
     "v2": true
   },
+  "sitetoolbox": {
+    "name": "站点工具箱",
+    "description": "站点诊断工具集合，当前支持测试已有站点RSS订阅是否正常。",
+    "version": "1.0.0",
+    "icon": "mdi-toolbox",
+    "author": "Ellick",
+    "level": 1,
+    "v2": true
+  },
   "IYUUAutoSeedPlus": {
     "name": "IYUU自动辅种增强",
     "description": "复刻官方IYUU自动辅种，增加IYUU/下载器请求超时、每批Hash数量和站点域名匹配配置。",
