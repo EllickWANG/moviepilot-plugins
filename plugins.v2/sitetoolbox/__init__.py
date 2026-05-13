@@ -27,7 +27,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引和用户数据解析适配。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -305,7 +305,7 @@ class sitetoolbox(_PluginBase):
 
         patched_count = 0
         for parser_cls in _iter_site_parser_classes():
-            for method in ("_parse_user_base_info", "_parse_user_traffic_info", "_parse_user_detail_info"):
+            for method in ("_parse_site_page", "_parse_user_base_info", "_parse_user_traffic_info", "_parse_user_detail_info"):
                 if method not in parser_cls.__dict__:
                     continue
                 key = (parser_cls, method)
@@ -788,6 +788,7 @@ def _apply_site_userdata_rules(parser: Any, html_text: str, rules: list[dict[str
             config = rule.get("config") or {}
             if not isinstance(config, dict):
                 continue
+            _apply_parser_attr_rules(parser, html, html_text, config)
             _apply_json_stats(parser, html, html_text, config)
             _apply_field_rules(parser, html, html_text, config)
             if config.get("calculate_ratio") and not getattr(parser, "ratio", 0) and getattr(parser, "download", 0):
@@ -844,6 +845,21 @@ def _apply_json_stats(parser: Any, html, html_text: str, config: dict[str, Any])
             _set_parser_value(parser, target_field, str(value), None)
 
 
+def _apply_parser_attr_rules(parser: Any, html, html_text: str, config: dict[str, Any]):
+    attrs = config.get("attrs") or config.get("parser_attrs") or {}
+    if not isinstance(attrs, dict):
+        return
+
+    for attr, spec in attrs.items():
+        attr_name = str(attr or "").strip()
+        if not attr_name or not attr_name.startswith("_"):
+            continue
+        value = _extract_value(html, html_text, spec)
+        if value is None or value == "":
+            continue
+        setattr(parser, attr_name, value)
+
+
 def _extract_value(html, html_text: str, spec: Any) -> Optional[str]:
     if isinstance(spec, str):
         spec = {"xpath": spec}
@@ -874,6 +890,11 @@ def _extract_value(html, html_text: str, spec: Any) -> Optional[str]:
 
     for old, new in spec.get("replace") or []:
         value = value.replace(str(old), str(new))
+    if spec.get("format"):
+        try:
+            value = str(spec.get("format")).format(value=value)
+        except Exception:
+            pass
     return value.strip()
 
 
