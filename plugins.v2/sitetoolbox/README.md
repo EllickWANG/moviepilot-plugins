@@ -2,7 +2,7 @@
 
 插件 ID：`sitetoolbox`
 
-这是一个 MoviePilot 站点诊断工具箱。当前第一版功能是：选择已有站点，测试对应 RSS 订阅是否可以正常获取和解析。
+这是一个 MoviePilot 站点诊断与适配工具箱。它可以选择已有站点测试 RSS 订阅是否可以正常获取和解析，也整合了原 `siteadapter` 的站点索引和用户数据解析适配能力。
 
 ## 功能
 
@@ -12,6 +12,8 @@
 - 可选择是否把自动获取到的 RSS 地址保存回站点配置。
 - 可一键尝试修复无效 RSS：忽略 `#`、补全相对路径、重新生成 RSS 地址并写回。
 - 显示最近一次测试结果：站点、域名、状态、条目数、RSS 来源、耗时和测试时间。
+- 通过配置补充或覆盖站点搜索、浏览、列表字段等索引规则。
+- 通过配置修正站点上传量、下载量、分享率、魔力、做种、下载等账号数据解析。
 
 ## 配置
 
@@ -22,6 +24,8 @@
 | 请求超时 | 20 秒 | 获取 RSS 链接和解析 RSS 时的请求超时。 |
 | 未配置RSS时自动获取 | 开启 | 站点没有 RSS 地址时，访问站点 RSS 页面尝试生成链接。 |
 | 自动保存获取到的RSS | 关闭 | 自动获取成功后，写回站点 RSS 地址。 |
+| 启用用户数据解析规则 | 开启 | 对 MoviePilot 已有站点解析器的用户数据解析结果做二次修正。 |
+| 站点适配配置 | 空 | 站点规则配置。支持 JSON、JSON 数组、`domain|base64(json)` 多行格式。 |
 
 ## 使用
 
@@ -56,6 +60,59 @@ POST /api/v1/plugin/sitetoolbox/repair/rss/{site_id}
 
 修复会在 RSS 解析成功后写回站点配置。对于站点本身返回 `403`、`404`、Cookie 失效、站点没有生成 RSS 能力等问题，插件只会报告失败，不会强行写入无效地址。
 
+## 站点适配配置
+
+配置格式兼容原 `站点适配器` 插件。单个站点配置由三部分组成：
+
+```json
+{
+  "domain": "example.com",
+  "indexer": {},
+  "userdata": {}
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `domain` | 站点域名。可以写 `example.com`，也可以写完整 URL。插件会归一化成 host。 |
+| `indexer` | 资源索引规则。会传给 MoviePilot 的 `SitesHelper().add_indexer(domain, indexer)`。 |
+| `userdata` | 用户数据解析规则。用于修正站点管理中的用户数据字段。 |
+
+支持直接粘贴 JSON 对象、JSON 数组、包一层 `sites` / `rules` 的对象，或多行 base64 格式：
+
+```text
+域名|配置 JSON 的 base64 编码
+```
+
+最小示例：
+
+```json
+{
+  "domain": "example.com",
+  "indexer": {
+    "schema": "NexusPhp",
+    "search": {},
+    "torrents": {}
+  },
+  "userdata": {
+    "calculate_ratio": true,
+    "fields": {
+      "upload": "//span[@id='uploaded']/text()",
+      "download": "//span[@id='downloaded']/text()",
+      "bonus": {
+        "xpath": "//span[@id='bonus']/text()",
+        "regex": "([0-9,.]+)",
+        "type": "float"
+      }
+    }
+  }
+}
+```
+
+`userdata.fields` 支持字符串 XPath、对象规则和候选规则数组。对象规则可用参数包括 `value`、`xpath`、`attribute`、`index`、`regex`、`group`、`ignore_case`、`replace`、`type`、`only_empty`、`continue`。
+
+常用目标字段包括 `username`、`user_level`、`userid`、`upload`、`download`、`ratio`、`bonus`、`seeding`、`leeching`、`active`、`seeding_size`。类型包括 `size`、`int`、`float`、`text`、`active`。
+
 ## 状态说明
 
 - `正常`：RSS 可以获取并解析到至少一条资源。
@@ -67,3 +124,5 @@ POST /api/v1/plugin/sitetoolbox/repair/rss/{site_id}
 - RSS URL 中疑似 `passkey`、`token` 等敏感参数会在页面显示时脱敏。
 - 插件不会默认修改站点配置，只有开启 `自动保存获取到的RSS` 才会写回站点 RSS 地址。
 - 部分站点需要有效 Cookie 或 User-Agent；插件会复用站点配置中的 Cookie、UA、代理和超时设置。
+- 站点适配配置不应写入站点 Cookie、账号、密钥等敏感信息。
+- 从 `siteadapter` 迁移时，可以把原插件的 `站点适配配置` 原样复制到工具箱。

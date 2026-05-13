@@ -23,7 +23,7 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 | 插件 ID | 名称 | 状态 | 说明文档 |
 | --- | --- | --- | --- |
 | `sourceprioritysubscribefix` | 订阅外部源优先 | 正式使用 | [README](plugins.v2/sourceprioritysubscribefix/README.md) |
-| `siteadapter` | 站点适配器 | 正式使用 | [README](plugins.v2/siteadapter/README.md) |
+| `siteadapter` | 站点适配器 | 已整合到站点工具箱 | [README](plugins.v2/siteadapter/README.md) |
 | `sitetoolbox` | 站点工具箱 | 正式使用 | [README](plugins.v2/sitetoolbox/README.md) |
 | `IYUUAutoSeedPlus` | IYUU自动辅种增强 | 正式使用 | [README](plugins.v2/iyuuautoseedplus/README.md) |
 | `sourceprioritysubscribe` | 订阅外部源优先 | 旧兼容版 | [README](plugins.v2/sourceprioritysubscribe/README.md) |
@@ -46,18 +46,20 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 
 详细用法见 [plugins.v2/sourceprioritysubscribefix/README.md](plugins.v2/sourceprioritysubscribefix/README.md)。
 
-### 站点适配器
+### 站点工具箱
 
-`siteadapter` 用于通过配置修复站点索引和用户数据解析问题，不在插件里写死具体站点规则。
+`sitetoolbox` 用于测试和修复站点 RSS，并已整合原 `siteadapter` 的站点索引与用户数据解析适配能力。
 
 主要能力：
 
+- 测试已有站点 RSS 是否可获取和解析。
+- 尝试重新生成或规范化 RSS 地址并写回站点配置。
 - 配置化接入站点索引规则。
 - 配置化修正用户上传量、下载量、分享率、魔力、做种、下载等字段。
 - 支持 JSON、JSON 数组、`domain|base64(json)` 多行配置。
 - 支持 XPath、正则、属性读取、JSON 统计块解析和字段类型转换。
 
-详细用法见 [plugins.v2/siteadapter/README.md](plugins.v2/siteadapter/README.md)。
+详细用法见 [plugins.v2/sitetoolbox/README.md](plugins.v2/sitetoolbox/README.md)。
 
 ### IYUU自动辅种增强
 
