@@ -27,7 +27,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引和用户数据解析适配。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -531,13 +531,7 @@ def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
         issues.append("分享率为空")
     if bonus <= 0:
         issues.append("魔力/积分为空")
-    if seeding <= 0 and leeching <= 0:
-        issues.append("活动种子为空")
-
-    hard_issues = [
-        issue for issue in issues
-        if issue not in {"活动种子为空"} and not (issue == "魔力/积分为空" and download > 0)
-    ]
+    hard_issues = [issue for issue in issues if not (issue == "魔力/积分为空" and download > 0)]
     state = "success"
     if hard_issues:
         state = "error"
