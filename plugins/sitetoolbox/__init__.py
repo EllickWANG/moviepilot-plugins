@@ -27,7 +27,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引和用户数据解析适配。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -504,6 +504,7 @@ def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
             "ratio": 0,
             "bonus": 0,
             "seeding": 0,
+            "seeding_size": 0,
             "leeching": 0,
             "updated_at": "",
             "adapted": _site_has_rule(getattr(site, "domain", "")),
@@ -517,6 +518,7 @@ def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
     ratio = _number(getattr(data, "ratio", 0))
     bonus = _number(getattr(data, "bonus", 0))
     seeding = _number(getattr(data, "seeding", 0))
+    seeding_size = _number(getattr(data, "seeding_size", 0))
     leeching = _number(getattr(data, "leeching", 0))
 
     if err_msg:
@@ -531,7 +533,14 @@ def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
         issues.append("分享率为空")
     if bonus <= 0:
         issues.append("魔力/积分为空")
-    hard_issues = [issue for issue in issues if not (issue == "魔力/积分为空" and download > 0)]
+    if seeding <= 0:
+        issues.append("做种数为空")
+    if seeding > 0 and seeding_size <= 0:
+        issues.append("做种体积为空")
+    hard_issues = [
+        issue for issue in issues
+        if issue not in {"做种数为空", "做种体积为空"} and not (issue == "魔力/积分为空" and download > 0)
+    ]
     state = "success"
     if hard_issues:
         state = "error"
@@ -551,6 +560,7 @@ def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
         "ratio": ratio,
         "bonus": bonus,
         "seeding": seeding,
+        "seeding_size": seeding_size,
         "leeching": leeching,
         "updated_at": _join_datetime(getattr(data, "updated_day", ""), getattr(data, "updated_time", "")),
         "adapted": _site_has_rule(getattr(site, "domain", "")),
@@ -958,6 +968,10 @@ def _normalize_field(field: str) -> str:
         "seeders": "seeding",
         "当前做种": "seeding",
         "torrents seeding": "seeding",
+        "seeding size": "seeding_size",
+        "seed size": "seeding_size",
+        "做种体积": "seeding_size",
+        "做种大小": "seeding_size",
         "leechers": "leeching",
         "当前下载": "leeching",
         "torrents leeching": "leeching",
@@ -1220,6 +1234,8 @@ def _userdata_table(results: List[Dict[str, Any]]) -> dict:
                 _td(_format_size(item.get("download")), "text-no-wrap"),
                 _td(item.get("ratio"), "text-no-wrap"),
                 _td(item.get("bonus"), "text-no-wrap"),
+                _td(_format_count(item.get("seeding")), "text-no-wrap"),
+                _td(_format_size(item.get("seeding_size")), "text-no-wrap"),
                 _td(item.get("updated_at") or "-", "text-no-wrap"),
             ],
         })
@@ -1251,6 +1267,8 @@ def _userdata_table(results: List[Dict[str, Any]]) -> dict:
                                         _th("下载"),
                                         _th("分享率"),
                                         _th("魔力"),
+                                        _th("做种数"),
+                                        _th("做种体积"),
                                         _th("更新时间"),
                                     ],
                                 }],
@@ -1410,6 +1428,13 @@ def _format_size(value: Any) -> str:
     if index == 0:
         return f"{int(number)} {units[index]}"
     return f"{number:.2f} {units[index]}"
+
+
+def _format_count(value: Any) -> str:
+    number = _number(value)
+    if number.is_integer():
+        return str(int(number))
+    return str(number)
 
 
 def _mask_url(url: str) -> str:
