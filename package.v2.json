@@ -26,7 +26,7 @@
   "sitetoolbox": {
     "name": "站点工具箱",
     "description": "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引和用户数据解析适配。",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "mdi-toolbox",
     "author": "Ellick",
     "level": 1

@@ -27,7 +27,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引和用户数据解析适配。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -39,6 +39,7 @@ class sitetoolbox(_PluginBase):
     _auto_discover = True
     _save_discovered = False
     _latest_results: List[Dict[str, Any]] = []
+    _latest_userdata_results: List[Dict[str, Any]] = []
     _patch_userdata = True
     _site_conf = ""
 
@@ -56,6 +57,9 @@ class sitetoolbox(_PluginBase):
         self._auto_discover = _to_bool(config.get("auto_discover", True), True)
         self._save_discovered = _to_bool(config.get("save_discovered", False), False)
         self._latest_results = config.get("latest_results") if isinstance(config.get("latest_results"), list) else []
+        self._latest_userdata_results = (
+            config.get("latest_userdata_results") if isinstance(config.get("latest_userdata_results"), list) else []
+        )
         self._patch_userdata = _to_bool(config.get("patch_userdata", True), True)
         self._site_conf = config.get("site_conf") or _merge_legacy_site_conf(
             indexer_conf=config.get("indexer_conf") or config.get("confstr") or "",
@@ -67,6 +71,7 @@ class sitetoolbox(_PluginBase):
         self.__class__._auto_discover = self._auto_discover
         self.__class__._save_discovered = self._save_discovered
         self.__class__._latest_results = self._latest_results
+        self.__class__._latest_userdata_results = self._latest_userdata_results
         self.__class__._patch_userdata = self._patch_userdata
         self.__class__._site_conf = self._site_conf
         self.__class__._site_rules = _parse_site_config(self._site_conf)
@@ -125,6 +130,14 @@ class sitetoolbox(_PluginBase):
                 "auth": "bear",
                 "summary": "尝试修复单个站点RSS",
                 "description": "重新生成或规范化指定站点 RSS 地址，成功后写回站点配置并测试解析。",
+            },
+            {
+                "path": "/check/userdata",
+                "endpoint": _api_check_userdata,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "检查站点用户数据完整性",
+                "description": "检查站点最新用户数据是否存在错误、缺失或关键字段异常。",
             },
         ]
 
@@ -227,6 +240,7 @@ class sitetoolbox(_PluginBase):
             "auto_discover": True,
             "save_discovered": False,
             "latest_results": [],
+            "latest_userdata_results": [],
             "patch_userdata": True,
             "site_conf": "",
         }
@@ -247,6 +261,22 @@ class sitetoolbox(_PluginBase):
             "auto_discover": self._auto_discover,
             "save_discovered": self._save_discovered,
             "latest_results": results,
+            "latest_userdata_results": self._latest_userdata_results,
+            "patch_userdata": self._patch_userdata,
+            "site_conf": self._site_conf,
+        })
+
+    def _save_userdata_results(self, results: List[Dict[str, Any]]):
+        self._latest_userdata_results = results
+        self.__class__._latest_userdata_results = results
+        self.update_config({
+            "enabled": self._enabled,
+            "site_ids": self._site_ids,
+            "timeout": self._timeout,
+            "auto_discover": self._auto_discover,
+            "save_discovered": self._save_discovered,
+            "latest_results": self._latest_results,
+            "latest_userdata_results": results,
             "patch_userdata": self._patch_userdata,
             "site_conf": self._site_conf,
         })
@@ -357,6 +387,21 @@ def _api_repair_one_rss(site_id: int) -> schemas.Response:
     return schemas.Response(success=result.get("state") == "success", message=result.get("message"), data=result)
 
 
+def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    site_ids = _int_list((payload or {}).get("site_ids"))
+    results = _check_userdata_health(site_ids=site_ids)
+    plugin._save_userdata_results(results)
+    bad_count = len([item for item in results if item.get("state") != "success"])
+    return schemas.Response(
+        success=bad_count == 0,
+        message=f"用户数据检查完成：异常 {bad_count}/{len(results)}",
+        data=results,
+    )
+
+
 def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
     start = time.monotonic()
     site = SiteOper().get(site_id)
@@ -424,6 +469,98 @@ def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
         samples=samples,
         seconds=_elapsed(start),
     )
+
+
+def _check_userdata_health(site_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    sites = [
+        site for site in SiteOper().list_order_by_pri()
+        if site and site.id and (not site_ids or site.id in site_ids)
+    ]
+    latest_by_domain = {}
+    for data in SiteOper().get_userdata_latest() or []:
+        domain = getattr(data, "domain", "") or ""
+        if domain:
+            latest_by_domain[domain] = data
+
+    return [_userdata_health_result(site, latest_by_domain.get(site.domain or "")) for site in sites]
+
+
+def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
+    issues: List[str] = []
+    if not getattr(site, "is_active", True):
+        issues.append("站点未启用")
+    if not data:
+        issues.append("没有用户数据")
+        return {
+            "site_id": getattr(site, "id", None),
+            "site_name": getattr(site, "name", None) or "",
+            "domain": getattr(site, "domain", None) or "",
+            "state": "error",
+            "message": "；".join(issues),
+            "username": "",
+            "user_level": "",
+            "upload": 0,
+            "download": 0,
+            "ratio": 0,
+            "bonus": 0,
+            "seeding": 0,
+            "leeching": 0,
+            "updated_at": "",
+            "adapted": _site_has_rule(getattr(site, "domain", "")),
+        }
+
+    err_msg = getattr(data, "err_msg", "") or ""
+    username = getattr(data, "username", "") or ""
+    user_level = getattr(data, "user_level", "") or ""
+    upload = _number(getattr(data, "upload", 0))
+    download = _number(getattr(data, "download", 0))
+    ratio = _number(getattr(data, "ratio", 0))
+    bonus = _number(getattr(data, "bonus", 0))
+    seeding = _number(getattr(data, "seeding", 0))
+    leeching = _number(getattr(data, "leeching", 0))
+
+    if err_msg:
+        issues.append(err_msg)
+    if not username:
+        issues.append("缺用户名")
+    if not user_level:
+        issues.append("缺用户等级")
+    if upload <= 0:
+        issues.append("上传量为空")
+    if download > 0 and ratio <= 0:
+        issues.append("分享率为空")
+    if bonus <= 0:
+        issues.append("魔力/积分为空")
+    if seeding <= 0 and leeching <= 0:
+        issues.append("活动种子为空")
+
+    hard_issues = [
+        issue for issue in issues
+        if issue not in {"活动种子为空"} and not (issue == "魔力/积分为空" and download > 0)
+    ]
+    state = "success"
+    if hard_issues:
+        state = "error"
+    elif issues:
+        state = "warning"
+
+    return {
+        "site_id": getattr(site, "id", None),
+        "site_name": getattr(site, "name", None) or getattr(data, "name", "") or "",
+        "domain": getattr(site, "domain", None) or getattr(data, "domain", "") or "",
+        "state": state,
+        "message": "；".join(issues) if issues else "用户数据完整",
+        "username": username,
+        "user_level": user_level,
+        "upload": upload,
+        "download": download,
+        "ratio": ratio,
+        "bonus": bonus,
+        "seeding": seeding,
+        "leeching": leeching,
+        "updated_at": _join_datetime(getattr(data, "updated_day", ""), getattr(data, "updated_time", "")),
+        "adapted": _site_has_rule(getattr(site, "domain", "")),
+    }
 
 
 def _result(site: Any = None, site_id: Optional[int] = None, state: str = "error", message: str = "",
@@ -873,11 +1010,35 @@ def _domain_matches(rule_domain: Any, parser_domain: str) -> bool:
     return parser_domain == rule_domain or parser_domain.endswith(f".{rule_domain}")
 
 
+def _site_has_rule(domain: Any) -> bool:
+    normalized = _normalize_domain(domain)
+    return any(_domain_matches(rule.get("domain"), normalized) for rule in sitetoolbox._site_rules)
+
+
+def _number(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _join_datetime(day: Any, clock: Any) -> str:
+    day = str(day or "").strip()
+    clock = str(clock or "").strip()
+    return " ".join(item for item in (day, clock) if item)
+
+
 def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     results = plugin._latest_results or []
+    rules = sitetoolbox._site_rules or []
+    userdata_results = plugin._latest_userdata_results or _check_userdata_health()
     ok = len([item for item in results if item.get("state") == "success"])
     warning = len([item for item in results if item.get("state") == "warning"])
     error = len([item for item in results if item.get("state") == "error"])
+    indexer_count = len([rule for rule in rules if isinstance(rule.get("indexer"), dict)])
+    userdata_count = len([rule for rule in rules if isinstance(rule.get("userdata"), dict)])
+    userdata_bad = len([item for item in userdata_results if item.get("state") == "error"])
+    userdata_warning = len([item for item in userdata_results if item.get("state") == "warning"])
     return [
         {
             "component": "VRow",
@@ -885,10 +1046,11 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             "content": [
                 _stat_card("插件状态", "已启用" if plugin.get_state() else "已停用", f"版本 {plugin.plugin_version}", "primary"),
                 _stat_card("已选站点", len(plugin._site_ids), "配置页选择", "info"),
-                _stat_card("正常", ok, "最近一次结果", "success"),
-                _stat_card("异常", error + warning, f"失败 {error} / 空结果 {warning}", "error" if error else "warning"),
+                _stat_card("适配规则", len(rules), f"索引 {indexer_count} / 用户数据 {userdata_count}", "secondary"),
+                _stat_card("数据异常", userdata_bad + userdata_warning, f"错误 {userdata_bad} / 警告 {userdata_warning}", "error" if userdata_bad else "warning"),
             ],
         },
+        _adapter_summary(rules, plugin),
         {
             "component": "VRow",
             "content": [
@@ -926,12 +1088,186 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
                                 }
                             },
                         },
+                        {
+                            "component": "VBtn",
+                            "props": {
+                                "variant": "tonal",
+                                "color": "secondary",
+                                "prepend-icon": "mdi-account-search",
+                            },
+                            "text": "检查用户数据",
+                            "events": {
+                                "click": {
+                                    "api": "plugin/sitetoolbox/check/userdata",
+                                    "method": "post",
+                                }
+                            },
+                        },
                     ],
                 })
             ],
         },
+        {
+            "component": "VRow",
+            "props": {"dense": True},
+            "content": [
+                _stat_card("RSS 正常", ok, "最近一次结果", "success"),
+                _stat_card("RSS 异常", error + warning, f"失败 {error} / 空结果 {warning}", "error" if error else "warning"),
+            ],
+        },
+        _userdata_table(userdata_results),
+        _adapter_rule_table(rules),
         _result_table(results),
     ]
+
+
+def _adapter_summary(rules: List[dict], plugin: sitetoolbox) -> dict:
+    indexer_count = len([rule for rule in rules if isinstance(rule.get("indexer"), dict)])
+    userdata_count = len([rule for rule in rules if isinstance(rule.get("userdata"), dict)])
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {"component": "VCardTitle", "text": "站点适配"},
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True},
+                        "content": [
+                            _compact_col("索引规则", indexer_count),
+                            _compact_col("用户数据规则", userdata_count),
+                            _compact_col("解析补丁", "已启用" if plugin._patch_userdata else "已停用"),
+                            _compact_col("挂载状态", "已挂载" if sitetoolbox._patched else "未挂载"),
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "配置页保存后会立即加载索引规则，并把用户数据规则挂载到站点解析器。下方规则表会展示每个站点启用了哪些适配能力。",
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _adapter_rule_table(rules: List[dict]) -> dict:
+    rows = []
+    for rule in rules:
+        indexer = rule.get("indexer") if isinstance(rule.get("indexer"), dict) else {}
+        userdata = rule.get("userdata") if isinstance(rule.get("userdata"), dict) else {}
+        fields = userdata.get("fields") if isinstance(userdata.get("fields"), dict) else {}
+        json_stats = _as_list(userdata.get("json_stats") or userdata.get("stats_json") or [])
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(rule.get("domain") or "-"),
+                _td("是" if indexer else "-", "text-no-wrap"),
+                _td(indexer.get("schema") or "-", "text-no-wrap"),
+                _td("是" if userdata else "-", "text-no-wrap"),
+                _td(", ".join(fields.keys()) if fields else "-", "text-no-wrap"),
+                _td(len(json_stats), "text-no-wrap"),
+            ],
+        })
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {"component": "VCardTitle", "text": "适配规则明细"},
+            {
+                "component": "VCardText",
+                "content": [
+                    _empty_alert("未配置站点适配规则") if not rows else {
+                        "component": "VTable",
+                        "props": {"density": "compact"},
+                        "content": [
+                            {
+                                "component": "thead",
+                                "content": [{
+                                    "component": "tr",
+                                    "content": [
+                                        _th("域名"),
+                                        _th("索引"),
+                                        _th("Schema"),
+                                        _th("用户数据"),
+                                        _th("字段"),
+                                        _th("JSON"),
+                                    ],
+                                }],
+                            },
+                            {"component": "tbody", "content": rows},
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _userdata_table(results: List[Dict[str, Any]]) -> dict:
+    rows = []
+    for item in results:
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(item.get("site_name") or "-"),
+                _td(item.get("domain") or "-"),
+                _td(_state_text(item.get("state")), "text-no-wrap"),
+                _td("是" if item.get("adapted") else "-", "text-no-wrap"),
+                _td(item.get("message") or "-"),
+                _td(item.get("username") or "-", "text-no-wrap"),
+                _td(item.get("user_level") or "-", "text-no-wrap"),
+                _td(_format_size(item.get("upload")), "text-no-wrap"),
+                _td(_format_size(item.get("download")), "text-no-wrap"),
+                _td(item.get("ratio"), "text-no-wrap"),
+                _td(item.get("bonus"), "text-no-wrap"),
+                _td(item.get("updated_at") or "-", "text-no-wrap"),
+            ],
+        })
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {"component": "VCardTitle", "text": "用户数据健康检查"},
+            {
+                "component": "VCardText",
+                "content": [
+                    _empty_alert("还没有用户数据检查结果") if not rows else {
+                        "component": "VTable",
+                        "props": {"density": "compact"},
+                        "content": [
+                            {
+                                "component": "thead",
+                                "content": [{
+                                    "component": "tr",
+                                    "content": [
+                                        _th("站点"),
+                                        _th("域名"),
+                                        _th("状态"),
+                                        _th("适配"),
+                                        _th("说明"),
+                                        _th("用户"),
+                                        _th("等级"),
+                                        _th("上传"),
+                                        _th("下载"),
+                                        _th("分享率"),
+                                        _th("魔力"),
+                                        _th("更新时间"),
+                                    ],
+                                }],
+                            },
+                            {"component": "tbody", "content": rows},
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
 
 
 def _result_table(results: List[Dict[str, Any]]) -> dict:
@@ -1018,6 +1354,21 @@ def _stat_card(title: str, value: Any, subtitle: str, color: str) -> dict:
     }
 
 
+def _compact_col(title: str, value: Any) -> dict:
+    return {
+        "component": "VCol",
+        "props": {"cols": 12, "sm": 6, "md": 3},
+        "content": [{
+            "component": "div",
+            "props": {"class": "d-flex flex-column"},
+            "content": [
+                {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": title},
+                {"component": "span", "props": {"class": "text-h6"}, "text": str(value)},
+            ],
+        }],
+    }
+
+
 def _col(cols: int, md: Optional[int], child: dict) -> dict:
     props = {"cols": cols}
     if md:
@@ -1037,9 +1388,34 @@ def _td(text: Any, class_name: Optional[str] = None) -> dict:
 def _state_text(state: Optional[str]) -> str:
     return {
         "success": "正常",
-        "warning": "空结果",
+        "warning": "警告",
         "error": "异常",
     }.get(state or "", state or "-")
+
+
+def _empty_alert(text: str) -> dict:
+    return {
+        "component": "VAlert",
+        "props": {
+            "type": "info",
+            "variant": "tonal",
+            "text": text,
+        },
+    }
+
+
+def _format_size(value: Any) -> str:
+    number = _number(value)
+    if number <= 0:
+        return "0"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    index = 0
+    while number >= 1024 and index < len(units) - 1:
+        number /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(number)} {units[index]}"
+    return f"{number:.2f} {units[index]}"
 
 
 def _mask_url(url: str) -> str:
