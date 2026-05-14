@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.9"
+    plugin_version = "2.15.10"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -614,22 +614,6 @@ class IYUUAutoSeedPlus(_PluginBase):
                                     }
                                 ]
                             },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'fixed_category',
-                                            'label': '固定辅种分类',
-                                        }
-                                    }
-                                ]
-                            },
                         ]
                     },
                     {
@@ -838,6 +822,22 @@ class IYUUAutoSeedPlus(_PluginBase):
                                         'props': {
                                             'model': 'auto_start',
                                             'label': '自动开始(跳过校验有效)',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'fixed_category',
+                                            'label': '固定辅种分类',
                                         }
                                     }
                                 ]
