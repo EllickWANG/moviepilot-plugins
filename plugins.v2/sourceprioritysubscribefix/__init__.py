@@ -10,7 +10,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, List, Optional, Tuple
 from xml.dom import minidom
 
-from fastapi import Depends, Request
+from fastapi import BackgroundTasks, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.41"
+    plugin_version = "1.0.42"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -66,6 +66,9 @@ class sourceprioritysubscribefix(_PluginBase):
     _original_search_route_indexes: dict[str, int] = {}
     _original_search_endpoints: dict[str, Any] = {}
     _plugin_search_route_registered = False
+    _original_subscribe_search_routes: list[Any] = []
+    _original_subscribe_search_route_index: Optional[int] = None
+    _plugin_subscribe_search_route_registered = False
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -225,6 +228,7 @@ class sourceprioritysubscribefix(_PluginBase):
             TransferChain.redo_transfer_history = _patched_transfer_redo_transfer_history
         cls._patch_media_seasons_route()
         cls._patch_search_routes()
+        cls._patch_subscribe_search_route()
         cls._patched = True
         logger.info("订阅外部源优先插件已启用")
 
@@ -258,6 +262,7 @@ class sourceprioritysubscribefix(_PluginBase):
         TransferChain.do_transfer = cls._originals["transfer_do_transfer"]
         if "transfer_redo_transfer_history" in cls._originals:
             TransferChain.redo_transfer_history = cls._originals["transfer_redo_transfer_history"]
+        cls._restore_subscribe_search_route()
         cls._restore_search_routes()
         cls._restore_media_seasons_route()
         cls._originals = {}
@@ -394,6 +399,80 @@ class sourceprioritysubscribefix(_PluginBase):
         cls._original_search_route_indexes = {}
         cls._original_search_endpoints = {}
         cls._plugin_search_route_registered = False
+
+    @classmethod
+    def _patch_subscribe_search_route(cls):
+        """
+        接管单个订阅的手动搜索入口。
+
+        MoviePilot 原接口会通过 Scheduler.start("subscribe_search", sid=...) 触发，
+        如果定时订阅搜索正在运行，这次手动搜索会被 running 状态直接忽略。这里改为
+        直接后台执行 SubscribeChain.search(sid=...)，由 SubscribeChain 自身的锁排队。
+        """
+        if cls._plugin_subscribe_search_route_registered:
+            return
+        path = f"{settings.API_V1_STR}/subscribe/search/{{subscribe_id}}"
+        remaining_routes = []
+        cls._original_subscribe_search_routes = []
+        cls._original_subscribe_search_route_index = None
+        for route in app.routes:
+            if getattr(route, "path", None) == path and "GET" in getattr(route, "methods", set()):
+                if cls._original_subscribe_search_route_index is None:
+                    cls._original_subscribe_search_route_index = len(remaining_routes)
+                cls._original_subscribe_search_routes.append(route)
+                continue
+            remaining_routes.append(route)
+        app.routes[:] = remaining_routes
+        route_count = len(app.routes)
+        app.add_api_route(
+            path,
+            _patched_subscribe_search,
+            methods=["GET"],
+            response_model=schemas.Response,
+            summary="搜索订阅",
+            tags=["subscribe"],
+        )
+        new_routes = app.routes[route_count:]
+        del app.routes[route_count:]
+        insert_at = cls._original_subscribe_search_route_index
+        if insert_at is None:
+            insert_at = len(app.routes)
+        for offset, route in enumerate(new_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._plugin_subscribe_search_route_registered = True
+
+    @classmethod
+    def _restore_subscribe_search_route(cls):
+        if not cls._plugin_subscribe_search_route_registered:
+            return
+        app.routes[:] = [
+            route for route in app.routes
+            if getattr(route, "endpoint", None) is not _patched_subscribe_search
+        ]
+        insert_at = cls._original_subscribe_search_route_index
+        if insert_at is None:
+            insert_at = len(app.routes)
+        for offset, route in enumerate(cls._original_subscribe_search_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._original_subscribe_search_routes = []
+        cls._original_subscribe_search_route_index = None
+        cls._plugin_subscribe_search_route_registered = False
+
+
+def _run_manual_subscribe_search(subscribe_id: int):
+    logger.info(f"订阅外部源优先插件执行手动订阅搜索：{subscribe_id}")
+    SubscribeChain().search(sid=subscribe_id, state=None, manual=True)
+
+
+async def _patched_subscribe_search(
+        subscribe_id: int,
+        background_tasks: BackgroundTasks,
+        _: schemas.TokenPayload = Depends(verify_token)) -> Any:
+    logger.info(f"订阅外部源优先插件接管手动订阅搜索请求：{subscribe_id}")
+    background_tasks.add_task(_run_manual_subscribe_search, subscribe_id)
+    return schemas.Response(success=True)
 
 
 _SOURCE_SUBSCRIBE_CACHE = {
