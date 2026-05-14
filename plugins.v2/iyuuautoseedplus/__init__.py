@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.8"
+    plugin_version = "2.15.9"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -180,6 +180,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     _nopaths = None
     _labelsafterseed = None
     _categoryafterseed = None
+    _fixed_category = False
     _addhosttotag = False
     _size = None
     _clearcache = False
@@ -276,6 +277,9 @@ class IYUUAutoSeedPlus(_PluginBase):
         self._nopaths = _text_config(config.get("nopaths"))
         self._labelsafterseed = _text_config(config.get("labelsafterseed")) or "已整理,辅种"
         self._categoryafterseed = _text_config(config.get("categoryafterseed"))
+        self._fixed_category = _bool_config(config.get("fixed_category"))
+        if "fixed_category" not in config and self._categoryafterseed:
+            self._fixed_category = True
         self._auto_start = _bool_config(config.get("auto_start"))
         self._addhosttotag = _bool_config(config.get("addhosttotag"))
         self._size = _float_config(config.get("size"))
@@ -610,6 +614,22 @@ class IYUUAutoSeedPlus(_PluginBase):
                                     }
                                 ]
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'fixed_category',
+                                            'label': '固定辅种分类',
+                                        }
+                                    }
+                                ]
+                            },
                         ]
                     },
                     {
@@ -878,6 +898,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "clearcache": False,
             "addhosttotag": False,
             "auto_start": False,
+            "fixed_category": False,
             "cron": "",
             "token": "",
             "downloaders": [],
@@ -913,6 +934,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "nopaths": self._nopaths,
             "labelsafterseed": self._labelsafterseed,
             "categoryafterseed": self._categoryafterseed,
+            "fixed_category": self._fixed_category,
             "addhosttotag": self._addhosttotag,
             "auto_start": self._auto_start,
             "size": self._size,
@@ -1011,7 +1033,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                     hash_strs.append({
                         "hash": hash_str,
                         "save_path": save_path,
-                        "category": self._categoryafterseed
+                        "category": self._categoryafterseed if self._fixed_category else None
                     })
                 if hash_strs:
                     chunk_size = self._chunk_size or 50
