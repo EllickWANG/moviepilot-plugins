@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.10"
+    plugin_version = "2.15.11"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1293,12 +1293,15 @@ class IYUUAutoSeedPlus(_PluginBase):
 
             torrent_tags.append(tag)
 
+            # qB 开启自动管理时，添加时传入 category 会让 qB 按分类路径重写 save_path。
+            # 这里先固定真实路径添加，再单独设置分类，避免辅种路径被分类默认路径覆盖。
             state, added_torrent_ids = self.__parse_add_torrent_result(
                 service.instance.add_torrent(content=content,
                                              download_dir=save_path,
                                              is_paused=True,
                                              tag=torrent_tags,
-                                             category=save_category,
+                                             category=None,
+                                             ignore_category_check=False,
                                              is_skip_checking=self._skipverify)
             )
             if not state:
@@ -1313,6 +1316,8 @@ class IYUUAutoSeedPlus(_PluginBase):
                 if not torrent_hash:
                     logger.error(f"{service.name} 下载任务添加成功，但获取任务信息失败！")
                     return None
+                if save_category:
+                    self.__set_qb_category(service=service, torrent_hash=torrent_hash, category=save_category)
             return torrent_hash
         elif service.type == "transmission":
             # 添加任务
@@ -1327,6 +1332,20 @@ class IYUUAutoSeedPlus(_PluginBase):
 
         logger.error(f"不支持的下载器：{service.type}")
         return None
+
+    @staticmethod
+    def __set_qb_category(service: ServiceInfo, torrent_hash: str, category: str) -> None:
+        """
+        qB 辅种需要保留真实 save_path，分类在添加完成后再设置。
+        """
+        try:
+            qbc = getattr(service.instance, "qbc", None)
+            if not qbc:
+                logger.warn(f"{service.name} 未获取到 qB 客户端，无法设置分类 {category}")
+                return
+            qbc.torrents_set_category(category=category, torrent_hashes=torrent_hash)
+        except Exception as err:
+            logger.error(f"{service.name} 设置辅种分类 {category} 失败：{err}")
 
     @staticmethod
     def __parse_add_torrent_result(result: Any) -> tuple[bool, list[str]]:
