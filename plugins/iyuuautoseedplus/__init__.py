@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.7"
+    plugin_version = "2.15.8"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -174,7 +174,6 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 辅种下载器
     _auto_downloader = None
     # 自动分类
-    _auto_category = False
     _sites = []
     _notify = False
     _nolabels = None
@@ -277,7 +276,6 @@ class IYUUAutoSeedPlus(_PluginBase):
         self._nopaths = _text_config(config.get("nopaths"))
         self._labelsafterseed = _text_config(config.get("labelsafterseed")) or "已整理,辅种"
         self._categoryafterseed = _text_config(config.get("categoryafterseed"))
-        self._auto_category = _bool_config(config.get("auto_category"))
         self._auto_start = _bool_config(config.get("auto_start"))
         self._addhosttotag = _bool_config(config.get("addhosttotag"))
         self._size = _float_config(config.get("size"))
@@ -824,22 +822,6 @@ class IYUUAutoSeedPlus(_PluginBase):
                                     }
                                 ]
                             },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'auto_category',
-                                            'label': '分类复用(仅QB有效)',
-                                        }
-                                    }
-                                ]
-                            }
                         ]
                     },
                     {
@@ -895,7 +877,6 @@ class IYUUAutoSeedPlus(_PluginBase):
             "notify": False,
             "clearcache": False,
             "addhosttotag": False,
-            "auto_category": False,
             "auto_start": False,
             "cron": "",
             "token": "",
@@ -933,7 +914,6 @@ class IYUUAutoSeedPlus(_PluginBase):
             "labelsafterseed": self._labelsafterseed,
             "categoryafterseed": self._categoryafterseed,
             "addhosttotag": self._addhosttotag,
-            "auto_category": self._auto_category,
             "auto_start": self._auto_start,
             "size": self._size,
             "request_timeout": self._request_timeout,
@@ -1028,11 +1008,10 @@ class IYUUAutoSeedPlus(_PluginBase):
                     if self._size and torrent_size < self._size:
                         logger.info(f"种子 {hash_str} 大小:{torrent_size:.2f}GB，小于设定 {self._size}GB，跳过 ...")
                         continue
-                    category = self.__get_category(torrent=torrent, dl_type=service.type) if self._auto_category else None
                     hash_strs.append({
                         "hash": hash_str,
                         "save_path": save_path,
-                        "category": category or self._categoryafterseed
+                        "category": self._categoryafterseed
                     })
                 if hash_strs:
                     chunk_size = self._chunk_size or 50
@@ -1562,17 +1541,6 @@ class IYUUAutoSeedPlus(_PluginBase):
         try:
             return [str(tag).strip() for tag in torrent.get("tags").split(',')] \
                 if dl_type == "qbittorrent" else torrent.labels or []
-        except Exception as e:
-            print(str(e))
-            return []
-
-    @staticmethod
-    def __get_category(torrent: Any, dl_type: str):
-        """
-        获取种子分类
-        """
-        try:
-            return torrent.get("category") if dl_type == "qbittorrent" else None
         except Exception as e:
             print(str(e))
             return []
