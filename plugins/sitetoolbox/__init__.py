@@ -34,7 +34,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -618,7 +618,13 @@ class sitetoolbox(_PluginBase):
 
         patched_count = 0
         for parser_cls in _iter_site_parser_classes():
-            for method in ("_parse_site_page", "_parse_user_base_info", "_parse_user_traffic_info", "_parse_user_detail_info"):
+            for method in (
+                "_parse_site_page",
+                "_parse_user_base_info",
+                "_parse_user_traffic_info",
+                "_parse_user_detail_info",
+                "_parse_user_torrent_seeding_info",
+            ):
                 if method not in parser_cls.__dict__:
                     continue
                 key = (parser_cls, method)
@@ -627,8 +633,17 @@ class sitetoolbox(_PluginBase):
                 original = getattr(parser_cls, method)
                 cls._originals[key] = original
 
-                def wrapped(self, html_text, *args, _original=original, **kwargs):
-                    result = _original(self, html_text, *args, **kwargs)
+                def wrapped(self, html_text, *args, _original=original, _method=method, **kwargs):
+                    try:
+                        result = _original(self, html_text, *args, **kwargs)
+                    except TypeError as err:
+                        if _method == "_parse_user_torrent_seeding_info" and _is_missing_userid_membership_error(err):
+                            logger.warning(
+                                "站点工具箱跳过无用户ID的做种翻页解析："
+                                f"{getattr(self, '_site_name', '') or getattr(self, '_site_domain', '')}"
+                            )
+                            return False
+                        raise
                     _apply_site_userdata_rules(self, html_text, cls._userdata_rules)
                     return result
 
@@ -1433,6 +1448,10 @@ def _apply_site_userdata_rules(parser: Any, html_text: str, rules: list[dict[str
         logger.warning(f"站点工具箱用户数据规则执行失败：{parser_domain} - {err}")
     finally:
         del html
+
+
+def _is_missing_userid_membership_error(err: TypeError) -> bool:
+    return "'in <string>' requires string as left operand, not NoneType" in str(err)
 
 
 def _apply_field_rules(parser: Any, html, html_text: str, config: dict[str, Any]):
