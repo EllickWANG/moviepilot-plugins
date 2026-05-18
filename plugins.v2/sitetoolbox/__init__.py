@@ -5,8 +5,10 @@ import html as html_lib
 import importlib
 import inspect
 import json
+import logging
 import pkgutil
 import re
+import sys
 import time
 from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -32,7 +34,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.9"
+    plugin_version = "1.3.0"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -55,12 +57,18 @@ class sitetoolbox(_PluginBase):
     _cleanup_auto_cron = "0 */6 * * *"
     _latest_missing_preview: Dict[str, Any] = {}
     _latest_missing_cleanup: Dict[str, Any] = {}
+    _error_retention_days = 3
 
     _patched = False
     _originals: dict[tuple[type, str], Any] = {}
     _site_rules: list[dict[str, Any]] = []
     _userdata_rules: list[dict[str, Any]] = []
     _jobs_lock = Lock()
+    _error_log_lock = Lock()
+    _error_capture_installed = False
+    _original_logger_method: Optional[Callable] = None
+    _standard_error_handler: Optional[logging.Handler] = None
+    _last_error_prune = 0.0
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -93,6 +101,7 @@ class sitetoolbox(_PluginBase):
         self._latest_missing_cleanup = (
             config.get("latest_missing_cleanup") if isinstance(config.get("latest_missing_cleanup"), dict) else {}
         )
+        self._error_retention_days = _normalize_retention_days(config.get("error_retention_days"))
         self.__class__._enabled = self._enabled
         self.__class__._site_ids = self._site_ids
         self.__class__._timeout = self._timeout
@@ -110,6 +119,7 @@ class sitetoolbox(_PluginBase):
         self.__class__._cleanup_auto_cron = self._cleanup_auto_cron
         self.__class__._latest_missing_preview = self._latest_missing_preview
         self.__class__._latest_missing_cleanup = self._latest_missing_cleanup
+        self.__class__._error_retention_days = self._error_retention_days
         self.__class__._site_rules = _parse_site_config(self._site_conf)
         self.__class__._userdata_rules = [
             {"domain": rule.get("domain"), "config": rule.get("userdata")}
@@ -118,6 +128,8 @@ class sitetoolbox(_PluginBase):
         ]
 
         if self._enabled:
+            self._install_error_capture()
+            self._get_error_records()
             self._apply_indexers()
             if self._patch_userdata and self.__class__._userdata_rules:
                 self._patch_userdata_parsers()
@@ -125,6 +137,7 @@ class sitetoolbox(_PluginBase):
                 self._unpatch_userdata()
         else:
             self._unpatch_userdata()
+            self._uninstall_error_capture()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -309,6 +322,21 @@ class sitetoolbox(_PluginBase):
                             ],
                         },
                     ]),
+                    _form_section("系统错误", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 4, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "error_retention_days",
+                                        "label": "错误保留时间",
+                                        "items": _error_retention_options(),
+                                    },
+                                }),
+                            ],
+                        },
+                    ]),
                     _form_section("站点适配", [
                         {
                             "component": "VRow",
@@ -350,6 +378,7 @@ class sitetoolbox(_PluginBase):
             "cleanup_auto_cron": "0 */6 * * *",
             "latest_missing_preview": {},
             "latest_missing_cleanup": {},
+            "error_retention_days": 3,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -357,6 +386,7 @@ class sitetoolbox(_PluginBase):
 
     def stop_service(self):
         self._unpatch_userdata()
+        self._uninstall_error_capture()
 
     def _config_payload(self, **overrides) -> Dict[str, Any]:
         payload = {
@@ -377,6 +407,7 @@ class sitetoolbox(_PluginBase):
             "cleanup_auto_cron": self._cleanup_auto_cron,
             "latest_missing_preview": self._latest_missing_preview,
             "latest_missing_cleanup": self._latest_missing_cleanup,
+            "error_retention_days": self._error_retention_days,
         }
         payload.update(overrides)
         return payload
@@ -469,6 +500,100 @@ class sitetoolbox(_PluginBase):
             self._set_job_state("missing_auto", name, "error", str(err), finished_at=_now())
             raise
 
+    def _install_error_capture(self):
+        cls = self.__class__
+        logger_cls = type(logger)
+
+        if not cls._error_capture_installed:
+            current_method = getattr(logger_cls, "logger")
+            original_method = getattr(current_method, "_sitetoolbox_original", current_method)
+            cls._original_logger_method = original_method
+
+            def wrapped_logger(log_self, method: str, msg: str, *args, **kwargs):
+                caller = _caller_info()
+                try:
+                    return original_method(log_self, method, msg, *args, **kwargs)
+                finally:
+                    if str(method or "").lower() in {"error", "critical"}:
+                        plugin = cls._instance
+                        if plugin and plugin._enabled:
+                            plugin._record_system_error(
+                                level=str(method).upper(),
+                                message=_format_log_message(msg, args),
+                                source=caller.get("source") or "moviepilot",
+                                file=caller.get("file") or "",
+                                line=caller.get("line") or 0,
+                                traceback_text=_format_exc_info(kwargs.get("exc_info")),
+                            )
+
+            wrapped_logger._sitetoolbox_error_capture = True
+            wrapped_logger._sitetoolbox_original = original_method
+            setattr(logger_cls, "logger", wrapped_logger)
+            cls._error_capture_installed = True
+
+        root_logger = logging.getLogger()
+        for handler in list(root_logger.handlers):
+            if getattr(handler, "_sitetoolbox_error_capture", False):
+                root_logger.removeHandler(handler)
+        cls._standard_error_handler = _SiteToolboxErrorHandler(cls)
+        root_logger.addHandler(cls._standard_error_handler)
+
+    @classmethod
+    def _uninstall_error_capture(cls):
+        logger_cls = type(logger)
+        current_method = getattr(logger_cls, "logger")
+        if getattr(current_method, "_sitetoolbox_error_capture", False):
+            setattr(logger_cls, "logger", getattr(current_method, "_sitetoolbox_original", cls._original_logger_method))
+        cls._error_capture_installed = False
+        cls._original_logger_method = None
+
+        root_logger = logging.getLogger()
+        for handler in list(root_logger.handlers):
+            if getattr(handler, "_sitetoolbox_error_capture", False):
+                root_logger.removeHandler(handler)
+        cls._standard_error_handler = None
+
+    def _record_system_error(self, level: str, message: str, source: str = "",
+                             file: str = "", line: int = 0, traceback_text: str = ""):
+        if not self._enabled:
+            return
+        record = {
+            "ts": int(time.time()),
+            "time": _now(),
+            "level": (level or "ERROR").upper(),
+            "source": source or "moviepilot",
+            "file": file or "",
+            "line": line or 0,
+            "message": _clip_text(message, 4000),
+            "traceback": _clip_text(traceback_text, 8000),
+        }
+        path = self._error_log_path()
+        with self.__class__._error_log_lock:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as file_obj:
+                    file_obj.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                now = time.time()
+                if now - self.__class__._last_error_prune > 60:
+                    _write_error_records(path, _filter_error_records(_read_error_records(path), self._error_retention_days))
+                    self.__class__._last_error_prune = now
+            except Exception:
+                return
+
+    def _get_error_records(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        path = self._error_log_path()
+        with self.__class__._error_log_lock:
+            records = _read_error_records(path)
+            filtered = _filter_error_records(records, self._error_retention_days)
+            if len(filtered) != len(records):
+                _write_error_records(path, filtered)
+            self.__class__._last_error_prune = time.time()
+        filtered.sort(key=lambda item: _error_record_ts(item), reverse=True)
+        return filtered[:limit] if limit else filtered
+
+    def _error_log_path(self):
+        return self.get_data_path() / "system_errors.jsonl"
+
     def _apply_indexers(self):
         count = 0
         for rule in self.__class__._site_rules:
@@ -522,6 +647,32 @@ class sitetoolbox(_PluginBase):
         cls._originals = {}
         cls._patched = False
         logger.info("站点工具箱用户数据解析规则已停用")
+
+
+class _SiteToolboxErrorHandler(logging.Handler):
+    _sitetoolbox_error_capture = True
+
+    def __init__(self, plugin_cls):
+        super().__init__(level=logging.ERROR)
+        self._plugin_cls = plugin_cls
+
+    def emit(self, record: logging.LogRecord):
+        plugin = self._plugin_cls._instance
+        if not plugin or not plugin._enabled:
+            return
+        try:
+            plugin._record_system_error(
+                level=record.levelname,
+                message=record.getMessage(),
+                source=record.name or "logging",
+                file=record.pathname or "",
+                line=record.lineno or 0,
+                traceback_text=record.exc_text or (
+                    logging.Formatter().formatException(record.exc_info) if record.exc_info else ""
+                ),
+            )
+        except Exception:
+            return
 
 
 def _api_test_selected_rss(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
@@ -1540,12 +1691,98 @@ def _join_datetime(day: Any, clock: Any) -> str:
     return " ".join(item for item in (day, clock) if item)
 
 
+def _caller_info() -> Dict[str, Any]:
+    frame = inspect.currentframe()
+    while frame:
+        filepath = str(frame.f_code.co_filename or "")
+        normalized = filepath.replace("\\", "/")
+        if normalized and not normalized.endswith("/app/log.py") and "/sitetoolbox/" not in normalized:
+            return {
+                "source": normalized.rsplit("/", 1)[-1],
+                "file": filepath,
+                "line": frame.f_lineno,
+            }
+        frame = frame.f_back
+    return {}
+
+
+def _format_log_message(message: Any, args: Tuple[Any, ...]) -> str:
+    text = str(message)
+    if not args:
+        return text
+    try:
+        return text % args
+    except (TypeError, ValueError):
+        return f"{text} {' '.join(str(arg) for arg in args)}"
+
+
+def _format_exc_info(exc_info: Any) -> str:
+    if not exc_info:
+        return ""
+    if exc_info is True:
+        exc_info = sys.exc_info()
+    if isinstance(exc_info, tuple):
+        try:
+            return logging.Formatter().formatException(exc_info)
+        except Exception:
+            return ""
+    return str(exc_info)
+
+
+def _read_error_records(path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as file_obj:
+            for line in file_obj:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict):
+                    records.append(item)
+    except Exception:
+        return []
+    return records
+
+
+def _write_error_records(path, records: List[Dict[str, Any]]):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as file_obj:
+            for record in records:
+                file_obj.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        return
+
+
+def _filter_error_records(records: List[Dict[str, Any]], retention_days: int) -> List[Dict[str, Any]]:
+    cutoff = time.time() - _normalize_retention_days(retention_days) * 86400
+    return [record for record in records if _error_record_ts(record) >= cutoff]
+
+
+def _error_record_ts(record: Dict[str, Any]) -> float:
+    try:
+        return float(record.get("ts") or 0)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return time.mktime(time.strptime(str(record.get("time") or ""), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return 0
+
+
 def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     results = plugin._latest_results or []
     rules = sitetoolbox._site_rules or []
     userdata_results = plugin._latest_userdata_results or []
     missing_preview = plugin._latest_missing_preview or {}
     missing_cleanup = plugin._latest_missing_cleanup or {}
+    error_records = plugin._get_error_records()
     ok = len([item for item in results if item.get("state") == "success"])
     warning = len([item for item in results if item.get("state") == "warning"])
     error = len([item for item in results if item.get("state") == "error"])
@@ -1562,6 +1799,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             missing_size=missing_size,
             rss_bad=error + warning,
             userdata_bad=userdata_bad + userdata_warning,
+            error_count=len(error_records),
             rule_count=len(rules),
             indexer_count=indexer_count,
             userdata_count=userdata_count,
@@ -1573,6 +1811,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             plugin=plugin,
             rss_results=results,
             userdata_results=userdata_results,
+            error_records=error_records,
             rules=rules,
             rss_ok=ok,
             rss_bad=error + warning,
@@ -1581,7 +1820,8 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
 
 
 def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, rss_bad: int,
-                    userdata_bad: int, rule_count: int, indexer_count: int, userdata_count: int) -> dict:
+                    userdata_bad: int, error_count: int, rule_count: int,
+                    indexer_count: int, userdata_count: int) -> dict:
     return {
         "component": "VCard",
         "props": {"variant": "outlined", "class": "mb-3"},
@@ -1618,6 +1858,7 @@ def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, 
                             _metric_col("缺失种子", missing_count, missing_size),
                             _metric_col("RSS 异常", rss_bad, "最近结果"),
                             _metric_col("数据异常", userdata_bad, "用户数据"),
+                            _metric_col("系统错误", error_count, f"保留 {plugin._error_retention_days} 天"),
                             _metric_col("适配规则", rule_count, f"索引 {indexer_count} / 数据 {userdata_count}"),
                         ],
                     },
@@ -1714,7 +1955,7 @@ def _job_state_summary(states: Dict[str, Dict[str, Any]]) -> str:
 
 def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, Any], plugin: sitetoolbox,
                    rss_results: List[Dict[str, Any]], userdata_results: List[Dict[str, Any]],
-                   rules: List[dict], rss_ok: int, rss_bad: int) -> dict:
+                   error_records: List[Dict[str, Any]], rules: List[dict], rss_ok: int, rss_bad: int) -> dict:
     return {
         "component": "VExpansionPanels",
         "props": {"variant": "accordion", "class": "mt-3"},
@@ -1726,6 +1967,11 @@ def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, A
             ),
             _expansion_panel("用户数据健康", f"{len(userdata_results)} 个站点", [_userdata_table(userdata_results)]),
             _expansion_panel("RSS 结果", f"正常 {rss_ok} / 异常 {rss_bad}", [_result_table(rss_results)]),
+            _expansion_panel(
+                "系统错误",
+                f"{len(error_records)} 条 / {plugin._error_retention_days} 天",
+                [_system_error_table(error_records)],
+            ),
             _expansion_panel("适配规则", f"{len(rules)} 条", [_adapter_rule_table(rules)]),
         ],
     }
@@ -2108,6 +2354,39 @@ def _adapter_rule_table(rules: List[dict]) -> dict:
     )
 
 
+def _system_error_table(records: List[Dict[str, Any]]) -> dict:
+    rows = []
+    for item in records[:200]:
+        file_line = item.get("file") or ""
+        if item.get("line"):
+            file_line = f"{file_line}:{item.get('line')}" if file_line else str(item.get("line"))
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(item.get("time") or "-", "text-no-wrap"),
+                _td(item.get("level") or "-", "text-no-wrap"),
+                _td(item.get("source") or "-", "text-no-wrap"),
+                _td(_error_record_message(item)),
+                _td(file_line or "-", "text-no-wrap"),
+            ],
+        })
+    return _table_or_empty(
+        rows,
+        "暂无系统错误记录",
+        [_th("时间"), _th("级别"), _th("来源"), _th("错误"), _th("位置")],
+    )
+
+
+def _error_record_message(item: Dict[str, Any]) -> str:
+    message = str(item.get("message") or "")
+    traceback_text = str(item.get("traceback") or "")
+    if traceback_text:
+        lines = [line.strip() for line in traceback_text.splitlines() if line.strip()]
+        if lines:
+            message = f"{message}\n{lines[-1]}"
+    return _clip_text(message, 500)
+
+
 def _userdata_table(results: List[Dict[str, Any]]) -> dict:
     rows = []
     for item in results:
@@ -2233,6 +2512,14 @@ def _form_section(title: str, content: List[dict]) -> dict:
             {"component": "VDivider", "props": {"class": "mt-2"}},
         ],
     }
+
+
+def _error_retention_options() -> List[dict]:
+    return [
+        {"title": "1 天", "value": 1},
+        {"title": "3 天", "value": 3},
+        {"title": "7 天", "value": 7},
+    ]
 
 
 def _col(cols: int, md: Optional[int], child: dict) -> dict:
@@ -2409,6 +2696,14 @@ def _normalize_job_states(value: Any) -> Dict[str, Dict[str, Any]]:
     return states
 
 
+def _normalize_retention_days(value: Any) -> int:
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        days = 3
+    return days if days in {1, 3, 7} else 3
+
+
 def _to_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -2454,3 +2749,10 @@ def _str_list(value: Any) -> List[str]:
         if text:
             result.append(text)
     return list(dict.fromkeys(result))
+
+
+def _clip_text(value: Any, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
