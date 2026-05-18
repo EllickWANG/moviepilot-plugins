@@ -110,12 +110,14 @@ class MTorrent(_ISiteSigninHandler):
         payload = {"pageNumber": 1, "pageSize": 10}
         if uid:
             payload["uid"] = int(uid) if uid.isdigit() else uid
-        res = RequestUtils(headers=headers,
+        history_headers = dict(headers)
+        history_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        res = RequestUtils(headers=history_headers,
                            timeout=timeout,
                            proxies=settings.PROXY if site_info.get("proxy") else None,
                            referer=f"{url}index"
                            ).post_res(url=f"https://api.{domain}/api/member/queryUserLoginHistory",
-                                      json=payload,
+                                      data=payload,
                                       allow_redirects=False)
         if res is None:
             return False, "登录历史检查失败，无法打开 M-Team API"

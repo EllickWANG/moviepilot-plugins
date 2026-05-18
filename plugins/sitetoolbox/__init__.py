@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.4"
+    plugin_version = "1.3.5"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1044,7 +1044,12 @@ def _check_mteam_login_site(site: Any, warning_days: int) -> Dict[str, Any]:
     history_params = {"pageNumber": 1, "pageSize": 10}
     if base["user_id"]:
         history_params["uid"] = _mteam_user_id_value(base["user_id"])
-    history_payload, history_error = _mteam_api_json(site, "member/queryUserLoginHistory", history_params)
+    history_payload, history_error = _mteam_api_json(
+        site,
+        "member/queryUserLoginHistory",
+        history_params,
+        json_body=False,
+    )
     if history_error:
         message = history_error
         if profile_error:
@@ -1082,21 +1087,25 @@ def _check_mteam_login_site(site: Any, warning_days: int) -> Dict[str, Any]:
     }
 
 
-def _mteam_api_json(site: Any, path: str, payload: Optional[dict]) -> Tuple[dict, str]:
+def _mteam_api_json(site: Any, path: str, payload: Optional[dict], json_body: bool = True) -> Tuple[dict, str]:
     domain = _mteam_domain(site)
     url = f"https://api.{domain}/api/{path.lstrip('/')}"
     headers = {
-        "Content-Type": "application/json",
+        "Content-Type": "application/json" if json_body else "application/x-www-form-urlencoded; charset=UTF-8",
         "User-Agent": getattr(site, "ua", "") or settings.USER_AGENT,
         "Accept": "application/json, text/plain, */*",
         "x-api-key": getattr(site, "apikey", "") or "",
     }
-    res = RequestUtils(
+    request = RequestUtils(
         headers=headers,
         timeout=getattr(site, "timeout", None) or sitetoolbox._timeout,
         proxies=settings.PROXY if getattr(site, "proxy", False) else None,
         referer=f"{getattr(site, 'url', '') or f'https://{domain}/'}index",
-    ).post_res(url=url, json=payload or {}, allow_redirects=False)
+    )
+    if json_body:
+        res = request.post_res(url=url, json=payload or {}, allow_redirects=False)
+    else:
+        res = request.post_res(url=url, data=payload or {}, allow_redirects=False)
     if res is None:
         return {}, "无法打开 M-Team API"
     if 300 <= int(res.status_code or 0) < 400:
