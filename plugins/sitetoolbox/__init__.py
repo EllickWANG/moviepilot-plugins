@@ -30,7 +30,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.5"
+    plugin_version = "1.2.6"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -192,111 +192,96 @@ class sitetoolbox(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 4, {
-                                "component": "VSwitch",
-                                "props": {"model": "enabled", "label": "启用插件"},
-                            }),
-                            _col(12, 4, {
-                                "component": "VSwitch",
-                                "props": {"model": "auto_discover", "label": "未配置RSS时自动获取"},
-                            }),
-                            _col(12, 4, {
-                                "component": "VSwitch",
-                                "props": {"model": "save_discovered", "label": "自动保存获取到的RSS"},
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 8, {
-                                "component": "VSelect",
-                                "props": {
-                                    "model": "site_ids",
-                                    "label": "测试站点",
-                                    "items": site_options,
-                                    "multiple": True,
-                                    "chips": True,
-                                    "clearable": True,
-                                },
-                            }),
-                            _col(12, 4, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "timeout",
-                                    "label": "请求超时(秒)",
-                                    "type": "number",
-                                    "min": 5,
-                                    "max": 120,
-                                },
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "text": "优先测试站点已保存的 RSS 地址；未配置时可按 MoviePilot 内置规则访问站点生成 RSS。测试结果在插件详情页查看。",
+                    _form_section("基础", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {"model": "enabled", "label": "启用插件"},
+                                }),
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {"model": "auto_discover", "label": "自动获取 RSS"},
+                                }),
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {"model": "save_discovered", "label": "保存获取到的 RSS"},
+                                }),
+                            ],
                         },
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 8, {
-                                "component": "VSelect",
-                                "props": {
-                                    "model": "cleanup_downloader_names",
-                                    "label": "缺失种子清理下载器",
-                                    "items": downloader_options,
-                                    "multiple": True,
-                                    "chips": True,
-                                    "clearable": True,
-                                },
-                            }),
-                            _col(12, 4, {
-                                "component": "VSwitch",
-                                "props": {"model": "cleanup_delete_files", "label": "同时删除数据文件"},
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "warning",
-                            "variant": "tonal",
-                            "text": "缺失种子清理采用预览快照模型：先在详情页预览 missingFiles 种子，清理时只删除预览中且当前仍为 missingFiles 的任务。默认只删除下载器任务，不删除数据文件。",
+                    ]),
+                    _form_section("RSS 诊断", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 8, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "site_ids",
+                                        "label": "站点",
+                                        "items": site_options,
+                                        "multiple": True,
+                                        "chips": True,
+                                        "clearable": True,
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "timeout",
+                                        "label": "超时(秒)",
+                                        "type": "number",
+                                        "min": 5,
+                                        "max": 120,
+                                    },
+                                }),
+                            ],
                         },
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 4, {
-                                "component": "VSwitch",
-                                "props": {"model": "patch_userdata", "label": "启用用户数据解析规则"},
-                            }),
-                            _col(12, 8, {
-                                "component": "VTextarea",
-                                "props": {
-                                    "model": "site_conf",
-                                    "label": "站点适配配置",
-                                    "rows": 12,
-                                    "placeholder": "一行一个站点，格式：域名|配置 json 的 base64 编码（utf-8）。JSON 可包含 indexer 与 userdata。",
-                                },
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "text": "站点适配配置兼容原站点适配器：indexer 负责搜索/浏览规则，userdata 负责上传量、下载量、分享率、魔力值、做种等账号数据解析。",
+                    ]),
+                    _form_section("缺失种子", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 8, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "cleanup_downloader_names",
+                                        "label": "下载器",
+                                        "items": downloader_options,
+                                        "multiple": True,
+                                        "chips": True,
+                                        "clearable": True,
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {"model": "cleanup_delete_files", "label": "同时删除数据文件"},
+                                }),
+                            ],
                         },
-                    },
+                    ]),
+                    _form_section("站点适配", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 3, {
+                                    "component": "VSwitch",
+                                    "props": {"model": "patch_userdata", "label": "用户数据补丁"},
+                                }),
+                                _col(12, 9, {
+                                    "component": "VTextarea",
+                                    "props": {
+                                        "model": "site_conf",
+                                        "label": "适配规则",
+                                        "rows": 10,
+                                        "auto-grow": True,
+                                        "placeholder": "domain|base64(json)",
+                                    },
+                                }),
+                            ],
+                        },
+                    ]),
                 ],
             }
         ], {
@@ -1434,117 +1419,224 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     missing_count = int(missing_preview.get("total_count") or 0)
     missing_size = _format_size(missing_preview.get("total_size"))
     return [
-        {
-            "component": "VRow",
-            "props": {"dense": True},
-            "content": [
-                _stat_card("插件状态", "已启用" if plugin.get_state() else "已停用", f"版本 {plugin.plugin_version}", "primary"),
-                _stat_card("已选站点", len(plugin._site_ids), "配置页选择", "info"),
-                _stat_card("适配规则", len(rules), f"索引 {indexer_count} / 用户数据 {userdata_count}", "secondary"),
-                _stat_card("数据异常", userdata_bad + userdata_warning, f"错误 {userdata_bad} / 警告 {userdata_warning}", "error" if userdata_bad else "warning"),
-                _stat_card("缺失种子", missing_count, missing_size, "error" if missing_count else "success"),
-            ],
-        },
-        _adapter_summary(rules, plugin),
-        {
-            "component": "VRow",
-            "content": [
-                _col(12, None, {
-                    "component": "div",
-                    "props": {"class": "d-flex flex-wrap ga-2"},
-                    "content": [
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "variant": "tonal",
-                                "color": "primary",
-                                "prepend-icon": "mdi-rss",
-                            },
-                            "text": "测试已选站点 RSS",
-                            "events": {
-                                "click": {
-                                    "api": "plugin/sitetoolbox/test/rss",
-                                    "method": "post",
-                                }
-                            },
-                        },
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "variant": "tonal",
-                                "color": "warning",
-                                "prepend-icon": "mdi-wrench",
-                            },
-                            "text": "尝试修复 RSS",
-                            "events": {
-                                "click": {
-                                    "api": "plugin/sitetoolbox/repair/rss",
-                                    "method": "post",
-                                }
-                            },
-                        },
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "variant": "tonal",
-                                "color": "secondary",
-                                "prepend-icon": "mdi-account-search",
-                            },
-                            "text": "检查用户数据",
-                            "events": {
-                                "click": {
-                                    "api": "plugin/sitetoolbox/check/userdata",
-                                    "method": "post",
-                                }
-                            },
-                        },
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "variant": "tonal",
-                                "color": "info",
-                                "prepend-icon": "mdi-eye-search",
-                            },
-                            "text": "预览缺失种子",
-                            "events": {
-                                "click": {
-                                    "api": "plugin/sitetoolbox/cleanup/missing/preview",
-                                    "method": "post",
-                                }
-                            },
-                        },
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "variant": "tonal",
-                                "color": "error",
-                                "prepend-icon": "mdi-delete-alert",
-                            },
-                            "text": "清理预览结果",
-                            "events": {
-                                "click": {
-                                    "api": "plugin/sitetoolbox/cleanup/missing",
-                                    "method": "post",
-                                }
-                            },
-                        },
-                    ],
-                })
-            ],
-        },
-        {
-            "component": "VRow",
-            "props": {"dense": True},
-            "content": [
-                _stat_card("RSS 正常", ok, "最近一次结果", "success"),
-                _stat_card("RSS 异常", error + warning, f"失败 {error} / 空结果 {warning}", "error" if error else "warning"),
-            ],
-        },
+        _overview_panel(
+            plugin=plugin,
+            missing_count=missing_count,
+            missing_size=missing_size,
+            rss_bad=error + warning,
+            userdata_bad=userdata_bad + userdata_warning,
+            rule_count=len(rules),
+            indexer_count=indexer_count,
+            userdata_count=userdata_count,
+        ),
+        _action_panel(plugin, missing_preview),
         _missing_torrent_panel(missing_preview, missing_cleanup, plugin),
-        _userdata_table(userdata_results),
-        _adapter_rule_table(rules),
-        _result_table(results),
+        _details_panel(
+            rss_results=results,
+            userdata_results=userdata_results,
+            rules=rules,
+            rss_ok=ok,
+            rss_bad=error + warning,
+        ),
     ]
+
+
+def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, rss_bad: int,
+                    userdata_bad: int, rule_count: int, indexer_count: int, userdata_count: int) -> dict:
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-3 mb-2"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-h6"},
+                                        "text": "站点工具箱",
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption text-medium-emphasis"},
+                                        "text": f"版本 {plugin.plugin_version} · {'已启用' if plugin.get_state() else '已停用'}",
+                                    },
+                                ],
+                            },
+                            _status_chip("安全模式" if not plugin._cleanup_delete_files else "删除文件", "success" if not plugin._cleanup_delete_files else "warning"),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True},
+                        "content": [
+                            _metric_col("缺失种子", missing_count, missing_size),
+                            _metric_col("RSS 异常", rss_bad, "最近结果"),
+                            _metric_col("数据异常", userdata_bad, "用户数据"),
+                            _metric_col("适配规则", rule_count, f"索引 {indexer_count} / 数据 {userdata_count}"),
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any]) -> dict:
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True},
+                        "content": [
+                            _operation_col(
+                                "缺失种子",
+                                f"下载器：{', '.join(plugin._cleanup_downloader_names) or '未选择'}",
+                                [
+                                    _action_button("预览", "mdi-eye-search", "primary", "plugin/sitetoolbox/cleanup/missing/preview"),
+                                    _action_button("清理", "mdi-delete-alert", "error", "plugin/sitetoolbox/cleanup/missing"),
+                                ],
+                            ),
+                            _operation_col(
+                                "RSS",
+                                f"站点：{len(plugin._site_ids)} 个 · 超时 {plugin._timeout}s",
+                                [
+                                    _action_button("测试", "mdi-rss", "primary", "plugin/sitetoolbox/test/rss"),
+                                    _action_button("修复", "mdi-wrench", "warning", "plugin/sitetoolbox/repair/rss"),
+                                ],
+                            ),
+                            _operation_col(
+                                "用户数据",
+                                "账号数据完整性",
+                                [
+                                    _action_button("检查", "mdi-account-search", "secondary", "plugin/sitetoolbox/check/userdata"),
+                                ],
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                        "text": f"最近预览：{missing_preview.get('created_at') or '-'}",
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _details_panel(rss_results: List[Dict[str, Any]], userdata_results: List[Dict[str, Any]],
+                   rules: List[dict], rss_ok: int, rss_bad: int) -> dict:
+    return {
+        "component": "VExpansionPanels",
+        "props": {"variant": "accordion", "class": "mt-3"},
+        "content": [
+            _expansion_panel("用户数据健康", f"{len(userdata_results)} 个站点", [_userdata_table(userdata_results)]),
+            _expansion_panel("RSS 结果", f"正常 {rss_ok} / 异常 {rss_bad}", [_result_table(rss_results)]),
+            _expansion_panel("适配规则", f"{len(rules)} 条", [_adapter_rule_table(rules)]),
+        ],
+    }
+
+
+def _operation_col(title: str, subtitle: str, actions: List[dict]) -> dict:
+    return {
+        "component": "VCol",
+        "props": {"cols": 12, "md": 4},
+        "content": [
+            {
+                "component": "div",
+                "props": {"class": "d-flex flex-column ga-2"},
+                "content": [
+                    {"component": "div", "props": {"class": "text-subtitle-2"}, "text": title},
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": subtitle},
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex flex-wrap ga-2"},
+                        "content": actions,
+                    },
+                ],
+            }
+        ],
+    }
+
+
+def _action_button(text: str, icon: str, color: str, api: str) -> dict:
+    return {
+        "component": "VBtn",
+        "props": {
+            "variant": "tonal",
+            "color": color,
+            "prepend-icon": icon,
+            "size": "small",
+        },
+        "text": text,
+        "events": {
+            "click": {
+                "api": api,
+                "method": "post",
+            }
+        },
+    }
+
+
+def _metric_col(title: str, value: Any, subtitle: str) -> dict:
+    return {
+        "component": "VCol",
+        "props": {"cols": 6, "md": 3},
+        "content": [{
+            "component": "div",
+            "props": {"class": "py-2"},
+            "content": [
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": title},
+                {"component": "div", "props": {"class": "text-h6"}, "text": str(value)},
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": subtitle},
+            ],
+        }],
+    }
+
+
+def _status_chip(text: str, color: str) -> dict:
+    return {
+        "component": "VChip",
+        "props": {"color": color, "variant": "tonal", "size": "small"},
+        "text": text,
+    }
+
+
+def _expansion_panel(title: str, subtitle: str, content: List[dict]) -> dict:
+    return {
+        "component": "VExpansionPanel",
+        "content": [
+            {
+                "component": "VExpansionPanelTitle",
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex align-center justify-space-between w-100 pr-4"},
+                        "content": [
+                            {"component": "span", "text": title},
+                            {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": subtitle},
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VExpansionPanelText",
+                "content": content,
+            },
+        ],
+    }
 
 
 def _adapter_summary(rules: List[dict], plugin: sitetoolbox) -> dict:
@@ -1624,15 +1716,29 @@ def _missing_torrent_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plu
         }
         for item in cleanup_items[:80]
     ]
+    path_summary = _path_summary_text(preview.get("by_save_path") or [])
 
     return {
         "component": "VCard",
         "props": {"variant": "outlined", "class": "mb-3"},
         "content": [
-            {"component": "VCardTitle", "text": "缺失文件种子清理"},
             {
                 "component": "VCardText",
                 "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-3 mb-2"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "content": [
+                                    {"component": "div", "props": {"class": "text-subtitle-1"}, "text": "缺失文件种子"},
+                                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": path_summary or "暂无路径汇总"},
+                                ],
+                            },
+                            _status_chip(f"{preview.get('total_count', 0)} 个", "error" if preview.get("total_count") else "success"),
+                        ],
+                    },
                     {
                         "component": "VRow",
                         "props": {"dense": True},
@@ -1655,8 +1761,6 @@ def _missing_torrent_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plu
                             ),
                         },
                     },
-                    _missing_summary_table("按下载器汇总", preview.get("by_downloader") or []),
-                    _missing_summary_table("按保存路径汇总", preview.get("by_save_path") or []),
                     _error_table("下载器异常", error_rows),
                     _cleanup_table(cleanup_rows, cleanup),
                     _empty_alert("还没有预览结果，请先点击“预览缺失种子”。") if not rows else {
@@ -1720,6 +1824,17 @@ def _missing_summary_table(title: str, summary: List[Dict[str, Any]]) -> dict:
             },
         ],
     }
+
+
+def _path_summary_text(summary: List[Dict[str, Any]]) -> str:
+    if not summary:
+        return ""
+    parts = []
+    for item in summary[:3]:
+        parts.append(f"{item.get('name') or '-'}：{item.get('count', 0)} 个 / {_format_size(item.get('size'))}")
+    if len(summary) > 3:
+        parts.append(f"+{len(summary) - 3}")
+    return " · ".join(parts)
 
 
 def _error_table(title: str, rows: List[dict]) -> dict:
@@ -1804,39 +1919,11 @@ def _adapter_rule_table(rules: List[dict]) -> dict:
                 _td(len(json_stats), "text-no-wrap"),
             ],
         })
-    return {
-        "component": "VCard",
-        "props": {"variant": "outlined", "class": "mb-3"},
-        "content": [
-            {"component": "VCardTitle", "text": "适配规则明细"},
-            {
-                "component": "VCardText",
-                "content": [
-                    _empty_alert("未配置站点适配规则") if not rows else {
-                        "component": "VTable",
-                        "props": {"density": "compact"},
-                        "content": [
-                            {
-                                "component": "thead",
-                                "content": [{
-                                    "component": "tr",
-                                    "content": [
-                                        _th("域名"),
-                                        _th("索引"),
-                                        _th("Schema"),
-                                        _th("用户数据"),
-                                        _th("字段"),
-                                        _th("JSON"),
-                                    ],
-                                }],
-                            },
-                            {"component": "tbody", "content": rows},
-                        ],
-                    }
-                ],
-            },
-        ],
-    }
+    return _table_or_empty(
+        rows,
+        "未配置站点适配规则",
+        [_th("域名"), _th("索引"), _th("Schema"), _th("用户数据"), _th("字段"), _th("JSON")],
+    )
 
 
 def _userdata_table(results: List[Dict[str, Any]]) -> dict:
@@ -1861,47 +1948,26 @@ def _userdata_table(results: List[Dict[str, Any]]) -> dict:
                 _td(item.get("updated_at") or "-", "text-no-wrap"),
             ],
         })
-    return {
-        "component": "VCard",
-        "props": {"variant": "outlined", "class": "mb-3"},
-        "content": [
-            {"component": "VCardTitle", "text": "用户数据健康检查"},
-            {
-                "component": "VCardText",
-                "content": [
-                    _empty_alert("还没有用户数据检查结果") if not rows else {
-                        "component": "VTable",
-                        "props": {"density": "compact"},
-                        "content": [
-                            {
-                                "component": "thead",
-                                "content": [{
-                                    "component": "tr",
-                                    "content": [
-                                        _th("站点"),
-                                        _th("域名"),
-                                        _th("状态"),
-                                        _th("适配"),
-                                        _th("说明"),
-                                        _th("用户"),
-                                        _th("等级"),
-                                        _th("上传"),
-                                        _th("下载"),
-                                        _th("分享率"),
-                                        _th("魔力"),
-                                        _th("做种数"),
-                                        _th("做种体积"),
-                                        _th("更新时间"),
-                                    ],
-                                }],
-                            },
-                            {"component": "tbody", "content": rows},
-                        ],
-                    }
-                ],
-            },
+    return _table_or_empty(
+        rows,
+        "还没有用户数据检查结果",
+        [
+            _th("站点"),
+            _th("域名"),
+            _th("状态"),
+            _th("适配"),
+            _th("说明"),
+            _th("用户"),
+            _th("等级"),
+            _th("上传"),
+            _th("下载"),
+            _th("分享率"),
+            _th("魔力"),
+            _th("做种数"),
+            _th("做种体积"),
+            _th("更新时间"),
         ],
-    }
+    )
 
 
 def _result_table(results: List[Dict[str, Any]]) -> dict:
@@ -1921,55 +1987,11 @@ def _result_table(results: List[Dict[str, Any]]) -> dict:
                 _td(item.get("tested_at") or "-", "text-no-wrap"),
             ],
         })
-    return {
-        "component": "VCard",
-        "props": {"variant": "outlined"},
-        "content": [
-            {
-                "component": "VCardTitle",
-                "text": "RSS 测试结果",
-            },
-            {
-                "component": "VCardText",
-                "content": [
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "text": "点击测试后如页面未立即刷新，可关闭再打开插件详情页查看最新结果。",
-                        },
-                    } if not results else {
-                        "component": "VTable",
-                        "props": {"density": "compact"},
-                        "content": [
-                            {
-                                "component": "thead",
-                                "content": [{
-                                    "component": "tr",
-                                    "content": [
-                                        _th("站点"),
-                                        _th("域名"),
-                                        _th("状态"),
-                                        _th("说明"),
-                                        _th("条目"),
-                                        _th("来源"),
-                                        _th("写回"),
-                                        _th("耗时"),
-                                        _th("时间"),
-                                    ],
-                                }],
-                            },
-                            {
-                                "component": "tbody",
-                                "content": rows,
-                            },
-                        ],
-                    }
-                ],
-            },
-        ],
-    }
+    return _table_or_empty(
+        rows,
+        "还没有 RSS 测试结果",
+        [_th("站点"), _th("域名"), _th("状态"), _th("说明"), _th("条目"), _th("来源"), _th("写回"), _th("耗时"), _th("时间")],
+    )
 
 
 def _stat_card(title: str, value: Any, subtitle: str, color: str) -> dict:
@@ -2000,6 +2022,34 @@ def _compact_col(title: str, value: Any) -> dict:
                 {"component": "span", "props": {"class": "text-h6"}, "text": str(value)},
             ],
         }],
+    }
+
+
+def _table_or_empty(rows: List[dict], empty_text: str, headers: List[dict]) -> dict:
+    if not rows:
+        return _empty_alert(empty_text)
+    return {
+        "component": "VTable",
+        "props": {"density": "compact"},
+        "content": [
+            {
+                "component": "thead",
+                "content": [{"component": "tr", "content": headers}],
+            },
+            {"component": "tbody", "content": rows},
+        ],
+    }
+
+
+def _form_section(title: str, content: List[dict]) -> dict:
+    return {
+        "component": "div",
+        "props": {"class": "mb-4"},
+        "content": [
+            {"component": "div", "props": {"class": "text-subtitle-1 mb-2"}, "text": title},
+            *content,
+            {"component": "VDivider", "props": {"class": "mt-2"}},
+        ],
     }
 
 
