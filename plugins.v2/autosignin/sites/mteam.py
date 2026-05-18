@@ -93,12 +93,29 @@ class MTorrent(_ISiteSigninHandler):
             "Accept": "application/json, text/plain, */*",
             "x-api-key": site_info.get("apikey")
         }
+        uid = ""
+        profile_res = RequestUtils(headers=headers,
+                                   timeout=timeout,
+                                   proxies=settings.PROXY if site_info.get("proxy") else None,
+                                   referer=f"{url}index"
+                                   ).post_res(url=f"https://api.{domain}/api/member/profile",
+                                              json={},
+                                              allow_redirects=False)
+        if profile_res and profile_res.status_code == 200:
+            try:
+                profile_data = (profile_res.json() or {}).get("data") or {}
+                uid = str(profile_data.get("id") or "").strip()
+            except Exception:
+                uid = ""
+        payload = {"pageNumber": 1, "pageSize": 10}
+        if uid:
+            payload["uid"] = int(uid) if uid.isdigit() else uid
         res = RequestUtils(headers=headers,
                            timeout=timeout,
                            proxies=settings.PROXY if site_info.get("proxy") else None,
                            referer=f"{url}index"
                            ).post_res(url=f"https://api.{domain}/api/member/queryUserLoginHistory",
-                                      json={"pageNumber": 1, "pageSize": 10},
+                                      json=payload,
                                       allow_redirects=False)
         if res is None:
             return False, "登录历史检查失败，无法打开 M-Team API"
