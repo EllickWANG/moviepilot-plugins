@@ -19,6 +19,7 @@ from fastapi import Body
 from lxml import etree
 
 from app import schemas
+from app.core.config import settings
 from app.db.site_oper import SiteOper
 from app.db.systemconfig_oper import SystemConfigOper
 from app.helper.downloader import DownloaderHelper
@@ -27,14 +28,15 @@ from app.helper.sites import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import SystemConfigKey
+from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 
 class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
-    plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
+    plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -58,6 +60,11 @@ class sitetoolbox(_PluginBase):
     _latest_missing_preview: Dict[str, Any] = {}
     _latest_missing_cleanup: Dict[str, Any] = {}
     _error_retention_days = 3
+    _mteam_site_ids: List[int] = []
+    _mteam_warning_days = 25
+    _mteam_auto_enabled = False
+    _mteam_auto_cron = "0 9 * * *"
+    _latest_mteam_login_check: Dict[str, Any] = {}
 
     _patched = False
     _originals: dict[tuple[type, str], Any] = {}
@@ -102,6 +109,15 @@ class sitetoolbox(_PluginBase):
             config.get("latest_missing_cleanup") if isinstance(config.get("latest_missing_cleanup"), dict) else {}
         )
         self._error_retention_days = _normalize_retention_days(config.get("error_retention_days"))
+        self._mteam_site_ids = _int_list(config.get("mteam_site_ids"))
+        self._mteam_warning_days = _int_or_default(config.get("mteam_warning_days"), 25, minimum=1, maximum=365)
+        self._mteam_auto_enabled = _to_bool(config.get("mteam_auto_enabled", False), False)
+        self._mteam_auto_cron = str(config.get("mteam_auto_cron") or "0 9 * * *").strip()
+        self._latest_mteam_login_check = (
+            config.get("latest_mteam_login_check")
+            if isinstance(config.get("latest_mteam_login_check"), dict)
+            else {}
+        )
         self.__class__._enabled = self._enabled
         self.__class__._site_ids = self._site_ids
         self.__class__._timeout = self._timeout
@@ -120,6 +136,11 @@ class sitetoolbox(_PluginBase):
         self.__class__._latest_missing_preview = self._latest_missing_preview
         self.__class__._latest_missing_cleanup = self._latest_missing_cleanup
         self.__class__._error_retention_days = self._error_retention_days
+        self.__class__._mteam_site_ids = self._mteam_site_ids
+        self.__class__._mteam_warning_days = self._mteam_warning_days
+        self.__class__._mteam_auto_enabled = self._mteam_auto_enabled
+        self.__class__._mteam_auto_cron = self._mteam_auto_cron
+        self.__class__._latest_mteam_login_check = self._latest_mteam_login_check
         self.__class__._site_rules = _parse_site_config(self._site_conf)
         self.__class__._userdata_rules = [
             {"domain": rule.get("domain"), "config": rule.get("userdata")}
@@ -147,20 +168,36 @@ class sitetoolbox(_PluginBase):
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if not (self._enabled and self._cleanup_auto_enabled and self._cleanup_auto_cron and self._cleanup_downloader_names):
+        if not self._enabled:
             return []
-        try:
-            trigger = CronTrigger.from_crontab(self._cleanup_auto_cron)
-        except Exception as err:
-            logger.error(f"站点工具箱缺失种子定时任务 cron 无效：{self._cleanup_auto_cron} - {err}")
-            return []
-        return [{
-            "id": "sitetoolbox_missing_preview",
-            "name": "站点工具箱缺失种子扫描",
-            "trigger": trigger,
-            "func": self.auto_preview_missing_torrents,
-            "kwargs": {},
-        }]
+        services: List[Dict[str, Any]] = []
+        if self._cleanup_auto_enabled and self._cleanup_auto_cron and self._cleanup_downloader_names:
+            try:
+                trigger = CronTrigger.from_crontab(self._cleanup_auto_cron)
+            except Exception as err:
+                logger.error(f"站点工具箱缺失种子定时任务 cron 无效：{self._cleanup_auto_cron} - {err}")
+            else:
+                services.append({
+                    "id": "sitetoolbox_missing_preview",
+                    "name": "站点工具箱缺失种子扫描",
+                    "trigger": trigger,
+                    "func": self.auto_preview_missing_torrents,
+                    "kwargs": {},
+                })
+        if self._mteam_auto_enabled and self._mteam_auto_cron:
+            try:
+                trigger = CronTrigger.from_crontab(self._mteam_auto_cron)
+            except Exception as err:
+                logger.error(f"站点工具箱馒头登录检查定时任务 cron 无效：{self._mteam_auto_cron} - {err}")
+            else:
+                services.append({
+                    "id": "sitetoolbox_mteam_login_check",
+                    "name": "站点工具箱馒头登录检查",
+                    "trigger": trigger,
+                    "func": self.auto_check_mteam_login,
+                    "kwargs": {},
+                })
+        return services
 
     def get_api(self) -> List[dict]:
         return [
@@ -220,18 +257,34 @@ class sitetoolbox(_PluginBase):
                 "summary": "清理缺失文件种子",
                 "description": "清理最近一次预览中仍处于 missingFiles 状态的种子。",
             },
+            {
+                "path": "/mteam/login/check",
+                "endpoint": _api_check_mteam_login,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "检查馒头登录历史",
+                "description": "通过 M-Team API Access Token 查询真实登录历史，后台运行并保存最近结果。",
+            },
         ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], dict]:
+        sites = [site for site in SiteOper().list_order_by_pri() if site and site.id]
         site_options = [
             {
                 "title": f"{site.name} ({site.domain})" if site.domain else site.name,
                 "value": site.id,
             }
-            for site in SiteOper().list_order_by_pri()
-            if site and site.id
+            for site in sites
         ]
         downloader_options = _downloader_options()
+        mteam_site_options = [
+            {
+                "title": f"{site.name} ({site.domain})" if site.domain else site.name,
+                "value": site.id,
+            }
+            for site in sites
+            if _is_mteam_site(site)
+        ]
         return [
             {
                 "component": "VForm",
@@ -337,6 +390,53 @@ class sitetoolbox(_PluginBase):
                             ],
                         },
                     ]),
+                    _form_section("馒头登录", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "mteam_site_ids",
+                                        "label": "馒头站点",
+                                        "items": mteam_site_options,
+                                        "multiple": True,
+                                        "chips": True,
+                                        "clearable": True,
+                                        "hint": "不选择时检查全部馒头站点",
+                                        "persistent-hint": True,
+                                    },
+                                }),
+                                _col(12, 3, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "mteam_warning_days",
+                                        "label": "提醒天数",
+                                        "type": "number",
+                                        "min": 1,
+                                        "max": 365,
+                                    },
+                                }),
+                                _col(12, 3, {
+                                    "component": "VSwitch",
+                                    "props": {"model": "mteam_auto_enabled", "label": "定时检查"},
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "mteam_auto_cron",
+                                        "label": "检查周期(cron)",
+                                        "placeholder": "0 9 * * *",
+                                    },
+                                }),
+                            ],
+                        },
+                    ]),
                     _form_section("站点适配", [
                         {
                             "component": "VRow",
@@ -379,6 +479,11 @@ class sitetoolbox(_PluginBase):
             "latest_missing_preview": {},
             "latest_missing_cleanup": {},
             "error_retention_days": 3,
+            "mteam_site_ids": [],
+            "mteam_warning_days": 25,
+            "mteam_auto_enabled": False,
+            "mteam_auto_cron": "0 9 * * *",
+            "latest_mteam_login_check": {},
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -408,6 +513,11 @@ class sitetoolbox(_PluginBase):
             "latest_missing_preview": self._latest_missing_preview,
             "latest_missing_cleanup": self._latest_missing_cleanup,
             "error_retention_days": self._error_retention_days,
+            "mteam_site_ids": self._mteam_site_ids,
+            "mteam_warning_days": self._mteam_warning_days,
+            "mteam_auto_enabled": self._mteam_auto_enabled,
+            "mteam_auto_cron": self._mteam_auto_cron,
+            "latest_mteam_login_check": self._latest_mteam_login_check,
         }
         payload.update(overrides)
         return payload
@@ -436,6 +546,11 @@ class sitetoolbox(_PluginBase):
         self._latest_missing_cleanup = cleanup
         self.__class__._latest_missing_cleanup = cleanup
         self.update_config(self._config_payload(latest_missing_cleanup=cleanup))
+
+    def _save_mteam_login_check(self, result: Dict[str, Any]):
+        self._latest_mteam_login_check = result
+        self.__class__._latest_mteam_login_check = result
+        self.update_config(self._config_payload(latest_mteam_login_check=result))
 
     def _set_job_state(self, key: str, name: str, status: str, message: str = "",
                        started_at: Optional[str] = None, finished_at: Optional[str] = None):
@@ -498,6 +613,27 @@ class sitetoolbox(_PluginBase):
             logger.info(f"站点工具箱缺失种子定时扫描完成：{message}")
         except Exception as err:
             self._set_job_state("missing_auto", name, "error", str(err), finished_at=_now())
+            raise
+
+    def auto_check_mteam_login(self):
+        name = "馒头登录定时检查"
+        self._set_job_state("mteam_login_auto", name, "running", "后台运行中", started_at=_now(), finished_at="")
+        try:
+            result = _build_mteam_login_check(self._mteam_site_ids, self._mteam_warning_days)
+            self._save_mteam_login_check(result)
+            warning_count = int(result.get("warning_count") or 0)
+            error_count = int(result.get("error_count") or 0)
+            total_count = int(result.get("total_count") or 0)
+            message = f"异常 {warning_count + error_count}/{total_count}"
+            self._set_job_state("mteam_login_auto", name, "success", message, finished_at=_now())
+            if warning_count or error_count:
+                self.systemmessage.put(
+                    f"馒头登录检查发现异常 {warning_count + error_count}/{total_count}，请在站点工具箱查看。",
+                    title=self.plugin_name,
+                )
+            logger.info(f"站点工具箱馒头登录定时检查完成：{message}")
+        except Exception as err:
+            self._set_job_state("mteam_login_auto", name, "error", str(err), finished_at=_now())
             raise
 
     def _install_error_capture(self):
@@ -834,6 +970,260 @@ def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) 
         return message
 
     return plugin._start_background_job("missing_cleanup", "缺失种子清理", worker)
+
+
+def _api_check_mteam_login(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    site_ids = _int_list((payload or {}).get("site_ids")) or plugin._mteam_site_ids
+
+    def worker() -> str:
+        result = _build_mteam_login_check(site_ids, plugin._mteam_warning_days)
+        plugin._save_mteam_login_check(result)
+        warning_count = int(result.get("warning_count") or 0)
+        error_count = int(result.get("error_count") or 0)
+        total_count = int(result.get("total_count") or 0)
+        return f"馒头登录检查完成：异常 {warning_count + error_count}/{total_count}"
+
+    return plugin._start_background_job("mteam_login_check", "馒头登录检查", worker)
+
+
+def _build_mteam_login_check(site_ids: Optional[List[int]] = None, warning_days: int = 25) -> Dict[str, Any]:
+    selected_ids = set(_int_list(site_ids))
+    sites = [
+        site for site in SiteOper().list_order_by_pri()
+        if site and site.id and (not selected_ids or site.id in selected_ids) and _is_mteam_site(site)
+    ]
+    results = [_check_mteam_login_site(site, warning_days) for site in sites]
+    warning_count = len([item for item in results if item.get("state") == "warning"])
+    error_count = len([item for item in results if item.get("state") == "error"])
+    return {
+        "checked_at": _now(),
+        "warning_days": warning_days,
+        "site_ids": list(selected_ids),
+        "total_count": len(results),
+        "warning_count": warning_count,
+        "error_count": error_count,
+        "items": results,
+    }
+
+
+def _check_mteam_login_site(site: Any, warning_days: int) -> Dict[str, Any]:
+    start = time.monotonic()
+    site_name = getattr(site, "name", "") or "馒头"
+    domain = _mteam_domain(site)
+    base = {
+        "site_id": getattr(site, "id", None),
+        "site_name": site_name,
+        "domain": domain,
+        "username": "",
+        "user_id": "",
+        "last_login_at": "",
+        "last_login_days": None,
+        "last_browse_at": "",
+        "record_count": 0,
+        "checked_at": _now(),
+        "seconds": 0,
+    }
+    if not getattr(site, "is_active", True):
+        return {**base, "state": "error", "message": "站点未启用", "seconds": _elapsed(start)}
+    if not getattr(site, "apikey", ""):
+        return {**base, "state": "error", "message": "未配置 M-Team API Access Token", "seconds": _elapsed(start)}
+
+    profile_payload, profile_error = _mteam_api_json(site, "member/profile", {})
+    profile_data = profile_payload.get("data") if isinstance(profile_payload, dict) else {}
+    if isinstance(profile_data, dict):
+        base["username"] = str(profile_data.get("username") or "")
+        base["user_id"] = str(profile_data.get("id") or "")
+        base["last_browse_at"] = _normalize_datetime_text(_find_named_value(
+            profile_data,
+            ("lastBrowse", "lastBrowseTime", "lastBrowseDate", "lastAccess", "lastAccessTime", "lastVisit"),
+        ))
+
+    history_payload, history_error = _mteam_api_json(
+        site,
+        "member/queryUserLoginHistory",
+        {"pageNumber": 1, "pageSize": 10},
+    )
+    if history_error:
+        message = history_error
+        if profile_error:
+            message = f"{message}；profile：{profile_error}"
+        return {**base, "state": "error", "message": message, "seconds": _elapsed(start)}
+
+    records = _mteam_history_records(history_payload)
+    base["record_count"] = len(records)
+    if not records:
+        return {**base, "state": "warning", "message": "API 未返回登录历史", "seconds": _elapsed(start)}
+
+    login_time, login_ts = _latest_mteam_login_time(records)
+    base["last_login_at"] = login_time
+    if login_ts:
+        days = max(0, int((time.time() - login_ts) // 86400))
+        base["last_login_days"] = days
+        if days > warning_days:
+            return {
+                **base,
+                "state": "warning",
+                "message": f"最近网页登录已超过 {warning_days} 天",
+                "seconds": _elapsed(start),
+            }
+        return {
+            **base,
+            "state": "success",
+            "message": f"最近网页登录 {days} 天前",
+            "seconds": _elapsed(start),
+        }
+    return {
+        **base,
+        "state": "warning",
+        "message": "登录历史存在，但无法解析登录时间",
+        "seconds": _elapsed(start),
+    }
+
+
+def _mteam_api_json(site: Any, path: str, payload: Optional[dict]) -> Tuple[dict, str]:
+    domain = _mteam_domain(site)
+    url = f"https://api.{domain}/api/{path.lstrip('/')}"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": getattr(site, "ua", "") or settings.USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "x-api-key": getattr(site, "apikey", "") or "",
+    }
+    res = RequestUtils(
+        headers=headers,
+        timeout=getattr(site, "timeout", None) or sitetoolbox._timeout,
+        proxies=settings.PROXY if getattr(site, "proxy", False) else None,
+        referer=f"{getattr(site, 'url', '') or f'https://{domain}/'}index",
+    ).post_res(url=url, json=payload or {}, allow_redirects=False)
+    if res is None:
+        return {}, "无法打开 M-Team API"
+    if 300 <= int(res.status_code or 0) < 400:
+        location = res.headers.get("Location") or res.headers.get("location") or ""
+        return {}, f"M-Team API 被重定向：{_mask_url(location) or res.status_code}"
+    if res.status_code != 200:
+        return {}, f"M-Team API 返回状态码 {res.status_code}"
+    try:
+        data = res.json() or {}
+    except Exception:
+        return {}, "M-Team API 返回非 JSON 内容"
+    code = data.get("code")
+    if code not in (None, 0, "0"):
+        return data, str(data.get("message") or data.get("msg") or f"M-Team API 返回 code={code}")
+    if "data" not in data:
+        return data, "M-Team API 未返回 data"
+    return data, ""
+
+
+def _mteam_history_records(payload: Any) -> List[dict]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    candidates = [data]
+    if isinstance(data, dict):
+        candidates.extend(data.get(key) for key in ("data", "records", "list", "items", "content", "rows"))
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return [item for item in candidate if isinstance(item, dict)]
+    return []
+
+
+def _latest_mteam_login_time(records: List[dict]) -> Tuple[str, float]:
+    candidates: List[Tuple[str, float]] = []
+    for record in records:
+        value = _find_named_value(record, (
+            "loginDate",
+            "loginTime",
+            "loginAt",
+            "lastLogin",
+            "lastLoginTime",
+            "createdDate",
+            "createdAt",
+            "createTime",
+            "time",
+            "date",
+        ))
+        text = _normalize_datetime_text(value)
+        ts = _parse_datetime_ts(value)
+        if text or ts:
+            candidates.append((text or _format_timestamp(ts), ts))
+    parsed = [item for item in candidates if item[1]]
+    if parsed:
+        text, ts = max(parsed, key=lambda item: item[1])
+        return text or _format_timestamp(ts), ts
+    return candidates[0] if candidates else ("", 0)
+
+
+def _find_named_value(value: Any, names: Tuple[str, ...]) -> Any:
+    if isinstance(value, dict):
+        lower_names = {name.lower() for name in names}
+        for key, item in value.items():
+            if str(key).lower() in lower_names and item not in (None, ""):
+                return item
+        for item in value.values():
+            found = _find_named_value(item, names)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _find_named_value(item, names)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _parse_datetime_ts(value: Any) -> float:
+    if value in (None, ""):
+        return 0
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 10_000_000_000:
+            number /= 1000
+        return number if number > 0 else 0
+    text = str(value).strip()
+    if not text:
+        return 0
+    if re.fullmatch(r"\d{10,13}", text):
+        return _parse_datetime_ts(int(text))
+    normalized = text.replace("T", " ").replace("Z", "").split("+", 1)[0].strip()
+    normalized = re.sub(r"\.\d+", "", normalized)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(normalized, fmt))
+        except Exception:
+            continue
+    return 0
+
+
+def _normalize_datetime_text(value: Any) -> str:
+    ts = _parse_datetime_ts(value)
+    if ts:
+        return _format_timestamp(ts)
+    return str(value or "").strip()
+
+
+def _mteam_domain(site: Any) -> str:
+    domain = getattr(site, "domain", "") or getattr(site, "url", "") or "m-team.cc"
+    normalized = StringUtils.get_url_domain(domain) or _normalize_domain(domain)
+    if normalized == "kp.m-team.cc":
+        return "m-team.cc"
+    if normalized == "kp.m-team.io":
+        return "m-team.io"
+    if normalized.endswith(".m-team.cc"):
+        return "m-team.cc"
+    if normalized.endswith(".m-team.io"):
+        return "m-team.io"
+    return normalized or "m-team.cc"
+
+
+def _is_mteam_site(site: Any) -> bool:
+    if not site:
+        return False
+    domain = _normalize_domain(getattr(site, "domain", "") or getattr(site, "url", ""))
+    url = str(getattr(site, "url", "") or "").lower()
+    return domain in {"m-team.cc", "m-team.io"} or domain.endswith(".m-team.cc") or domain.endswith(".m-team.io") or "m-team" in url
 
 
 def _build_missing_torrent_preview(downloader_names: List[str]) -> Dict[str, Any]:
@@ -1873,6 +2263,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     userdata_results = plugin._latest_userdata_results or []
     missing_preview = plugin._latest_missing_preview or {}
     missing_cleanup = plugin._latest_missing_cleanup or {}
+    mteam_check = plugin._latest_mteam_login_check or {}
     error_records = plugin._get_error_records()
     ok = len([item for item in results if item.get("state") == "success"])
     warning = len([item for item in results if item.get("state") == "warning"])
@@ -1883,6 +2274,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     userdata_warning = len([item for item in userdata_results if item.get("state") == "warning"])
     missing_count = int(missing_preview.get("total_count") or 0)
     missing_size = _format_size(missing_preview.get("total_size"))
+    mteam_bad = int(mteam_check.get("warning_count") or 0) + int(mteam_check.get("error_count") or 0)
     return [
         _overview_panel(
             plugin=plugin,
@@ -1890,15 +2282,17 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             missing_size=missing_size,
             rss_bad=error + warning,
             userdata_bad=userdata_bad + userdata_warning,
+            mteam_bad=mteam_bad,
             error_count=len(error_records),
             rule_count=len(rules),
             indexer_count=indexer_count,
             userdata_count=userdata_count,
         ),
-        _action_panel(plugin, missing_preview, results),
+        _action_panel(plugin, missing_preview, results, mteam_check),
         _details_panel(
             missing_preview=missing_preview,
             missing_cleanup=missing_cleanup,
+            mteam_check=mteam_check,
             plugin=plugin,
             rss_results=results,
             userdata_results=userdata_results,
@@ -1911,7 +2305,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
 
 
 def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, rss_bad: int,
-                    userdata_bad: int, error_count: int, rule_count: int,
+                    userdata_bad: int, mteam_bad: int, error_count: int, rule_count: int,
                     indexer_count: int, userdata_count: int) -> dict:
     return {
         "component": "VCard",
@@ -1949,6 +2343,7 @@ def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, 
                             _metric_col("缺失种子", missing_count, missing_size),
                             _metric_col("RSS 异常", rss_bad, "最近结果"),
                             _metric_col("数据异常", userdata_bad, "用户数据"),
+                            _metric_col("馒头登录", mteam_bad, f"提醒 {plugin._mteam_warning_days} 天"),
                             _metric_col("系统错误", error_count, f"保留 {plugin._error_retention_days} 天"),
                             _metric_col("适配规则", rule_count, f"索引 {indexer_count} / 数据 {userdata_count}"),
                         ],
@@ -1959,10 +2354,12 @@ def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, 
     }
 
 
-def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any], rss_results: List[Dict[str, Any]]) -> dict:
+def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any],
+                  rss_results: List[Dict[str, Any]], mteam_check: Dict[str, Any]) -> dict:
     missing_time = missing_preview.get("created_at") or "-"
     rss_time = _latest_rss_time(rss_results) or "-"
     userdata_time = plugin._latest_userdata_checked_at or "-"
+    mteam_time = mteam_check.get("checked_at") or "-"
     job_text = _job_state_summary(plugin._latest_job_states)
     content = [
         {
@@ -1990,6 +2387,13 @@ def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any], rss_resu
                     f"最近：{userdata_time}",
                     [
                         _action_button("检查", "mdi-account-search", "secondary", "plugin/sitetoolbox/check/userdata"),
+                    ],
+                ),
+                _operation_col(
+                    "馒头登录",
+                    f"最近：{mteam_time} · 定时：{plugin._mteam_auto_cron if plugin._mteam_auto_enabled else '关闭'}",
+                    [
+                        _action_button("检查", "mdi-login-variant", "secondary", "plugin/sitetoolbox/mteam/login/check"),
                     ],
                 ),
             ],
@@ -2044,7 +2448,8 @@ def _job_state_summary(states: Dict[str, Dict[str, Any]]) -> str:
     return f"最近任务：{name} {status} · {latest.get('finished_at') or '-'}"
 
 
-def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, Any], plugin: sitetoolbox,
+def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, Any],
+                   mteam_check: Dict[str, Any], plugin: sitetoolbox,
                    rss_results: List[Dict[str, Any]], userdata_results: List[Dict[str, Any]],
                    error_records: List[Dict[str, Any]], rules: List[dict], rss_ok: int, rss_bad: int) -> dict:
     return {
@@ -2055,6 +2460,11 @@ def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, A
                 "缺失文件种子",
                 f"{missing_preview.get('total_count', 0)} 个 / {_format_size(missing_preview.get('total_size'))}",
                 [_missing_torrent_panel(missing_preview, missing_cleanup, plugin)],
+            ),
+            _expansion_panel(
+                "馒头登录",
+                f"异常 {int(mteam_check.get('warning_count') or 0) + int(mteam_check.get('error_count') or 0)} / {mteam_check.get('total_count', 0)}",
+                [_mteam_login_panel(mteam_check, plugin)],
             ),
             _expansion_panel("用户数据健康", f"{len(userdata_results)} 个站点", [_userdata_table(userdata_results)]),
             _expansion_panel("RSS 结果", f"正常 {rss_ok} / 异常 {rss_bad}", [_result_table(rss_results)]),
@@ -2187,6 +2597,83 @@ def _adapter_summary(rules: List[dict], plugin: sitetoolbox) -> dict:
                             "text": "配置页保存后会立即加载索引规则，并把用户数据规则挂载到站点解析器。下方规则表会展示每个站点启用了哪些适配能力。",
                         },
                     },
+                ],
+            },
+        ],
+    }
+
+
+def _mteam_login_panel(check: Dict[str, Any], plugin: sitetoolbox) -> dict:
+    items = check.get("items") if isinstance(check.get("items"), list) else []
+    rows = []
+    for item in items:
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(item.get("site_name") or "-", "text-no-wrap"),
+                _td(item.get("domain") or "-", "text-no-wrap"),
+                _td(_state_text(item.get("state")), "text-no-wrap"),
+                _td(item.get("message") or "-"),
+                _td(item.get("username") or "-", "text-no-wrap"),
+                _td(item.get("last_login_at") or "-", "text-no-wrap"),
+                _td("-" if item.get("last_login_days") is None else item.get("last_login_days"), "text-no-wrap"),
+                _td(item.get("last_browse_at") or "-", "text-no-wrap"),
+                _td(item.get("record_count") or 0, "text-no-wrap"),
+                _td(item.get("checked_at") or "-", "text-no-wrap"),
+            ],
+        })
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-3 mb-2"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "content": [
+                                    {"component": "div", "props": {"class": "text-subtitle-1"}, "text": "馒头登录历史"},
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption text-medium-emphasis"},
+                                        "text": f"最近检查：{check.get('checked_at') or '-'} · 提醒天数：{plugin._mteam_warning_days}",
+                                    },
+                                ],
+                            },
+                            _status_chip(
+                                f"异常 {int(check.get('warning_count') or 0) + int(check.get('error_count') or 0)}",
+                                "success" if not (check.get("warning_count") or check.get("error_count")) else "warning",
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "这里通过馒头 API Access Token 查询真实登录历史；不会伪造浏览器登录，也不会展示 IP 信息。",
+                        },
+                    },
+                    _table_or_empty(
+                        rows,
+                        "还没有馒头登录检查结果",
+                        [
+                            _th("站点"),
+                            _th("域名"),
+                            _th("状态"),
+                            _th("说明"),
+                            _th("用户"),
+                            _th("最近登录"),
+                            _th("天数"),
+                            _th("最近访问"),
+                            _th("记录数"),
+                            _th("检查时间"),
+                        ],
+                    ),
                 ],
             },
         ],
