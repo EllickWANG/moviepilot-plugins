@@ -16,18 +16,21 @@ from lxml import etree
 
 from app import schemas
 from app.db.site_oper import SiteOper
+from app.db.systemconfig_oper import SystemConfigOper
+from app.helper.downloader import DownloaderHelper
 from app.helper.rss import RssHelper
 from app.helper.sites import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
+from app.schemas.types import SystemConfigKey
 from app.utils.string import StringUtils
 
 
 class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
-    plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引和用户数据解析适配。"
+    plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -42,6 +45,10 @@ class sitetoolbox(_PluginBase):
     _latest_userdata_results: List[Dict[str, Any]] = []
     _patch_userdata = True
     _site_conf = ""
+    _cleanup_downloader_names: List[str] = []
+    _cleanup_delete_files = False
+    _latest_missing_preview: Dict[str, Any] = {}
+    _latest_missing_cleanup: Dict[str, Any] = {}
 
     _patched = False
     _originals: dict[tuple[type, str], Any] = {}
@@ -65,6 +72,16 @@ class sitetoolbox(_PluginBase):
             indexer_conf=config.get("indexer_conf") or config.get("confstr") or "",
             userdata_conf=config.get("userdata_conf") or "",
         )
+        self._cleanup_downloader_names = _str_list(
+            config.get("cleanup_downloader_names") or config.get("cleanup_downloaders")
+        )
+        self._cleanup_delete_files = _to_bool(config.get("cleanup_delete_files", False), False)
+        self._latest_missing_preview = (
+            config.get("latest_missing_preview") if isinstance(config.get("latest_missing_preview"), dict) else {}
+        )
+        self._latest_missing_cleanup = (
+            config.get("latest_missing_cleanup") if isinstance(config.get("latest_missing_cleanup"), dict) else {}
+        )
         self.__class__._enabled = self._enabled
         self.__class__._site_ids = self._site_ids
         self.__class__._timeout = self._timeout
@@ -74,6 +91,10 @@ class sitetoolbox(_PluginBase):
         self.__class__._latest_userdata_results = self._latest_userdata_results
         self.__class__._patch_userdata = self._patch_userdata
         self.__class__._site_conf = self._site_conf
+        self.__class__._cleanup_downloader_names = self._cleanup_downloader_names
+        self.__class__._cleanup_delete_files = self._cleanup_delete_files
+        self.__class__._latest_missing_preview = self._latest_missing_preview
+        self.__class__._latest_missing_cleanup = self._latest_missing_cleanup
         self.__class__._site_rules = _parse_site_config(self._site_conf)
         self.__class__._userdata_rules = [
             {"domain": rule.get("domain"), "config": rule.get("userdata")}
@@ -139,6 +160,22 @@ class sitetoolbox(_PluginBase):
                 "summary": "检查站点用户数据完整性",
                 "description": "检查站点最新用户数据是否存在错误、缺失或关键字段异常。",
             },
+            {
+                "path": "/cleanup/missing/preview",
+                "endpoint": _api_preview_missing_torrents,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "预览缺失文件种子",
+                "description": "扫描配置的下载器，预览 qBittorrent missingFiles 状态的种子。",
+            },
+            {
+                "path": "/cleanup/missing",
+                "endpoint": _api_cleanup_missing_torrents,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清理缺失文件种子",
+                "description": "清理最近一次预览中仍处于 missingFiles 状态的种子。",
+            },
         ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], dict]:
@@ -150,6 +187,7 @@ class sitetoolbox(_PluginBase):
             for site in SiteOper().list_order_by_pri()
             if site and site.id
         ]
+        downloader_options = _downloader_options()
         return [
             {
                 "component": "VForm",
@@ -208,6 +246,34 @@ class sitetoolbox(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            _col(12, 8, {
+                                "component": "VSelect",
+                                "props": {
+                                    "model": "cleanup_downloader_names",
+                                    "label": "缺失种子清理下载器",
+                                    "items": downloader_options,
+                                    "multiple": True,
+                                    "chips": True,
+                                    "clearable": True,
+                                },
+                            }),
+                            _col(12, 4, {
+                                "component": "VSwitch",
+                                "props": {"model": "cleanup_delete_files", "label": "同时删除数据文件"},
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "text": "缺失种子清理采用预览快照模型：先在详情页预览 missingFiles 种子，清理时只删除预览中且当前仍为 missingFiles 的任务。默认只删除下载器任务，不删除数据文件。",
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             _col(12, 4, {
                                 "component": "VSwitch",
                                 "props": {"model": "patch_userdata", "label": "启用用户数据解析规则"},
@@ -243,6 +309,10 @@ class sitetoolbox(_PluginBase):
             "latest_userdata_results": [],
             "patch_userdata": True,
             "site_conf": "",
+            "cleanup_downloader_names": [],
+            "cleanup_delete_files": False,
+            "latest_missing_preview": {},
+            "latest_missing_cleanup": {},
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -251,35 +321,44 @@ class sitetoolbox(_PluginBase):
     def stop_service(self):
         self._unpatch_userdata()
 
-    def _save_results(self, results: List[Dict[str, Any]]):
-        self._latest_results = results
-        self.__class__._latest_results = results
-        self.update_config({
-            "enabled": self._enabled,
-            "site_ids": self._site_ids,
-            "timeout": self._timeout,
-            "auto_discover": self._auto_discover,
-            "save_discovered": self._save_discovered,
-            "latest_results": results,
-            "latest_userdata_results": self._latest_userdata_results,
-            "patch_userdata": self._patch_userdata,
-            "site_conf": self._site_conf,
-        })
-
-    def _save_userdata_results(self, results: List[Dict[str, Any]]):
-        self._latest_userdata_results = results
-        self.__class__._latest_userdata_results = results
-        self.update_config({
+    def _config_payload(self, **overrides) -> Dict[str, Any]:
+        payload = {
             "enabled": self._enabled,
             "site_ids": self._site_ids,
             "timeout": self._timeout,
             "auto_discover": self._auto_discover,
             "save_discovered": self._save_discovered,
             "latest_results": self._latest_results,
-            "latest_userdata_results": results,
+            "latest_userdata_results": self._latest_userdata_results,
             "patch_userdata": self._patch_userdata,
             "site_conf": self._site_conf,
-        })
+            "cleanup_downloader_names": self._cleanup_downloader_names,
+            "cleanup_delete_files": self._cleanup_delete_files,
+            "latest_missing_preview": self._latest_missing_preview,
+            "latest_missing_cleanup": self._latest_missing_cleanup,
+        }
+        payload.update(overrides)
+        return payload
+
+    def _save_results(self, results: List[Dict[str, Any]]):
+        self._latest_results = results
+        self.__class__._latest_results = results
+        self.update_config(self._config_payload(latest_results=results))
+
+    def _save_userdata_results(self, results: List[Dict[str, Any]]):
+        self._latest_userdata_results = results
+        self.__class__._latest_userdata_results = results
+        self.update_config(self._config_payload(latest_userdata_results=results))
+
+    def _save_missing_preview(self, preview: Dict[str, Any]):
+        self._latest_missing_preview = preview
+        self.__class__._latest_missing_preview = preview
+        self.update_config(self._config_payload(latest_missing_preview=preview))
+
+    def _save_missing_cleanup(self, cleanup: Dict[str, Any]):
+        self._latest_missing_cleanup = cleanup
+        self.__class__._latest_missing_cleanup = cleanup
+        self.update_config(self._config_payload(latest_missing_cleanup=cleanup))
 
     def _apply_indexers(self):
         count = 0
@@ -400,6 +479,290 @@ def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas
         message=f"用户数据检查完成：异常 {bad_count}/{len(results)}",
         data=results,
     )
+
+
+def _api_preview_missing_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    downloader_names = _str_list((payload or {}).get("downloader_names") or (payload or {}).get("downloaders"))
+    downloader_names = downloader_names or plugin._cleanup_downloader_names
+    if not downloader_names:
+        return schemas.Response(success=False, message="未选择下载器")
+
+    preview = _build_missing_torrent_preview(downloader_names)
+    plugin._save_missing_preview(preview)
+    total_count = preview.get("total_count", 0)
+    total_size = _format_size(preview.get("total_size", 0))
+    error_count = len(preview.get("errors") or [])
+    message = f"缺失种子预览完成：{total_count} 个，{total_size}"
+    if error_count:
+        message += f"，{error_count} 个下载器异常"
+    return schemas.Response(success=error_count == 0, message=message, data=preview)
+
+
+def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    downloader_names = _str_list((payload or {}).get("downloader_names") or (payload or {}).get("downloaders"))
+    downloader_names = downloader_names or plugin._cleanup_downloader_names
+    if not downloader_names:
+        return schemas.Response(success=False, message="未选择下载器")
+
+    preview = plugin._latest_missing_preview if isinstance(plugin._latest_missing_preview, dict) else {}
+    preview_items = preview.get("items") if isinstance(preview.get("items"), list) else []
+    if not preview_items:
+        return schemas.Response(success=False, message="请先预览缺失文件种子")
+
+    selected_names = set(downloader_names)
+    cleanup_items = [item for item in preview_items if item.get("downloader") in selected_names]
+    if not cleanup_items:
+        return schemas.Response(success=False, message="最近一次预览中没有选中下载器的缺失种子")
+
+    delete_files = _to_bool((payload or {}).get("delete_files"), plugin._cleanup_delete_files)
+    cleanup = _cleanup_missing_torrents_from_preview(cleanup_items, delete_files=delete_files)
+    plugin._save_missing_cleanup(cleanup)
+
+    refreshed = _build_missing_torrent_preview(downloader_names)
+    plugin._save_missing_preview(refreshed)
+
+    deleted_count = cleanup.get("deleted_count", 0)
+    failed_count = cleanup.get("failed_count", 0)
+    skipped_count = cleanup.get("skipped_count", 0)
+    message = f"缺失种子清理完成：删除 {deleted_count} 个，跳过 {skipped_count} 个"
+    if failed_count:
+        message += f"，失败 {failed_count} 个"
+    return schemas.Response(
+        success=failed_count == 0,
+        message=message,
+        data={"cleanup": cleanup, "preview": refreshed},
+    )
+
+
+def _build_missing_torrent_preview(downloader_names: List[str]) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    services = DownloaderHelper().get_services(name_filters=downloader_names)
+
+    for downloader_name in downloader_names:
+        service = services.get(downloader_name)
+        if not service or not service.instance:
+            errors.append({"downloader": downloader_name, "message": "下载器未启用或未连接"})
+            continue
+        if service.type != "qbittorrent":
+            errors.append({"downloader": downloader_name, "message": f"暂不支持 {service.type or '未知'} 下载器"})
+            continue
+
+        server = service.instance
+        try:
+            if hasattr(server, "is_inactive") and server.is_inactive():
+                server.reconnect()
+            torrents, failed = server.get_torrents()
+        except Exception as err:
+            errors.append({"downloader": downloader_name, "message": f"查询失败：{err}"})
+            continue
+        if failed:
+            errors.append({"downloader": downloader_name, "message": "查询种子列表失败"})
+            continue
+
+        for torrent in torrents or []:
+            if not _is_missing_torrent(torrent):
+                continue
+            items.append(_missing_torrent_item(downloader_name, torrent))
+
+    items = sorted(items, key=lambda item: (item.get("downloader") or "", item.get("save_path") or "", item.get("name") or ""))
+    total_size = sum(int(item.get("size") or 0) for item in items)
+    return {
+        "created_at": _now(),
+        "downloaders": downloader_names,
+        "total_count": len(items),
+        "total_size": total_size,
+        "by_downloader": _summarize_missing_items(items, "downloader"),
+        "by_save_path": _summarize_missing_items(items, "save_path"),
+        "items": items,
+        "errors": errors,
+    }
+
+
+def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_files: bool = False) -> Dict[str, Any]:
+    services = DownloaderHelper().get_services(name_filters=list(dict.fromkeys(item.get("downloader") for item in items)))
+    errors: List[Dict[str, Any]] = []
+    result_items: List[Dict[str, Any]] = []
+    deleted_count = 0
+    skipped_count = 0
+    failed_count = 0
+
+    for downloader_name, downloader_items in _group_items(items, "downloader").items():
+        service = services.get(downloader_name)
+        if not service or not service.instance:
+            message = "下载器未启用或未连接"
+            errors.append({"downloader": downloader_name, "message": message})
+            failed_count += len(downloader_items)
+            result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
+            continue
+        if service.type != "qbittorrent":
+            message = f"暂不支持 {service.type or '未知'} 下载器"
+            errors.append({"downloader": downloader_name, "message": message})
+            failed_count += len(downloader_items)
+            result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
+            continue
+
+        server = service.instance
+        hashes = [item.get("hash") for item in downloader_items if item.get("hash")]
+        try:
+            if hasattr(server, "is_inactive") and server.is_inactive():
+                server.reconnect()
+            torrents, failed = server.get_torrents(ids=hashes)
+        except Exception as err:
+            message = f"清理前复查失败：{err}"
+            errors.append({"downloader": downloader_name, "message": message})
+            failed_count += len(downloader_items)
+            result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
+            continue
+        if failed:
+            message = "清理前复查种子状态失败"
+            errors.append({"downloader": downloader_name, "message": message})
+            failed_count += len(downloader_items)
+            result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
+            continue
+
+        missing_hashes = {_torrent_hash(torrent) for torrent in torrents or [] if _is_missing_torrent(torrent)}
+        missing_hashes.discard("")
+        skipped_items = [item for item in downloader_items if item.get("hash") not in missing_hashes]
+        skipped_count += len(skipped_items)
+        result_items.extend(_cleanup_result_rows(skipped_items, "skipped", "当前已不是 missingFiles 状态"))
+
+        delete_hashes = [item.get("hash") for item in downloader_items if item.get("hash") in missing_hashes]
+        if not delete_hashes:
+            continue
+        try:
+            deleted = bool(server.delete_torrents(delete_file=delete_files, ids=delete_hashes))
+        except Exception as err:
+            deleted = False
+            errors.append({"downloader": downloader_name, "message": f"删除失败：{err}"})
+        if deleted:
+            deleted_count += len(delete_hashes)
+            result_items.extend(_cleanup_result_rows(
+                [item for item in downloader_items if item.get("hash") in missing_hashes],
+                "deleted",
+                "已删除下载器任务",
+            ))
+        else:
+            failed_count += len(delete_hashes)
+            result_items.extend(_cleanup_result_rows(
+                [item for item in downloader_items if item.get("hash") in missing_hashes],
+                "failed",
+                "删除失败",
+            ))
+
+    return {
+        "cleaned_at": _now(),
+        "delete_files": delete_files,
+        "candidate_count": len(items),
+        "deleted_count": deleted_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "items": result_items,
+        "errors": errors,
+    }
+
+
+def _missing_torrent_item(downloader_name: str, torrent: Any) -> Dict[str, Any]:
+    size = _torrent_int(torrent, "total_size", "size")
+    return {
+        "downloader": downloader_name,
+        "hash": _torrent_hash(torrent),
+        "name": _torrent_text(torrent, "name"),
+        "state": _torrent_text(torrent, "state"),
+        "progress": _torrent_progress(torrent),
+        "size": size,
+        "save_path": _torrent_text(torrent, "save_path"),
+        "content_path": _torrent_text(torrent, "content_path"),
+        "category": _torrent_text(torrent, "category"),
+        "tags": _torrent_text(torrent, "tags"),
+        "tracker": _torrent_text(torrent, "tracker"),
+        "last_activity": _format_timestamp(_torrent_int(torrent, "last_activity")),
+    }
+
+
+def _is_missing_torrent(torrent: Any) -> bool:
+    return _torrent_text(torrent, "state").lower() == "missingfiles"
+
+
+def _torrent_hash(torrent: Any) -> str:
+    return _torrent_text(torrent, "hash") or _torrent_text(torrent, "hashString")
+
+
+def _torrent_text(torrent: Any, key: str) -> str:
+    value = _torrent_value(torrent, key)
+    return "" if value is None else str(value)
+
+
+def _torrent_int(torrent: Any, *keys: str) -> int:
+    for key in keys:
+        value = _torrent_value(torrent, key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _torrent_progress(torrent: Any) -> float:
+    value = _torrent_value(torrent, "progress")
+    try:
+        progress = float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if progress <= 1:
+        progress *= 100
+    return round(progress, 2)
+
+
+def _torrent_value(torrent: Any, key: str) -> Any:
+    if isinstance(torrent, dict):
+        return torrent.get(key)
+    if hasattr(torrent, "get"):
+        try:
+            return torrent.get(key)
+        except Exception:
+            pass
+    return getattr(torrent, key, None)
+
+
+def _summarize_missing_items(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    summary: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        name = item.get(key) or "-"
+        bucket = summary.setdefault(name, {"name": name, "count": 0, "size": 0})
+        bucket["count"] += 1
+        bucket["size"] += int(item.get("size") or 0)
+    return sorted(summary.values(), key=lambda item: (-item.get("count", 0), item.get("name") or ""))
+
+
+def _group_items(items: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items:
+        name = item.get(key) or ""
+        grouped.setdefault(name, []).append(item)
+    return grouped
+
+
+def _cleanup_result_rows(items: List[Dict[str, Any]], state: str, message: str) -> List[Dict[str, Any]]:
+    return [
+        {
+            "downloader": item.get("downloader"),
+            "hash": item.get("hash"),
+            "name": item.get("name"),
+            "size": item.get("size"),
+            "state": state,
+            "message": message,
+        }
+        for item in items
+    ]
 
 
 def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
@@ -1059,6 +1422,8 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     results = plugin._latest_results or []
     rules = sitetoolbox._site_rules or []
     userdata_results = plugin._latest_userdata_results or _check_userdata_health()
+    missing_preview = plugin._latest_missing_preview or {}
+    missing_cleanup = plugin._latest_missing_cleanup or {}
     ok = len([item for item in results if item.get("state") == "success"])
     warning = len([item for item in results if item.get("state") == "warning"])
     error = len([item for item in results if item.get("state") == "error"])
@@ -1066,6 +1431,8 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     userdata_count = len([rule for rule in rules if isinstance(rule.get("userdata"), dict)])
     userdata_bad = len([item for item in userdata_results if item.get("state") == "error"])
     userdata_warning = len([item for item in userdata_results if item.get("state") == "warning"])
+    missing_count = int(missing_preview.get("total_count") or 0)
+    missing_size = _format_size(missing_preview.get("total_size"))
     return [
         {
             "component": "VRow",
@@ -1075,6 +1442,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
                 _stat_card("已选站点", len(plugin._site_ids), "配置页选择", "info"),
                 _stat_card("适配规则", len(rules), f"索引 {indexer_count} / 用户数据 {userdata_count}", "secondary"),
                 _stat_card("数据异常", userdata_bad + userdata_warning, f"错误 {userdata_bad} / 警告 {userdata_warning}", "error" if userdata_bad else "warning"),
+                _stat_card("缺失种子", missing_count, missing_size, "error" if missing_count else "success"),
             ],
         },
         _adapter_summary(rules, plugin),
@@ -1130,6 +1498,36 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
                                 }
                             },
                         },
+                        {
+                            "component": "VBtn",
+                            "props": {
+                                "variant": "tonal",
+                                "color": "info",
+                                "prepend-icon": "mdi-eye-search",
+                            },
+                            "text": "预览缺失种子",
+                            "events": {
+                                "click": {
+                                    "api": "plugin/sitetoolbox/cleanup/missing/preview",
+                                    "method": "post",
+                                }
+                            },
+                        },
+                        {
+                            "component": "VBtn",
+                            "props": {
+                                "variant": "tonal",
+                                "color": "error",
+                                "prepend-icon": "mdi-delete-alert",
+                            },
+                            "text": "清理预览结果",
+                            "events": {
+                                "click": {
+                                    "api": "plugin/sitetoolbox/cleanup/missing",
+                                    "method": "post",
+                                }
+                            },
+                        },
                     ],
                 })
             ],
@@ -1142,6 +1540,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
                 _stat_card("RSS 异常", error + warning, f"失败 {error} / 空结果 {warning}", "error" if error else "warning"),
             ],
         },
+        _missing_torrent_panel(missing_preview, missing_cleanup, plugin),
         _userdata_table(userdata_results),
         _adapter_rule_table(rules),
         _result_table(results),
@@ -1179,6 +1578,210 @@ def _adapter_summary(rules: List[dict], plugin: sitetoolbox) -> dict:
                     },
                 ],
             },
+        ],
+    }
+
+
+def _missing_torrent_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plugin: sitetoolbox) -> dict:
+    items = preview.get("items") if isinstance(preview.get("items"), list) else []
+    errors = preview.get("errors") if isinstance(preview.get("errors"), list) else []
+    cleanup_items = cleanup.get("items") if isinstance(cleanup.get("items"), list) else []
+    rows = []
+    for item in items[:200]:
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(item.get("downloader") or "-", "text-no-wrap"),
+                _td(item.get("state") or "-", "text-no-wrap"),
+                _td(item.get("name") or "-"),
+                _td(_format_size(item.get("size")), "text-no-wrap"),
+                _td(item.get("save_path") or "-", "text-no-wrap"),
+                _td(item.get("content_path") or "-"),
+                _td((item.get("hash") or "")[:12], "text-no-wrap"),
+            ],
+        })
+
+    error_rows = [
+        {
+            "component": "tr",
+            "content": [
+                _td(item.get("downloader") or "-", "text-no-wrap"),
+                _td(item.get("message") or "-"),
+            ],
+        }
+        for item in errors
+    ]
+    cleanup_rows = [
+        {
+            "component": "tr",
+            "content": [
+                _td(item.get("downloader") or "-", "text-no-wrap"),
+                _td(_cleanup_state_text(item.get("state")), "text-no-wrap"),
+                _td(item.get("message") or "-"),
+                _td(item.get("name") or "-"),
+                _td((item.get("hash") or "")[:12], "text-no-wrap"),
+            ],
+        }
+        for item in cleanup_items[:80]
+    ]
+
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {"component": "VCardTitle", "text": "缺失文件种子清理"},
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True},
+                        "content": [
+                            _compact_col("配置下载器", ", ".join(plugin._cleanup_downloader_names) or "未选择"),
+                            _compact_col("预览数量", preview.get("total_count", 0)),
+                            _compact_col("预览体积", _format_size(preview.get("total_size"))),
+                            _compact_col("最近清理", f"{cleanup.get('deleted_count', 0)} 个" if cleanup else "-"),
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning" if plugin._cleanup_delete_files else "info",
+                            "variant": "tonal",
+                            "text": (
+                                "当前配置会同时删除下载器中的数据文件；清理前请确认预览列表。"
+                                if plugin._cleanup_delete_files
+                                else "当前为安全清理：只删除下载器任务，不删除数据文件。清理时会复查任务仍为 missingFiles。"
+                            ),
+                        },
+                    },
+                    _missing_summary_table("按下载器汇总", preview.get("by_downloader") or []),
+                    _missing_summary_table("按保存路径汇总", preview.get("by_save_path") or []),
+                    _error_table("下载器异常", error_rows),
+                    _cleanup_table(cleanup_rows, cleanup),
+                    _empty_alert("还没有预览结果，请先点击“预览缺失种子”。") if not rows else {
+                        "component": "VTable",
+                        "props": {"density": "compact"},
+                        "content": [
+                            {
+                                "component": "thead",
+                                "content": [{
+                                    "component": "tr",
+                                    "content": [
+                                        _th("下载器"),
+                                        _th("状态"),
+                                        _th("名称"),
+                                        _th("大小"),
+                                        _th("保存路径"),
+                                        _th("内容路径"),
+                                        _th("Hash"),
+                                    ],
+                                }],
+                            },
+                            {"component": "tbody", "content": rows},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _missing_summary_table(title: str, summary: List[Dict[str, Any]]) -> dict:
+    rows = [
+        {
+            "component": "tr",
+            "content": [
+                _td(item.get("name") or "-", "text-no-wrap"),
+                _td(item.get("count"), "text-no-wrap"),
+                _td(_format_size(item.get("size")), "text-no-wrap"),
+            ],
+        }
+        for item in summary
+    ]
+    return {
+        "component": "div",
+        "props": {"class": "mt-3"},
+        "content": [
+            {"component": "div", "props": {"class": "text-subtitle-2 mb-1"}, "text": title},
+            _empty_alert("暂无数据") if not rows else {
+                "component": "VTable",
+                "props": {"density": "compact"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [{
+                            "component": "tr",
+                            "content": [_th("名称"), _th("数量"), _th("体积")],
+                        }],
+                    },
+                    {"component": "tbody", "content": rows},
+                ],
+            },
+        ],
+    }
+
+
+def _error_table(title: str, rows: List[dict]) -> dict:
+    if not rows:
+        return {"component": "div"}
+    return {
+        "component": "div",
+        "props": {"class": "mt-3"},
+        "content": [
+            {"component": "div", "props": {"class": "text-subtitle-2 mb-1"}, "text": title},
+            {
+                "component": "VTable",
+                "props": {"density": "compact"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [{
+                            "component": "tr",
+                            "content": [_th("下载器"), _th("说明")],
+                        }],
+                    },
+                    {"component": "tbody", "content": rows},
+                ],
+            },
+        ],
+    }
+
+
+def _cleanup_table(rows: List[dict], cleanup: Dict[str, Any]) -> dict:
+    if not cleanup:
+        return {"component": "div"}
+    return {
+        "component": "div",
+        "props": {"class": "mt-3"},
+        "content": [
+            {
+                "component": "div",
+                "props": {"class": "text-subtitle-2 mb-1"},
+                "text": f"最近清理结果：{cleanup.get('cleaned_at') or '-'}",
+            },
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "success" if not cleanup.get("failed_count") else "warning",
+                    "variant": "tonal",
+                    "text": f"候选 {cleanup.get('candidate_count', 0)} 个，删除 {cleanup.get('deleted_count', 0)} 个，跳过 {cleanup.get('skipped_count', 0)} 个，失败 {cleanup.get('failed_count', 0)} 个。",
+                },
+            },
+            {
+                "component": "VTable",
+                "props": {"density": "compact"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [{
+                            "component": "tr",
+                            "content": [_th("下载器"), _th("结果"), _th("说明"), _th("名称"), _th("Hash")],
+                        }],
+                    },
+                    {"component": "tbody", "content": rows},
+                ],
+            } if rows else _empty_alert("没有清理明细"),
         ],
     }
 
@@ -1424,6 +2027,14 @@ def _state_text(state: Optional[str]) -> str:
     }.get(state or "", state or "-")
 
 
+def _cleanup_state_text(state: Optional[str]) -> str:
+    return {
+        "deleted": "已删除",
+        "skipped": "已跳过",
+        "failed": "失败",
+    }.get(state or "", state or "-")
+
+
 def _empty_alert(text: str) -> dict:
     return {
         "component": "VAlert",
@@ -1454,6 +2065,36 @@ def _format_count(value: Any) -> str:
     if number.is_integer():
         return str(int(number))
     return str(number)
+
+
+def _format_timestamp(value: Any) -> str:
+    try:
+        timestamp = int(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+    except Exception:
+        return ""
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _downloader_options() -> List[dict]:
+    downloaders = SystemConfigOper().get(SystemConfigKey.Downloaders) or []
+    items = []
+    for downloader in downloaders:
+        if not isinstance(downloader, dict) or not downloader.get("enabled") or not downloader.get("name"):
+            continue
+        items.append({
+            "title": f"{downloader.get('name')} ({downloader.get('type') or 'unknown'})",
+            "value": downloader.get("name"),
+        })
+    return items
 
 
 def _mask_url(url: str) -> str:
@@ -1549,3 +2190,18 @@ def _int_list(value: Any) -> List[int]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def _str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            result.append(text)
+    return list(dict.fromkeys(result))

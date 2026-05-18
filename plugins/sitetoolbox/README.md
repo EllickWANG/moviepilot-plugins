@@ -2,7 +2,7 @@
 
 插件 ID：`sitetoolbox`
 
-这是一个 MoviePilot 站点诊断与适配工具箱。它可以选择已有站点测试 RSS 订阅是否可以正常获取和解析，也整合了原 `siteadapter` 的站点索引和用户数据解析适配能力。
+这是一个 MoviePilot 站点诊断与适配工具箱。它可以选择已有站点测试 RSS 订阅是否可以正常获取和解析，也整合了原 `siteadapter` 的站点索引和用户数据解析适配能力，并支持预览和清理下载器中的缺失文件种子。
 
 ## 功能
 
@@ -15,6 +15,8 @@
 - 通过配置补充或覆盖站点搜索、浏览、列表字段等索引规则。
 - 通过配置修正站点上传量、下载量、分享率、魔力、做种、下载等账号数据解析。
 - 在详情页展示 RSS 结果、站点适配概览、规则明细和用户数据健康检查。
+- 可选择一个或多个下载器，预览 qBittorrent `missingFiles` 状态的种子。
+- 可按最近一次预览快照清理仍处于 `missingFiles` 的种子任务，默认不删除数据文件。
 
 ## 配置
 
@@ -27,6 +29,8 @@
 | 自动保存获取到的RSS | 关闭 | 自动获取成功后，写回站点 RSS 地址。 |
 | 启用用户数据解析规则 | 开启 | 对 MoviePilot 已有站点解析器的用户数据解析结果做二次修正。 |
 | 站点适配配置 | 空 | 站点规则配置。支持 JSON、JSON 数组、`domain|base64(json)` 多行格式。 |
+| 缺失种子清理下载器 | 空 | 选择需要扫描和清理 `missingFiles` 种子的下载器。 |
+| 同时删除数据文件 | 关闭 | 清理缺失种子时是否要求下载器同步删除数据文件。默认关闭，只删除下载器任务。 |
 
 ## 使用
 
@@ -68,6 +72,20 @@ POST /api/v1/plugin/sitetoolbox/check/userdata
 ```
 
 检查结果会写入插件配置，并在插件详情页的 `用户数据健康检查` 表格中展示。
+
+预览缺失文件种子：
+
+```http
+POST /api/v1/plugin/sitetoolbox/cleanup/missing/preview
+```
+
+清理最近一次预览中的缺失文件种子：
+
+```http
+POST /api/v1/plugin/sitetoolbox/cleanup/missing
+```
+
+清理接口会先按 hash 复查当前任务状态，只删除仍为 `missingFiles` 的种子；如果任务已恢复、已下载或状态变化，会跳过。
 
 ## 站点适配配置
 
@@ -135,3 +153,4 @@ POST /api/v1/plugin/sitetoolbox/check/userdata
 - 部分站点需要有效 Cookie 或 User-Agent；插件会复用站点配置中的 Cookie、UA、代理和超时设置。
 - 站点适配配置不应写入站点 Cookie、账号、密钥等敏感信息。
 - 从 `siteadapter` 迁移时，可以把原插件的 `站点适配配置` 原样复制到工具箱。
+- 缺失种子清理当前面向 qBittorrent 的 `missingFiles` 状态；清理前应先查看详情页预览结果。
