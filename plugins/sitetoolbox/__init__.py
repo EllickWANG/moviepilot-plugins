@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.5"
+    plugin_version = "1.3.6"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1041,9 +1041,9 @@ def _check_mteam_login_site(site: Any, warning_days: int) -> Dict[str, Any]:
             ("lastBrowse", "lastBrowseTime", "lastBrowseDate", "lastAccess", "lastAccessTime", "lastVisit"),
         ))
 
-    history_params = {"pageNumber": 1, "pageSize": 10}
+    history_params = {}
     if base["user_id"]:
-        history_params["uid"] = _mteam_user_id_value(base["user_id"])
+        history_params["userId"] = _mteam_user_id_value(base["user_id"])
     history_payload, history_error = _mteam_api_json(
         site,
         "member/queryUserLoginHistory",

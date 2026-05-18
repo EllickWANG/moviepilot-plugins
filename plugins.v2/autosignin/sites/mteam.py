@@ -107,9 +107,9 @@ class MTorrent(_ISiteSigninHandler):
                 uid = str(profile_data.get("id") or "").strip()
             except Exception:
                 uid = ""
-        payload = {"pageNumber": 1, "pageSize": 10}
+        payload = {}
         if uid:
-            payload["uid"] = int(uid) if uid.isdigit() else uid
+            payload["userId"] = int(uid) if uid.isdigit() else uid
         history_headers = dict(headers)
         history_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
         res = RequestUtils(headers=history_headers,
