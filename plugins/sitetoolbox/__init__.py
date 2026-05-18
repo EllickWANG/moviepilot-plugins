@@ -8,7 +8,8 @@ import json
 import pkgutil
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from threading import Lock, Thread
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from apscheduler.triggers.cron import CronTrigger
@@ -31,7 +32,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.8"
+    plugin_version = "1.2.9"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -44,6 +45,8 @@ class sitetoolbox(_PluginBase):
     _save_discovered = False
     _latest_results: List[Dict[str, Any]] = []
     _latest_userdata_results: List[Dict[str, Any]] = []
+    _latest_userdata_checked_at = ""
+    _latest_job_states: Dict[str, Dict[str, Any]] = {}
     _patch_userdata = True
     _site_conf = ""
     _cleanup_downloader_names: List[str] = []
@@ -57,6 +60,7 @@ class sitetoolbox(_PluginBase):
     _originals: dict[tuple[type, str], Any] = {}
     _site_rules: list[dict[str, Any]] = []
     _userdata_rules: list[dict[str, Any]] = []
+    _jobs_lock = Lock()
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -70,6 +74,8 @@ class sitetoolbox(_PluginBase):
         self._latest_userdata_results = (
             config.get("latest_userdata_results") if isinstance(config.get("latest_userdata_results"), list) else []
         )
+        self._latest_userdata_checked_at = str(config.get("latest_userdata_checked_at") or "")
+        self._latest_job_states = _normalize_job_states(config.get("latest_job_states"))
         self._patch_userdata = _to_bool(config.get("patch_userdata", True), True)
         self._site_conf = config.get("site_conf") or _merge_legacy_site_conf(
             indexer_conf=config.get("indexer_conf") or config.get("confstr") or "",
@@ -94,6 +100,8 @@ class sitetoolbox(_PluginBase):
         self.__class__._save_discovered = self._save_discovered
         self.__class__._latest_results = self._latest_results
         self.__class__._latest_userdata_results = self._latest_userdata_results
+        self.__class__._latest_userdata_checked_at = self._latest_userdata_checked_at
+        self.__class__._latest_job_states = self._latest_job_states
         self.__class__._patch_userdata = self._patch_userdata
         self.__class__._site_conf = self._site_conf
         self.__class__._cleanup_downloader_names = self._cleanup_downloader_names
@@ -332,6 +340,8 @@ class sitetoolbox(_PluginBase):
             "save_discovered": False,
             "latest_results": [],
             "latest_userdata_results": [],
+            "latest_userdata_checked_at": "",
+            "latest_job_states": {},
             "patch_userdata": True,
             "site_conf": "",
             "cleanup_downloader_names": [],
@@ -357,6 +367,8 @@ class sitetoolbox(_PluginBase):
             "save_discovered": self._save_discovered,
             "latest_results": self._latest_results,
             "latest_userdata_results": self._latest_userdata_results,
+            "latest_userdata_checked_at": self._latest_userdata_checked_at,
+            "latest_job_states": self._latest_job_states,
             "patch_userdata": self._patch_userdata,
             "site_conf": self._site_conf,
             "cleanup_downloader_names": self._cleanup_downloader_names,
@@ -377,7 +389,12 @@ class sitetoolbox(_PluginBase):
     def _save_userdata_results(self, results: List[Dict[str, Any]]):
         self._latest_userdata_results = results
         self.__class__._latest_userdata_results = results
-        self.update_config(self._config_payload(latest_userdata_results=results))
+        self._latest_userdata_checked_at = _now()
+        self.__class__._latest_userdata_checked_at = self._latest_userdata_checked_at
+        self.update_config(self._config_payload(
+            latest_userdata_results=results,
+            latest_userdata_checked_at=self._latest_userdata_checked_at,
+        ))
 
     def _save_missing_preview(self, preview: Dict[str, Any]):
         self._latest_missing_preview = preview
@@ -389,16 +406,68 @@ class sitetoolbox(_PluginBase):
         self.__class__._latest_missing_cleanup = cleanup
         self.update_config(self._config_payload(latest_missing_cleanup=cleanup))
 
+    def _set_job_state(self, key: str, name: str, status: str, message: str = "",
+                       started_at: Optional[str] = None, finished_at: Optional[str] = None):
+        with self.__class__._jobs_lock:
+            states = dict(self._latest_job_states or {})
+            current = dict(states.get(key) or {})
+            current.update({
+                "key": key,
+                "name": name,
+                "status": status,
+                "message": message,
+            })
+            if started_at is not None:
+                current["started_at"] = started_at
+            if finished_at is not None:
+                current["finished_at"] = finished_at
+            states[key] = current
+            self._latest_job_states = states
+            self.__class__._latest_job_states = states
+        self.update_config(self._config_payload(latest_job_states=states))
+
+    def _start_background_job(self, key: str, name: str, func: Callable[[], str]) -> schemas.Response:
+        with self.__class__._jobs_lock:
+            state = (self._latest_job_states or {}).get(key) or {}
+            if state.get("status") == "running":
+                return schemas.Response(
+                    success=True,
+                    message=f"{name}已在后台运行，开始时间：{state.get('started_at') or '-'}",
+                    data=state,
+                )
+
+        self._set_job_state(key, name, "running", "后台运行中", started_at=_now(), finished_at="")
+
+        def runner():
+            try:
+                message = func() or "任务完成"
+                self._set_job_state(key, name, "success", message, finished_at=_now())
+            except Exception as err:
+                logger.error(f"站点工具箱后台任务失败：{name} - {err}")
+                self._set_job_state(key, name, "error", str(err), finished_at=_now())
+
+        Thread(target=runner, name=f"sitetoolbox-{key}", daemon=True).start()
+        return schemas.Response(
+            success=True,
+            message=f"{name}已在后台运行，完成后刷新页面查看最新结果",
+            data=self._latest_job_states.get(key),
+        )
+
     def auto_preview_missing_torrents(self):
         if not self._cleanup_downloader_names:
             logger.warning("站点工具箱缺失种子定时扫描跳过：未配置下载器")
             return
-        preview = _build_missing_torrent_preview(self._cleanup_downloader_names)
-        self._save_missing_preview(preview)
-        logger.info(
-            f"站点工具箱缺失种子定时扫描完成：{preview.get('total_count', 0)} 个，"
-            f"{_format_size(preview.get('total_size', 0))}"
-        )
+        name = "缺失种子定时扫描"
+        self._set_job_state("missing_auto", name, "running", "后台运行中", started_at=_now(), finished_at="")
+        try:
+            preview = _build_missing_torrent_preview(self._cleanup_downloader_names)
+            self._save_missing_preview(preview)
+            message = f"{preview.get('total_count', 0)} 个，{_format_size(preview.get('total_size', 0))}"
+            self._set_job_state("missing_auto", name, "success", message, finished_at=_now())
+            logger.info(f"站点工具箱缺失种子定时扫描完成：{message}")
+        except Exception as err:
+            self._set_job_state("missing_auto", name, "error", str(err), finished_at=_now())
+            raise
 
     def _apply_indexers(self):
         count = 0
@@ -462,20 +531,28 @@ def _api_test_selected_rss(payload: Optional[dict] = Body(default=None)) -> sche
     site_ids = _int_list((payload or {}).get("site_ids")) or plugin._site_ids
     if not site_ids:
         return schemas.Response(success=False, message="未选择站点")
-    results = [_test_site_rss(site_id) for site_id in site_ids]
-    plugin._save_results(results)
-    ok_count = len([item for item in results if item.get("state") == "success"])
-    return schemas.Response(success=ok_count == len(results), message=f"RSS测试完成：成功 {ok_count}/{len(results)}", data=results)
+
+    def worker() -> str:
+        results = [_test_site_rss(site_id) for site_id in site_ids]
+        plugin._save_results(results)
+        ok_count = len([item for item in results if item.get("state") == "success"])
+        return f"RSS测试完成：成功 {ok_count}/{len(results)}"
+
+    return plugin._start_background_job("rss_test", "RSS测试", worker)
 
 
 def _api_test_one_rss(site_id: int) -> schemas.Response:
     plugin = sitetoolbox._instance
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
-    result = _test_site_rss(site_id)
-    kept = [item for item in sitetoolbox._latest_results if item.get("site_id") != site_id]
-    plugin._save_results([result, *kept][:100])
-    return schemas.Response(success=result.get("state") == "success", message=result.get("message"), data=result)
+
+    def worker() -> str:
+        result = _test_site_rss(site_id)
+        kept = [item for item in sitetoolbox._latest_results if item.get("site_id") != site_id]
+        plugin._save_results([result, *kept][:100])
+        return result.get("message") or "RSS测试完成"
+
+    return plugin._start_background_job(f"rss_test_{site_id}", "单站RSS测试", worker)
 
 
 def _api_repair_selected_rss(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
@@ -485,25 +562,29 @@ def _api_repair_selected_rss(payload: Optional[dict] = Body(default=None)) -> sc
     site_ids = _int_list((payload or {}).get("site_ids")) or plugin._site_ids
     if not site_ids:
         return schemas.Response(success=False, message="未选择站点")
-    results = [_test_site_rss(site_id, repair=True) for site_id in site_ids]
-    plugin._save_results(results)
-    ok_count = len([item for item in results if item.get("state") == "success"])
-    fixed_count = len([item for item in results if item.get("fixed")])
-    return schemas.Response(
-        success=ok_count == len(results),
-        message=f"RSS修复完成：成功 {ok_count}/{len(results)}，写回 {fixed_count} 个",
-        data=results,
-    )
+
+    def worker() -> str:
+        results = [_test_site_rss(site_id, repair=True) for site_id in site_ids]
+        plugin._save_results(results)
+        ok_count = len([item for item in results if item.get("state") == "success"])
+        fixed_count = len([item for item in results if item.get("fixed")])
+        return f"RSS修复完成：成功 {ok_count}/{len(results)}，写回 {fixed_count} 个"
+
+    return plugin._start_background_job("rss_repair", "RSS修复", worker)
 
 
 def _api_repair_one_rss(site_id: int) -> schemas.Response:
     plugin = sitetoolbox._instance
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
-    result = _test_site_rss(site_id, repair=True)
-    kept = [item for item in sitetoolbox._latest_results if item.get("site_id") != site_id]
-    plugin._save_results([result, *kept][:100])
-    return schemas.Response(success=result.get("state") == "success", message=result.get("message"), data=result)
+
+    def worker() -> str:
+        result = _test_site_rss(site_id, repair=True)
+        kept = [item for item in sitetoolbox._latest_results if item.get("site_id") != site_id]
+        plugin._save_results([result, *kept][:100])
+        return result.get("message") or "RSS修复完成"
+
+    return plugin._start_background_job(f"rss_repair_{site_id}", "单站RSS修复", worker)
 
 
 def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
@@ -511,14 +592,14 @@ def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
     site_ids = _int_list((payload or {}).get("site_ids"))
-    results = _check_userdata_health(site_ids=site_ids)
-    plugin._save_userdata_results(results)
-    bad_count = len([item for item in results if item.get("state") != "success"])
-    return schemas.Response(
-        success=bad_count == 0,
-        message=f"用户数据检查完成：异常 {bad_count}/{len(results)}",
-        data=results,
-    )
+
+    def worker() -> str:
+        results = _check_userdata_health(site_ids=site_ids)
+        plugin._save_userdata_results(results)
+        bad_count = len([item for item in results if item.get("state") != "success"])
+        return f"用户数据检查完成：异常 {bad_count}/{len(results)}"
+
+    return plugin._start_background_job("userdata_check", "用户数据检查", worker)
 
 
 def _api_preview_missing_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
@@ -530,15 +611,18 @@ def _api_preview_missing_torrents(payload: Optional[dict] = Body(default=None)) 
     if not downloader_names:
         return schemas.Response(success=False, message="未选择下载器")
 
-    preview = _build_missing_torrent_preview(downloader_names)
-    plugin._save_missing_preview(preview)
-    total_count = preview.get("total_count", 0)
-    total_size = _format_size(preview.get("total_size", 0))
-    error_count = len(preview.get("errors") or [])
-    message = f"缺失种子预览完成：{total_count} 个，{total_size}"
-    if error_count:
-        message += f"，{error_count} 个下载器异常"
-    return schemas.Response(success=error_count == 0, message=message, data=preview)
+    def worker() -> str:
+        preview = _build_missing_torrent_preview(downloader_names)
+        plugin._save_missing_preview(preview)
+        total_count = preview.get("total_count", 0)
+        total_size = _format_size(preview.get("total_size", 0))
+        error_count = len(preview.get("errors") or [])
+        message = f"缺失种子预览完成：{total_count} 个，{total_size}"
+        if error_count:
+            message += f"，{error_count} 个下载器异常"
+        return message
+
+    return plugin._start_background_job("missing_preview", "缺失种子预览", worker)
 
 
 def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
@@ -561,23 +645,23 @@ def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) 
         return schemas.Response(success=False, message="最近一次预览中没有选中下载器的缺失种子")
 
     delete_files = _to_bool((payload or {}).get("delete_files"), plugin._cleanup_delete_files)
-    cleanup = _cleanup_missing_torrents_from_preview(cleanup_items, delete_files=delete_files)
-    plugin._save_missing_cleanup(cleanup)
 
-    refreshed = _build_missing_torrent_preview(downloader_names)
-    plugin._save_missing_preview(refreshed)
+    def worker() -> str:
+        cleanup = _cleanup_missing_torrents_from_preview(cleanup_items, delete_files=delete_files)
+        plugin._save_missing_cleanup(cleanup)
 
-    deleted_count = cleanup.get("deleted_count", 0)
-    failed_count = cleanup.get("failed_count", 0)
-    skipped_count = cleanup.get("skipped_count", 0)
-    message = f"缺失种子清理完成：删除 {deleted_count} 个，跳过 {skipped_count} 个"
-    if failed_count:
-        message += f"，失败 {failed_count} 个"
-    return schemas.Response(
-        success=failed_count == 0,
-        message=message,
-        data={"cleanup": cleanup, "preview": refreshed},
-    )
+        refreshed = _build_missing_torrent_preview(downloader_names)
+        plugin._save_missing_preview(refreshed)
+
+        deleted_count = cleanup.get("deleted_count", 0)
+        failed_count = cleanup.get("failed_count", 0)
+        skipped_count = cleanup.get("skipped_count", 0)
+        message = f"缺失种子清理完成：删除 {deleted_count} 个，跳过 {skipped_count} 个"
+        if failed_count:
+            message += f"，失败 {failed_count} 个"
+        return message
+
+    return plugin._start_background_job("missing_cleanup", "缺失种子清理", worker)
 
 
 def _build_missing_torrent_preview(downloader_names: List[str]) -> Dict[str, Any]:
@@ -1459,7 +1543,7 @@ def _join_datetime(day: Any, clock: Any) -> str:
 def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     results = plugin._latest_results or []
     rules = sitetoolbox._site_rules or []
-    userdata_results = plugin._latest_userdata_results or _check_userdata_health()
+    userdata_results = plugin._latest_userdata_results or []
     missing_preview = plugin._latest_missing_preview or {}
     missing_cleanup = plugin._latest_missing_cleanup or {}
     ok = len([item for item in results if item.get("state") == "success"])
@@ -1482,7 +1566,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             indexer_count=indexer_count,
             userdata_count=userdata_count,
         ),
-        _action_panel(plugin, missing_preview),
+        _action_panel(plugin, missing_preview, results),
         _details_panel(
             missing_preview=missing_preview,
             missing_cleanup=missing_cleanup,
@@ -1543,52 +1627,89 @@ def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, 
     }
 
 
-def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any]) -> dict:
+def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any], rss_results: List[Dict[str, Any]]) -> dict:
+    missing_time = missing_preview.get("created_at") or "-"
+    rss_time = _latest_rss_time(rss_results) or "-"
+    userdata_time = plugin._latest_userdata_checked_at or "-"
+    job_text = _job_state_summary(plugin._latest_job_states)
+    content = [
+        {
+            "component": "VRow",
+            "props": {"dense": True},
+            "content": [
+                _operation_col(
+                    "缺失种子",
+                    f"最近：{missing_time} · 定时：{plugin._cleanup_auto_cron if plugin._cleanup_auto_enabled else '关闭'}",
+                    [
+                        _action_button("预览", "mdi-eye-search", "primary", "plugin/sitetoolbox/cleanup/missing/preview"),
+                        _action_button("清理", "mdi-delete-alert", "error", "plugin/sitetoolbox/cleanup/missing"),
+                    ],
+                ),
+                _operation_col(
+                    "RSS",
+                    f"最近：{rss_time} · 站点：{len(plugin._site_ids)} 个",
+                    [
+                        _action_button("测试", "mdi-rss", "primary", "plugin/sitetoolbox/test/rss"),
+                        _action_button("修复", "mdi-wrench", "warning", "plugin/sitetoolbox/repair/rss"),
+                    ],
+                ),
+                _operation_col(
+                    "用户数据",
+                    f"最近：{userdata_time}",
+                    [
+                        _action_button("检查", "mdi-account-search", "secondary", "plugin/sitetoolbox/check/userdata"),
+                    ],
+                ),
+            ],
+        },
+    ]
+    if job_text:
+        content.append({
+            "component": "div",
+            "props": {"class": "text-caption text-medium-emphasis mt-2"},
+            "text": job_text,
+        })
     return {
         "component": "VCard",
         "props": {"variant": "outlined", "class": "mb-3"},
         "content": [
             {
                 "component": "VCardText",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "props": {"dense": True},
-                        "content": [
-                            _operation_col(
-                                "缺失种子",
-                                f"下载器：{', '.join(plugin._cleanup_downloader_names) or '未选择'} · 定时：{plugin._cleanup_auto_cron if plugin._cleanup_auto_enabled else '关闭'}",
-                                [
-                                    _action_button("预览", "mdi-eye-search", "primary", "plugin/sitetoolbox/cleanup/missing/preview"),
-                                    _action_button("清理", "mdi-delete-alert", "error", "plugin/sitetoolbox/cleanup/missing"),
-                                ],
-                            ),
-                            _operation_col(
-                                "RSS",
-                                f"站点：{len(plugin._site_ids)} 个 · 超时 {plugin._timeout}s",
-                                [
-                                    _action_button("测试", "mdi-rss", "primary", "plugin/sitetoolbox/test/rss"),
-                                    _action_button("修复", "mdi-wrench", "warning", "plugin/sitetoolbox/repair/rss"),
-                                ],
-                            ),
-                            _operation_col(
-                                "用户数据",
-                                "账号数据完整性",
-                                [
-                                    _action_button("检查", "mdi-account-search", "secondary", "plugin/sitetoolbox/check/userdata"),
-                                ],
-                            ),
-                        ],
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                        "text": f"最近预览：{missing_preview.get('created_at') or '-'}",
-                    },
-                ],
+                "content": content,
             },
         ],
     }
+
+
+def _latest_rss_time(results: List[Dict[str, Any]]) -> str:
+    values = [str(item.get("tested_at") or "") for item in results or [] if isinstance(item, dict)]
+    values = [value for value in values if value]
+    return max(values) if values else ""
+
+
+def _job_state_summary(states: Dict[str, Dict[str, Any]]) -> str:
+    if not isinstance(states, dict):
+        return ""
+    items = [item for item in states.values() if isinstance(item, dict)]
+    running = [item for item in items if item.get("status") == "running"]
+    if running:
+        names = list(dict.fromkeys(str(item.get("name") or item.get("key") or "任务") for item in running))
+        text = "、".join(names[:3])
+        if len(names) > 3:
+            text += f" 等 {len(names)} 个"
+        return f"后台运行：{text}"
+
+    finished = [item for item in items if item.get("finished_at")]
+    if not finished:
+        return ""
+    latest = max(finished, key=lambda item: str(item.get("finished_at") or ""))
+    status = {
+        "success": "完成",
+        "error": "失败",
+        "interrupted": "已重置",
+    }.get(str(latest.get("status") or ""), str(latest.get("status") or ""))
+    name = latest.get("name") or latest.get("key") or "任务"
+    return f"最近任务：{name} {status} · {latest.get('finished_at') or '-'}"
 
 
 def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, Any], plugin: sitetoolbox,
@@ -2269,6 +2390,23 @@ def _parse_rss(site: Any, rss_url: str):
 
 def _elapsed(start: float) -> float:
     return round(time.monotonic() - start, 2)
+
+
+def _normalize_job_states(value: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    states: Dict[str, Dict[str, Any]] = {}
+    for key, state in value.items():
+        if not isinstance(state, dict):
+            continue
+        item = dict(state)
+        item.setdefault("key", str(key))
+        if item.get("status") == "running":
+            item["status"] = "interrupted"
+            item["message"] = "插件重新加载，任务状态已重置"
+            item["finished_at"] = _now()
+        states[str(key)] = item
+    return states
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
