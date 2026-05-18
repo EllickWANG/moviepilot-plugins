@@ -35,6 +35,15 @@
     "level": 1,
     "v2": true
   },
+  "AutoSignIn": {
+    "name": "站点自动签到",
+    "description": "自动模拟登录、签到站点；私有修复 HDCity 当前签到页面识别。",
+    "version": "2.8.3",
+    "icon": "signin.png",
+    "author": "thsrite / Ellick",
+    "level": 2,
+    "v2": true
+  },
   "IYUUAutoSeedPlus": {
     "name": "IYUU自动辅种增强",
     "description": "复刻官方IYUU自动辅种，增加IYUU/下载器请求超时、每批Hash数量和站点域名匹配配置。",
