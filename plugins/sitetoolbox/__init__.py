@@ -34,7 +34,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -634,6 +634,8 @@ class sitetoolbox(_PluginBase):
                 cls._originals[key] = original
 
                 def wrapped(self, html_text, *args, _original=original, _method=method, **kwargs):
+                    if _method == "_parse_user_torrent_seeding_info":
+                        _apply_xloli_uuid_userdata(parser=self, html_text=html_text)
                     try:
                         result = _original(self, html_text, *args, **kwargs)
                     except TypeError as err:
@@ -644,6 +646,10 @@ class sitetoolbox(_PluginBase):
                             )
                             return False
                         raise
+                    if _method == "_parse_user_torrent_seeding_info":
+                        result = _normalize_xloli_next_page(parser=self, next_page=result)
+                    else:
+                        _apply_xloli_uuid_userdata(parser=self, html_text=html_text)
                     _apply_site_userdata_rules(self, html_text, cls._userdata_rules)
                     return result
 
@@ -1452,6 +1458,72 @@ def _apply_site_userdata_rules(parser: Any, html_text: str, rules: list[dict[str
 
 def _is_missing_userid_membership_error(err: TypeError) -> bool:
     return "'in <string>' requires string as left operand, not NoneType" in str(err)
+
+
+def _apply_xloli_uuid_userdata(parser: Any, html_text: str = ""):
+    if not _is_xloli_parser(parser):
+        return
+    user_uuid = _get_xloli_user_uuid(parser, html_text)
+    if not user_uuid:
+        return
+    parser.userid = user_uuid
+    user_detail_page = str(getattr(parser, "_user_detail_page", "") or "")
+    if not user_detail_page or user_detail_page == "userdetails":
+        parser._user_detail_page = f"userdetails.php?uuid={user_uuid}"
+    parser._torrent_seeding_page = f"getusertorrentlistajax.php?useruuid={user_uuid}&type=seeding"
+    parser._torrent_seeding_params = None
+
+
+def _normalize_xloli_next_page(parser: Any, next_page: Any) -> Any:
+    if not next_page or not isinstance(next_page, str) or not _is_xloli_parser(parser):
+        return next_page
+    user_uuid = _get_xloli_user_uuid(parser, next_page)
+    if not user_uuid:
+        return next_page
+
+    normalized = next_page.replace("&amp;", "&")
+    normalized = re.sub(r"([?&])userid=", r"\1useruuid=", normalized, count=1)
+    if "useruuid=" not in normalized:
+        separator = "&" if "?" in normalized else "?"
+        normalized = f"{normalized}{separator}useruuid={user_uuid}"
+    if "type=" not in normalized:
+        separator = "&" if "?" in normalized else "?"
+        normalized = f"{normalized}{separator}type=seeding"
+    return normalized
+
+
+def _is_xloli_parser(parser: Any) -> bool:
+    parser_domain = _normalize_domain(getattr(parser, "_site_domain", "") or getattr(parser, "_base_url", ""))
+    return parser_domain == "xloli.cc" or parser_domain.endswith(".xloli.cc")
+
+
+def _get_xloli_user_uuid(parser: Any, html_text: str = "") -> Optional[str]:
+    for text in (
+        html_text,
+        getattr(parser, "_torrent_seeding_page", ""),
+        getattr(parser, "_user_detail_page", ""),
+        getattr(parser, "_site_url", ""),
+        getattr(parser, "userid", ""),
+    ):
+        user_uuid = _extract_xloli_user_uuid(str(text or ""))
+        if user_uuid:
+            return user_uuid
+    return None
+
+
+def _extract_xloli_user_uuid(text: str) -> Optional[str]:
+    if not text:
+        return None
+    patterns = (
+        r"userdetails\.php\?uuid=([0-9a-fA-F-]{16,})",
+        r"getusertorrentlistajax\(\s*['\"]([0-9a-fA-F-]{16,})['\"]\s*,\s*['\"]seeding['\"]",
+        r"[?&]useruuid=([0-9a-fA-F-]{16,})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
 
 
 def _apply_field_rules(parser: Any, html, html_text: str, config: dict[str, Any]):
