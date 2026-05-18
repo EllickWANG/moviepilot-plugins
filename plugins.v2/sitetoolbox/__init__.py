@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body
 from lxml import etree
 
@@ -30,7 +31,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配和缺失文件种子清理。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -47,6 +48,8 @@ class sitetoolbox(_PluginBase):
     _site_conf = ""
     _cleanup_downloader_names: List[str] = []
     _cleanup_delete_files = False
+    _cleanup_auto_enabled = False
+    _cleanup_auto_cron = "0 */6 * * *"
     _latest_missing_preview: Dict[str, Any] = {}
     _latest_missing_cleanup: Dict[str, Any] = {}
 
@@ -76,6 +79,8 @@ class sitetoolbox(_PluginBase):
             config.get("cleanup_downloader_names") or config.get("cleanup_downloaders")
         )
         self._cleanup_delete_files = _to_bool(config.get("cleanup_delete_files", False), False)
+        self._cleanup_auto_enabled = _to_bool(config.get("cleanup_auto_enabled", False), False)
+        self._cleanup_auto_cron = str(config.get("cleanup_auto_cron") or "0 */6 * * *").strip()
         self._latest_missing_preview = (
             config.get("latest_missing_preview") if isinstance(config.get("latest_missing_preview"), dict) else {}
         )
@@ -93,6 +98,8 @@ class sitetoolbox(_PluginBase):
         self.__class__._site_conf = self._site_conf
         self.__class__._cleanup_downloader_names = self._cleanup_downloader_names
         self.__class__._cleanup_delete_files = self._cleanup_delete_files
+        self.__class__._cleanup_auto_enabled = self._cleanup_auto_enabled
+        self.__class__._cleanup_auto_cron = self._cleanup_auto_cron
         self.__class__._latest_missing_preview = self._latest_missing_preview
         self.__class__._latest_missing_cleanup = self._latest_missing_cleanup
         self.__class__._site_rules = _parse_site_config(self._site_conf)
@@ -117,6 +124,22 @@ class sitetoolbox(_PluginBase):
     @staticmethod
     def get_command() -> List[dict]:
         return []
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if not (self._enabled and self._cleanup_auto_enabled and self._cleanup_auto_cron and self._cleanup_downloader_names):
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cleanup_auto_cron)
+        except Exception as err:
+            logger.error(f"站点工具箱缺失种子定时任务 cron 无效：{self._cleanup_auto_cron} - {err}")
+            return []
+        return [{
+            "id": "sitetoolbox_missing_preview",
+            "name": "站点工具箱缺失种子扫描",
+            "trigger": trigger,
+            "func": self.auto_preview_missing_torrents,
+            "kwargs": {},
+        }]
 
     def get_api(self) -> List[dict]:
         return [
@@ -260,6 +283,23 @@ class sitetoolbox(_PluginBase):
                                 }),
                             ],
                         },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {"model": "cleanup_auto_enabled", "label": "定时扫描"},
+                                }),
+                                _col(12, 8, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "cleanup_auto_cron",
+                                        "label": "扫描周期(cron)",
+                                        "placeholder": "0 */6 * * *",
+                                    },
+                                }),
+                            ],
+                        },
                     ]),
                     _form_section("站点适配", [
                         {
@@ -296,6 +336,8 @@ class sitetoolbox(_PluginBase):
             "site_conf": "",
             "cleanup_downloader_names": [],
             "cleanup_delete_files": False,
+            "cleanup_auto_enabled": False,
+            "cleanup_auto_cron": "0 */6 * * *",
             "latest_missing_preview": {},
             "latest_missing_cleanup": {},
         }
@@ -319,6 +361,8 @@ class sitetoolbox(_PluginBase):
             "site_conf": self._site_conf,
             "cleanup_downloader_names": self._cleanup_downloader_names,
             "cleanup_delete_files": self._cleanup_delete_files,
+            "cleanup_auto_enabled": self._cleanup_auto_enabled,
+            "cleanup_auto_cron": self._cleanup_auto_cron,
             "latest_missing_preview": self._latest_missing_preview,
             "latest_missing_cleanup": self._latest_missing_cleanup,
         }
@@ -344,6 +388,17 @@ class sitetoolbox(_PluginBase):
         self._latest_missing_cleanup = cleanup
         self.__class__._latest_missing_cleanup = cleanup
         self.update_config(self._config_payload(latest_missing_cleanup=cleanup))
+
+    def auto_preview_missing_torrents(self):
+        if not self._cleanup_downloader_names:
+            logger.warning("站点工具箱缺失种子定时扫描跳过：未配置下载器")
+            return
+        preview = _build_missing_torrent_preview(self._cleanup_downloader_names)
+        self._save_missing_preview(preview)
+        logger.info(
+            f"站点工具箱缺失种子定时扫描完成：{preview.get('total_count', 0)} 个，"
+            f"{_format_size(preview.get('total_size', 0))}"
+        )
 
     def _apply_indexers(self):
         count = 0
@@ -1430,8 +1485,10 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             userdata_count=userdata_count,
         ),
         _action_panel(plugin, missing_preview),
-        _missing_torrent_panel(missing_preview, missing_cleanup, plugin),
         _details_panel(
+            missing_preview=missing_preview,
+            missing_cleanup=missing_cleanup,
+            plugin=plugin,
             rss_results=results,
             userdata_results=userdata_results,
             rules=rules,
@@ -1502,7 +1559,7 @@ def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any]) -> dict:
                         "content": [
                             _operation_col(
                                 "缺失种子",
-                                f"下载器：{', '.join(plugin._cleanup_downloader_names) or '未选择'}",
+                                f"下载器：{', '.join(plugin._cleanup_downloader_names) or '未选择'} · 定时：{plugin._cleanup_auto_cron if plugin._cleanup_auto_enabled else '关闭'}",
                                 [
                                     _action_button("预览", "mdi-eye-search", "primary", "plugin/sitetoolbox/cleanup/missing/preview"),
                                     _action_button("清理", "mdi-delete-alert", "error", "plugin/sitetoolbox/cleanup/missing"),
@@ -1536,12 +1593,18 @@ def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any]) -> dict:
     }
 
 
-def _details_panel(rss_results: List[Dict[str, Any]], userdata_results: List[Dict[str, Any]],
+def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, Any], plugin: sitetoolbox,
+                   rss_results: List[Dict[str, Any]], userdata_results: List[Dict[str, Any]],
                    rules: List[dict], rss_ok: int, rss_bad: int) -> dict:
     return {
         "component": "VExpansionPanels",
         "props": {"variant": "accordion", "class": "mt-3"},
         "content": [
+            _expansion_panel(
+                "缺失文件种子",
+                f"{missing_preview.get('total_count', 0)} 个 / {_format_size(missing_preview.get('total_size'))}",
+                [_missing_torrent_panel(missing_preview, missing_cleanup, plugin)],
+            ),
             _expansion_panel("用户数据健康", f"{len(userdata_results)} 个站点", [_userdata_table(userdata_results)]),
             _expansion_panel("RSS 结果", f"正常 {rss_ok} / 异常 {rss_bad}", [_result_table(rss_results)]),
             _expansion_panel("适配规则", f"{len(rules)} 条", [_adapter_rule_table(rules)]),
