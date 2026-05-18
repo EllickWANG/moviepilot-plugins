@@ -35,11 +35,11 @@ class AutoSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "signin.png"
     # 插件版本
-    plugin_version = "2.8.3"
+    plugin_version = "2.8.4"
     # 插件作者
-    plugin_author = "thsrite"
+    plugin_author = "Ellick"
     # 作者主页
-    author_url = "https://github.com/thsrite"
+    author_url = "https://github.com/EllickWANG"
     # 插件配置项ID前缀
     plugin_config_prefix = "autosignin_"
     # 加载顺序
