@@ -1,12 +1,21 @@
 import time
 import random
 import inspect
+from types import SimpleNamespace
 from typing import List, Union
 
-import openai
+import httpx
 from cacheout import Cache
 
 OpenAISessionCache = Cache(maxsize=100, ttl=3600, timer=time.time, default=None)
+
+
+def _to_namespace(value):
+    if isinstance(value, dict):
+        return SimpleNamespace(**{key: _to_namespace(val) for key, val in value.items()})
+    if isinstance(value, list):
+        return [_to_namespace(item) for item in value]
+    return value
 
 
 class OpenAi:
@@ -18,24 +27,25 @@ class OpenAi:
                  compatible: bool = False):
         self._api_key = api_key
         self._api_url = api_url
-        base_url = self._api_url if compatible else self._api_url + "/v1"
+        base_url = self._api_url.rstrip("/") if self._api_url else "https://api.openai.com"
+        if not compatible and not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
+        self._base_url = base_url
         
-        # 创建 OpenAI 客户端实例
+        # 避免 OpenAI SDK 与 httpx 版本不匹配时的 proxies/proxy 参数兼容问题。
         proxy_url = None
         if isinstance(proxy, dict):
             proxy_url = proxy.get("https") or proxy.get("http")
         elif proxy:
             proxy_url = proxy
-        import httpx
-        client_kwargs = {}
+        client_kwargs = {"timeout": 120}
         if proxy_url:
             httpx_client_params = inspect.signature(httpx.Client).parameters
             if "proxy" in httpx_client_params:
                 client_kwargs["proxy"] = proxy_url
             elif "proxies" in httpx_client_params:
                 client_kwargs["proxies"] = proxy_url
-        http_client = httpx.Client(**client_kwargs)
-        self.client = openai.OpenAI(api_key=self._api_key, base_url=base_url, http_client=http_client)
+        self.client = httpx.Client(**client_kwargs)
         
         if model:
             self._model = model
@@ -108,12 +118,28 @@ class OpenAi:
                         "content": message
                     }
                 ]
-        return self.client.chat.completions.create(
-            model=self._model,
-            user=user,
-            messages=message,
-            **kwargs
+        payload = {
+            "model": self._model,
+            "user": user,
+            "messages": message,
+        }
+        payload.update(kwargs)
+        response = self.client.post(
+            f"{self._base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
         )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as err:
+            raise RuntimeError(f"OpenAI接口返回错误 {response.status_code}: {response.text[:500]}") from err
+        try:
+            return _to_namespace(response.json())
+        except ValueError as err:
+            raise RuntimeError(f"OpenAI接口返回非JSON响应: {response.text[:500]}") from err
 
     @staticmethod
     def __clear_session(session_id: str):
