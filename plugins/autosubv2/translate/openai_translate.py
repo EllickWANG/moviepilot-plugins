@@ -1,5 +1,6 @@
 import time
 import random
+import inspect
 from typing import List, Union
 
 import openai
@@ -25,15 +26,16 @@ class OpenAi:
             proxy_url = proxy.get("https") or proxy.get("http")
         elif proxy:
             proxy_url = proxy
+        import httpx
+        client_kwargs = {}
         if proxy_url:
-            import httpx
-            try:
-                http_client = httpx.Client(proxy=proxy_url)
-            except TypeError:
-                http_client = httpx.Client(proxies=proxy_url)
-            self.client = openai.OpenAI(api_key=self._api_key, base_url=base_url, http_client=http_client)
-        else:
-            self.client = openai.OpenAI(api_key=self._api_key, base_url=base_url)
+            httpx_client_params = inspect.signature(httpx.Client).parameters
+            if "proxy" in httpx_client_params:
+                client_kwargs["proxy"] = proxy_url
+            elif "proxies" in httpx_client_params:
+                client_kwargs["proxies"] = proxy_url
+        http_client = httpx.Client(**client_kwargs)
+        self.client = openai.OpenAI(api_key=self._api_key, base_url=base_url, http_client=http_client)
         
         if model:
             self._model = model
