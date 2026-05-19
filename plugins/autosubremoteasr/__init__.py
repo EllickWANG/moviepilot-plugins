@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.23"
+    plugin_version = "1.0.24"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -487,14 +487,30 @@ class AutoSubRemoteAsr(_PluginBase):
         if not self._running:
             self._task_queue = queue.Queue()
             self._running = True
+        if self._tasks is None:
+            self._tasks = self.load_tasks()
+        with self._tasks_lock:
+            has_pending_tasks = any(
+                task.status == TaskStatus.PENDING
+                for task in (self._tasks or {}).values()
+            )
+            has_current_tasks = bool(self._current_processing_tasks)
+            has_queued_marks = bool(self._queued_task_ids)
         if self._event.is_set():
             self._event.clear()
             logger.warn(f"AI字幕队列自修复：{reason} 清理停止标记")
         alive_workers = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
+        if has_pending_tasks and not has_current_tasks:
+            if has_queued_marks:
+                with self._tasks_lock:
+                    self._queued_task_ids = set()
+                logger.warn(f"AI字幕队列自修复：{reason} 清理旧队列标记")
+            if alive_workers:
+                self._consumer_threads = {}
+                alive_workers = []
+                logger.warn(f"AI字幕队列自修复：{reason} 重建消费者线程注册")
         if len(alive_workers) < self._parallel_tasks:
             self.__start_workers()
-        if self._tasks is None:
-            self._tasks = self.load_tasks()
 
         now = datetime.now()
         stale_seconds = max(90, int(self._translate_request_timeout or 60) + 30)
