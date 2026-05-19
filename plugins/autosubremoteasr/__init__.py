@@ -78,7 +78,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2482,12 +2482,10 @@ class AutoSubRemoteAsr(_PluginBase):
         }
         for task in tasks:
             counts[task.status] = counts.get(task.status, 0) + 1
-        active_tasks = [
+        processing_tasks = [
             task for task in tasks
-            if task.status in [TaskStatus.IN_PROGRESS, TaskStatus.PENDING, TaskStatus.WAITING_FILE]
+            if task.status == TaskStatus.IN_PROGRESS
         ][:8]
-        if not active_tasks:
-            active_tasks = tasks[:8]
 
         elements = [
             {
@@ -2499,7 +2497,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__dashboard_metric("已完成", counts.get(TaskStatus.COMPLETED, 0), "success"),
                 ]
             },
-            self.__dashboard_task_list(active_tasks)
+            self.__dashboard_task_list(processing_tasks)
         ]
         return (
             {"cols": 12, "md": 6},
@@ -2545,7 +2543,7 @@ class AutoSubRemoteAsr(_PluginBase):
             return {
                 "component": "VAlert",
                 "props": {"type": "info", "variant": "tonal", "density": "compact"},
-                "text": "暂无任务"
+                "text": "暂无正在处理任务"
             }
 
         status_text = {
