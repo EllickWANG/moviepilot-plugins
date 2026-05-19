@@ -78,7 +78,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1035,6 +1035,43 @@ class AutoSubRemoteAsr(_PluginBase):
         except ValueError as err:
             raise RuntimeError(f"接口ASR返回非JSON响应: {response.text[:500]}") from err
 
+    def __transcribe_audio_chunk_with_progress(self, audio_file: str, audio_lang: str, chunk_no: int,
+                                               expected_chunks: int, task: Optional[TaskItem],
+                                               base_progress: float) -> dict:
+        result = {}
+
+        def worker():
+            try:
+                result["response"] = self.__transcribe_audio_chunk(audio_file, audio_lang)
+            except Exception as err:
+                result["error"] = err
+                result["traceback"] = traceback.format_exc()
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"autosubremoteasr-asr-{chunk_no}",
+            daemon=True
+        )
+        started_at = time.time()
+        thread.start()
+        while thread.is_alive():
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            elapsed = int(time.time() - started_at)
+            self.__update_task_progress(
+                task,
+                base_progress,
+                "提取并识别音频",
+                f"第 {chunk_no}/{expected_chunks or '?'} 段上传ASR中，已等待 {elapsed} 秒"
+            )
+            thread.join(timeout=2)
+
+        if result.get("error"):
+            if result.get("traceback"):
+                logger.error(result["traceback"])
+            raise result["error"]
+        return result.get("response") or {}
+
     @staticmethod
     def __get_audio_file_duration(audio_file: str) -> float:
         meta = Ffmpeg().get_video_metadata(audio_file)
@@ -1166,7 +1203,14 @@ class AutoSubRemoteAsr(_PluginBase):
                 percent = self.__scale_progress(24, 72, processed_chunks, expected_chunks)
                 self.__update_task_progress(task, percent, "提取并识别音频",
                                             f"第 {chunk_no}/{expected_chunks or '?'} 段正在上传ASR")
-                response = self.__transcribe_audio_chunk(chunk_file, lang)
+                response = self.__transcribe_audio_chunk_with_progress(
+                    chunk_file,
+                    lang,
+                    chunk_no,
+                    expected_chunks,
+                    task,
+                    percent
+                )
                 self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
                 detected_lang = detected_lang or response.get("language")
                 offset = (chunk_no - 1) * self._asr_chunk_seconds
@@ -2502,7 +2546,7 @@ class AutoSubRemoteAsr(_PluginBase):
         return (
             {"cols": 12, "md": 6},
             {
-                "refresh": 5,
+                "refresh": 2,
                 "border": True,
                 "title": "AI字幕任务进度",
                 "subtitle": f"队列 {counts.get(TaskStatus.PENDING, 0)} · 处理中 {counts.get(TaskStatus.IN_PROGRESS, 0)}",
