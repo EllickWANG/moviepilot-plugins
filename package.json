@@ -56,7 +56,7 @@
   "AutoSubv2Gpu": {
     "name": "AI字幕自动生成(v2) GPU版",
     "description": "复刻 AI 字幕自动生成，新增外部 ASR 命令后端，可接入 whisper.cpp/OpenVINO/Vulkan，不覆盖私有版。",
-    "version": "2.7.1",
+    "version": "2.7.2",
     "icon": "mdi-subtitles-outline",
     "author": "Ellick",
     "level": 2,

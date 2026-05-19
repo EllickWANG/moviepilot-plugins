@@ -1,4 +1,5 @@
 import copy
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -80,7 +81,7 @@ class AutoSubv2Gpu(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.7.1"
+    plugin_version = "2.7.2"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -709,7 +710,8 @@ class AutoSubv2Gpu(_PluginBase):
                         result["srt_preview"] = self.__clip_log(file_obj.read(), 1000)
                     os.remove(srt_path)
                 result["success"] = bool(ret and result["srt_exists"])
-                result["message"] = "外部ASR自检成功" if result["success"] else "外部ASR自检失败，未生成有效SRT"
+                backend_name = "OpenVINO GenAI" if self._asr_backend == "openvino_genai" else "外部ASR"
+                result["message"] = f"{backend_name}自检成功" if result["success"] else f"{backend_name}自检失败，未生成有效SRT"
                 return schemas.Response(success=result["success"], message=result["message"], data=result)
         except Exception as err:
             result["message"] = str(err)
@@ -982,6 +984,7 @@ if not payload["success"]:
     def __probe_asr_runtime() -> Dict[str, Any]:
         openvino_status = "installed" if importlib.util.find_spec("openvino_genai") else "missing"
         hf_status = "installed" if importlib.util.find_spec("huggingface_hub") else "missing"
+        package_versions = AutoSubv2Gpu.__probe_python_package_versions_safe()
         devices = AutoSubv2Gpu.__probe_openvino_devices_safe()
         command = (
             "printf 'bins='; "
@@ -1004,6 +1007,7 @@ if not payload["success"]:
                 "returncode": completed.returncode,
                 "openvino_genai": openvino_status,
                 "huggingface_hub": hf_status,
+                "package_versions": package_versions,
                 "openvino_devices": devices,
                 "output": AutoSubv2Gpu.__clip_log(
                     "\n".join(item for item in [completed.stdout.strip(), completed.stderr.strip()] if item),
@@ -1015,6 +1019,7 @@ if not payload["success"]:
                 "returncode": -1,
                 "openvino_genai": openvino_status,
                 "huggingface_hub": hf_status,
+                "package_versions": package_versions,
                 "openvino_devices": devices,
                 "output": str(err),
             }
@@ -1045,6 +1050,19 @@ if not payload["success"]:
             return json.loads(completed.stdout.strip() or "[]")
         except Exception as err:
             return [f"openvino_device_probe_error: {type(err).__name__}: {err}"]
+
+    @staticmethod
+    def __probe_python_package_versions_safe() -> Dict[str, str]:
+        packages = ["openvino", "openvino-genai", "openvino-tokenizers", "huggingface-hub"]
+        versions = {}
+        for package in packages:
+            try:
+                versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                versions[package] = "missing"
+            except Exception as err:
+                versions[package] = f"error: {type(err).__name__}: {err}"
+        return versions
 
     @staticmethod
     def __format_external_asr_command(command: str, audio_file: str, output_prefix: str,
