@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.10"
+    plugin_version = "1.0.11"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2492,21 +2492,22 @@ class AutoSubRemoteAsr(_PluginBase):
                         md=8,
                     ),
                     self.__form_col(
-                        [
-                            self.__form_text(
-                                "auto_scan_cron",
-                                "扫描周期",
-                                "*/10 * * * *",
-                                "默认每10分钟扫描一次",
-                            ),
-                            self.__form_text(
-                                "integrity_retry_minutes",
-                                "不完整重试分钟",
-                                "10",
-                                "文件未完整时等待后重新检查",
-                            ),
-                        ],
-                        md=4,
+                        self.__form_text(
+                            "auto_scan_cron",
+                            "扫描周期",
+                            "*/10 * * * *",
+                            "默认每10分钟扫描一次",
+                        ),
+                        md=2,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "integrity_retry_minutes",
+                            "不完整重试分钟",
+                            "10",
+                            "文件未完整时等待后重新检查",
+                        ),
+                        md=2,
                     ),
                 ],
             },
