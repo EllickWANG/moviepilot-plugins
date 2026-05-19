@@ -6,9 +6,10 @@ import subprocess
 import tempfile
 import time
 import traceback
+import wave
 from datetime import timedelta, datetime
 from pathlib import Path
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional
 from threading import Event
 import iso639
 import psutil
@@ -19,6 +20,8 @@ from enum import Enum
 import queue
 import threading
 from uuid import uuid4
+from fastapi import Body
+from app import schemas
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event as MPEvent
@@ -74,7 +77,7 @@ class AutoSubv2Gpu(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.6.0"
+    plugin_version = "2.6.1"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -87,6 +90,7 @@ class AutoSubv2Gpu(_PluginBase):
     auth_level = 2
 
     # 私有属性
+    _instance: Optional["AutoSubv2Gpu"] = None
     _tasks: Dict[str, TaskItem] = None
     _task_queue = None
     _consumer_thread = None
@@ -114,11 +118,13 @@ class AutoSubv2Gpu(_PluginBase):
     _external_asr_command = None
     _external_asr_timeout = None
     _external_asr_default_language = None
+    _latest_asr_test: Dict[str, Any] = None
     _huggingface_proxy = None
     _faster_whisper_model_path = None
     _faster_whisper_model = None
 
     def init_plugin(self, config=None):
+        self.__class__._instance = self
         # 如果没有配置信息， 则不处理
         if not config:
             return
@@ -143,6 +149,9 @@ class AutoSubv2Gpu(_PluginBase):
             self._external_asr_timeout = int(config.get('external_asr_timeout')) \
                 if config.get('external_asr_timeout') else 7200
             self._external_asr_default_language = str(config.get('external_asr_default_language') or 'en').strip()
+            self._latest_asr_test = (
+                config.get('latest_asr_test') if isinstance(config.get('latest_asr_test'), dict) else {}
+            )
             self._faster_whisper_model = config.get('faster_whisper_model', 'base')
             self._faster_whisper_model_path = config.get('faster_whisper_model_path',
                                                          self.get_data_path() / "faster-whisper-models")
@@ -570,6 +579,98 @@ class AutoSubv2Gpu(_PluginBase):
             logger.error(f"外部ASR处理异常：{e}")
             logger.error(traceback.format_exc())
             return False, None
+
+    def _save_asr_test_result(self, result: Dict[str, Any]):
+        self._latest_asr_test = result
+        config = self.get_config() or {}
+        config['latest_asr_test'] = result
+        self.update_config(config)
+
+    def _run_asr_test(self, payload: Optional[dict] = None) -> schemas.Response:
+        payload = payload or {}
+        original_command = self._external_asr_command
+        original_timeout = self._external_asr_timeout
+        original_default_language = self._external_asr_default_language
+        if payload.get('external_asr_command'):
+            self._external_asr_command = str(payload.get('external_asr_command') or '').strip()
+        if payload.get('external_asr_timeout'):
+            self._external_asr_timeout = int(payload.get('external_asr_timeout'))
+        if payload.get('external_asr_default_language'):
+            self._external_asr_default_language = str(payload.get('external_asr_default_language') or '').strip()
+
+        started = time.time()
+        result = {
+            "tested_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "success": False,
+            "message": "",
+            "language": "",
+            "duration": 0,
+            "runtime": self.__probe_external_asr_runtime(),
+        }
+        try:
+            if not self._external_asr_command:
+                result["message"] = "外部ASR命令未配置"
+                return schemas.Response(success=False, message=result["message"], data=result)
+
+            with tempfile.NamedTemporaryFile(prefix='autosub-asr-test-', suffix='.wav', delete=True) as audio_file:
+                self.__write_test_wav(audio_file.name)
+                ret, lang = self.__do_external_speech_recognition('auto', audio_file.name)
+                result["language"] = lang or ""
+                srt_path = f"{audio_file.name}.srt"
+                result["srt_exists"] = os.path.exists(srt_path)
+                if os.path.exists(srt_path):
+                    with open(srt_path, 'r', encoding='utf-8', errors='ignore') as file_obj:
+                        result["srt_preview"] = self.__clip_log(file_obj.read(), 1000)
+                    os.remove(srt_path)
+                result["success"] = bool(ret and result["srt_exists"])
+                result["message"] = "外部ASR自检成功" if result["success"] else "外部ASR自检失败，未生成有效SRT"
+                return schemas.Response(success=result["success"], message=result["message"], data=result)
+        except Exception as err:
+            result["message"] = str(err)
+            return schemas.Response(success=False, message=result["message"], data=result)
+        finally:
+            result["duration"] = round(time.time() - started, 2)
+            self._save_asr_test_result(result)
+            self._external_asr_command = original_command
+            self._external_asr_timeout = original_timeout
+            self._external_asr_default_language = original_default_language
+
+    @staticmethod
+    def __write_test_wav(file_path: str):
+        with wave.open(file_path, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b'\x00\x00' * 16000)
+
+    @staticmethod
+    def __probe_external_asr_runtime() -> Dict[str, Any]:
+        command = (
+            "printf 'bins='; "
+            "for b in whisper-cli whisper.cpp main whisper; do command -v \"$b\" 2>/dev/null | head -n 1; done; "
+            "printf '\\nmodels='; "
+            "find /models /config /moviepilot /app -maxdepth 4 -type f "
+            "\\( -name 'ggml*.bin' -o -name '*whisper*.bin' -o -name '*.onnx' -o -name '*.xml' \\) "
+            "2>/dev/null | head -n 20"
+        )
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            return {
+                "returncode": completed.returncode,
+                "output": AutoSubv2Gpu.__clip_log(
+                    "\n".join(item for item in [completed.stdout.strip(), completed.stderr.strip()] if item),
+                    3000,
+                ),
+            }
+        except Exception as err:
+            return {"returncode": -1, "output": str(err)}
 
     @staticmethod
     def __format_external_asr_command(command: str, audio_file: str, output_prefix: str,
@@ -1777,6 +1878,7 @@ class AutoSubv2Gpu(_PluginBase):
             "external_asr_command": "",
             "external_asr_timeout": 7200,
             "external_asr_default_language": "en",
+            "latest_asr_test": {},
             "faster_whisper_model": "base",
             "proxy": True,
             "use_chatgpt": True,
@@ -1794,7 +1896,16 @@ class AutoSubv2Gpu(_PluginBase):
         }
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return [
+            {
+                "path": "/asr/test",
+                "endpoint": _api_test_asr,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "测试外部ASR命令",
+                "description": "生成临时静音 wav，调用外部 ASR 命令，验证命令、模型和 SRT 输出是否可用。",
+            },
+        ]
 
     def get_page(self) -> List[dict]:
         # 加载任务并按添加时间倒序排列
@@ -1939,3 +2050,10 @@ class AutoSubv2Gpu(_PluginBase):
         self._running = False
         self._event.clear()
         logger.info(f"自动字幕生成服务已停止")
+
+
+def _api_test_asr(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = AutoSubv2Gpu._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    return plugin._run_asr_test(payload)
