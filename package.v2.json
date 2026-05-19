@@ -47,6 +47,14 @@
     "author": "Ellick",
     "level": 2
   },
+  "GpuProbe": {
+    "name": "GPU 探测",
+    "description": "检测容器内 Intel GPU、OpenVINO、Vulkan 与 VAAPI 是否可用。",
+    "version": "1.0.0",
+    "icon": "mdi-chip",
+    "author": "Ellick",
+    "level": 1
+  },
   "IYUUAutoSeedPlus": {
     "name": "IYUU自动辅种增强",
     "description": "复刻官方IYUU自动辅种，增加IYUU/下载器请求超时、每批Hash数量和站点域名匹配配置。",
