@@ -24,8 +24,8 @@ from app.schemas.types import NotificationType, EventType
 from app.log import logger
 from app.plugins import _PluginBase
 from app.utils.system import SystemUtils
-from plugins.autosubv2.ffmpeg import Ffmpeg
-from plugins.autosubv2.translate.openai_translate import OpenAi
+from .ffmpeg import Ffmpeg
+from .translate.openai_translate import OpenAi
 
 
 class UserInterruptException(Exception):
@@ -66,7 +66,7 @@ class AutoSubv2(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.5.3"
+    plugin_version = "2.5.4"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
