@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.16"
+    plugin_version = "1.0.17"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -584,6 +584,15 @@ class AutoSubRemoteAsr(_PluginBase):
         ]
         return any(marker in error for marker in markers)
 
+    def __is_waiting_file_task(self, task: TaskItem) -> bool:
+        if not task:
+            return False
+        return (
+            task.status == TaskStatus.WAITING_FILE
+            or task.progress_stage in {"等待文件完整", "视频不完整"}
+            or self.__is_incomplete_video_error(task.progress_detail)
+        )
+
     def load_tasks(self) -> Dict[str, TaskItem]:
         raw_tasks = self.get_data("tasks") or {}
         tasks = {}
@@ -592,13 +601,13 @@ class AutoSubRemoteAsr(_PluginBase):
                 status = TaskStatus(task_dict["status"])
                 progress_stage = task_dict.get("progress_stage") or ""
                 progress_detail = task_dict.get("progress_detail") or ""
-                if status == TaskStatus.FAILED and (
-                        self.__is_incomplete_video_error(progress_detail)
-                        or progress_stage == "视频不完整"
-                        or progress_stage == "服务已停止"
+                if self.__is_incomplete_video_error(progress_detail) or progress_stage in ["等待文件完整", "视频不完整"]:
+                    status = TaskStatus.WAITING_FILE
+                elif status == TaskStatus.FAILED and (
+                        progress_stage == "服务已停止"
                         or "插件停止时任务未完成" in progress_detail
                 ):
-                    status = TaskStatus.WAITING_FILE if self.__is_incomplete_video_error(progress_detail) else TaskStatus.PENDING
+                    status = TaskStatus.PENDING
                 default_progress, default_stage = self.__default_task_progress(status)
                 task = TaskItem(
                     task_id=task_dict["task_id"],
@@ -4010,8 +4019,8 @@ class AutoSubRemoteAsr(_PluginBase):
             counts[task.status] = counts.get(task.status, 0) + 1
 
         processing_tasks = [task for task in tasks if task.status == TaskStatus.IN_PROGRESS]
-        queue_tasks = [task for task in tasks if task.status != TaskStatus.WAITING_FILE]
-        waiting_file_tasks = [task for task in tasks if task.status == TaskStatus.WAITING_FILE]
+        waiting_file_tasks = [task for task in tasks if self.__is_waiting_file_task(task)]
+        queue_tasks = [task for task in tasks if not self.__is_waiting_file_task(task)]
         selected_tab = self.get_data("page_tab") or "queue"
         latest_update = None
         for task in tasks:
