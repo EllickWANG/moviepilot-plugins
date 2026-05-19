@@ -22,6 +22,7 @@ import threading
 from uuid import uuid4
 from apscheduler.triggers.cron import CronTrigger
 import httpx
+from app import schemas
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event as MPEvent
@@ -90,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -116,6 +117,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _auto_scan_lock = None
     _translate_lock = None
     _parallel_tasks = 1
+    _translate_concurrency = 1
     _cpu_threads = 1
     _full_integrity_check = False
     _asr_api_model = "whisper-1"
@@ -171,6 +173,13 @@ class AutoSubRemoteAsr(_PluginBase):
 
     @staticmethod
     def __normalize_parallel_tasks(value) -> int:
+        try:
+            return max(1, min(3, int(value or 1)))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def __normalize_translate_concurrency(value) -> int:
         try:
             return max(1, min(3, int(value or 1)))
         except Exception:
@@ -307,6 +316,8 @@ class AutoSubRemoteAsr(_PluginBase):
         self._path_list = self.__normalize_path_list(config.get('path_list'))
         self._send_notify = config.get('send_notify', False)
         self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
+        self._translate_concurrency = self.__normalize_translate_concurrency(config.get('translate_concurrency', 1))
+        self._translate_lock = threading.Semaphore(self._translate_concurrency)
         self._cpu_threads = 1
         self._full_integrity_check = bool(config.get('full_integrity_check', False))
         self._auto_scan_enabled = bool(config.get('auto_scan_enabled', True))
@@ -2391,7 +2402,318 @@ class AutoSubRemoteAsr(_PluginBase):
 
         return False
 
+    @staticmethod
+    def __form_col(content: Any, md: int = 4, cols: int = 12, props: Optional[dict] = None) -> dict:
+        col_props = {"cols": cols}
+        if md:
+            col_props["md"] = md
+        if props:
+            col_props.update(props)
+        return {
+            "component": "VCol",
+            "props": col_props,
+            "content": content if isinstance(content, list) else [content],
+        }
+
+    @staticmethod
+    def __form_switch(model: str, label: str, hint: str = None, color: str = None, props: Optional[dict] = None) -> dict:
+        switch_props = {"model": model, "label": label}
+        if hint:
+            switch_props["hint"] = hint
+        if color:
+            switch_props["color"] = color
+        if props:
+            switch_props.update(props)
+        return {"component": "VSwitch", "props": switch_props}
+
+    @staticmethod
+    def __form_text(model: str, label: str, placeholder: str = None, hint: str = None,
+                    props: Optional[dict] = None) -> dict:
+        text_props = {"model": model, "label": label}
+        if placeholder is not None:
+            text_props["placeholder"] = placeholder
+        if hint:
+            text_props["hint"] = hint
+        if props:
+            text_props.update(props)
+        return {"component": "VTextField", "props": text_props}
+
+    @staticmethod
+    def __form_textarea(model: str, label: str, placeholder: str = None, hint: str = None,
+                        rows: int = 3) -> dict:
+        props = {"model": model, "label": label, "rows": rows}
+        if placeholder is not None:
+            props["placeholder"] = placeholder
+        if hint:
+            props["hint"] = hint
+        return {"component": "VTextarea", "props": props}
+
+    @staticmethod
+    def __form_select(model: str, label: str, items: List[dict], hint: str = None) -> dict:
+        props = {"model": model, "label": label, "items": items}
+        if hint:
+            props["hint"] = hint
+        return {"component": "VSelect", "props": props}
+
+    @staticmethod
+    def __form_card(title: str, subtitle: str, content: List[dict]) -> dict:
+        card_content = [{"component": "VCardTitle", "text": title}]
+        if subtitle:
+            card_content.append({"component": "VCardSubtitle", "text": subtitle})
+        card_content.append({"component": "VCardText", "content": content})
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-3"},
+            "content": card_content,
+        }
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        run_settings = self.__form_card("运行设置", "控制扫描入口和后台任务队列", [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(self.__form_switch("enabled", "启用插件", color="primary"), md=3),
+                    self.__form_col(self.__form_switch("auto_scan_enabled", "定时扫描媒体路径"), md=3),
+                    self.__form_col(self.__form_switch("listen_transfer_event", "媒体入库自动执行"), md=3),
+                    self.__form_col(self.__form_switch("send_notify", "发送通知"), md=3),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_textarea(
+                            "path_list",
+                            "媒体路径",
+                            "绝对路径，每行一个。支持文件和文件夹",
+                            "手动扫描和定时扫描共用这些路径",
+                            rows=4,
+                        ),
+                        md=8,
+                    ),
+                    self.__form_col(
+                        [
+                            self.__form_text(
+                                "auto_scan_cron",
+                                "扫描周期",
+                                "*/10 * * * *",
+                                "默认每10分钟扫描一次",
+                            ),
+                            self.__form_text(
+                                "integrity_retry_minutes",
+                                "不完整重试分钟",
+                                "10",
+                                "文件未完整时等待后重新检查",
+                            ),
+                        ],
+                        md=4,
+                    ),
+                ],
+            },
+        ])
+
+        process_settings = self.__form_card("处理策略", "控制字幕来源、任务并行和翻译批次", [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(self.__form_switch("enable_asr", "允许从音轨生成字幕"), md=3),
+                    self.__form_col(self.__form_switch("translate_zh", "翻译成中文"), md=3),
+                    self.__form_col(
+                        self.__form_select(
+                            "translate_preference",
+                            "字幕源偏好",
+                            [
+                                {"title": "英文优先", "value": "english_first"},
+                                {"title": "仅英文", "value": "english_only"},
+                                {"title": "原音优先", "value": "origin_first"},
+                            ],
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(self.__form_switch("auto_detect_language", "ASR自动检测语言"), md=3),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "parallel_tasks",
+                            "并行任务数",
+                            "1",
+                            "同一时间处理的视频数量，范围1-3",
+                        ),
+                        md=4,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "translate_concurrency",
+                            "翻译接口并发数",
+                            "1",
+                            "同一时间发起的翻译请求数量，范围1-3",
+                        ),
+                        md=4,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "batch_size",
+                            "每批翻译行数",
+                            "20",
+                            "建议20-25；接口稳定时再提高",
+                        ),
+                        md=4,
+                    ),
+                ],
+            },
+        ])
+
+        api_settings = self.__form_card("接口设置", "复用私有版配置，或为当前插件单独配置接口", [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_switch(
+                            "reuse_autosub_config",
+                            "复用私有版接口配置",
+                            "关闭后使用当前插件填写的接口地址、密钥和模型",
+                            color="primary",
+                        ),
+                        md=4,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_api_model",
+                            "ASR模型",
+                            "whisper-1",
+                            "需要支持 verbose_json 和 segments",
+                        ),
+                        md=4,
+                    ),
+                    self.__form_col(
+                        self.__form_text("openai_model", "翻译模型", "gpt-4o-mini",
+                                         props={"v-show": "!reuse_autosub_config"}),
+                        md=4,
+                    ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "props": {"v-show": "!reuse_autosub_config"},
+                "content": [
+                    self.__form_col(self.__form_text("openai_url", "接口地址", "https://api.openai.com"), md=4),
+                    self.__form_col(self.__form_text("openai_key", "API密钥", "sk-xxx"), md=4),
+                    self.__form_col(
+                        [
+                            self.__form_switch("openai_proxy", "使用代理服务器"),
+                            self.__form_switch("compatible", "兼容模式"),
+                        ],
+                        md=4,
+                    ),
+                ],
+            },
+        ])
+
+        advanced_settings = {
+            "component": "VExpansionPanels",
+            "props": {"variant": "accordion"},
+            "content": [
+                {
+                    "component": "VExpansionPanel",
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": "高级设置"},
+                        {
+                            "component": "VExpansionPanelText",
+                            "content": [
+                                {
+                                    "component": "VRow",
+                                    "content": [
+                                        self.__form_col(
+                                            self.__form_text(
+                                                "asr_chunk_minutes",
+                                                "音频分段分钟",
+                                                "10",
+                                                "分段上传，降低单次ASR超时风险",
+                                            ),
+                                            md=4,
+                                        ),
+                                        self.__form_col(
+                                            self.__form_text("context_window", "上下文窗口", "5"),
+                                            md=4,
+                                        ),
+                                        self.__form_col(
+                                            self.__form_text("max_retries", "接口重试次数", "3"),
+                                            md=4,
+                                        ),
+                                        self.__form_col(
+                                            self.__form_switch(
+                                                "enable_merge",
+                                                "翻译英文时合并整句",
+                                                "仅英文字幕需要时开启",
+                                            ),
+                                            md=4,
+                                        ),
+                                        self.__form_col(
+                                            self.__form_switch(
+                                                "full_integrity_check",
+                                                "完整解码校验",
+                                                "高CPU，仅排查视频损坏时开启",
+                                            ),
+                                            md=4,
+                                        ),
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    run_settings,
+                    process_settings,
+                    api_settings,
+                    advanced_settings,
+                ],
+            }
+        ], {
+            "enabled": False,
+            "clear_history": False,
+            "send_notify": False,
+            "retry_failed_once": False,
+            "listen_transfer_event": True,
+            "run_now": False,
+            "path_list": "",
+            "auto_scan_enabled": True,
+            "auto_scan_cron": "*/10 * * * *",
+            "integrity_retry_minutes": 10,
+            "parallel_tasks": 1,
+            "translate_concurrency": 1,
+            "full_integrity_check": False,
+            "translate_preference": "english_first",
+            "translate_zh": True,
+            "enable_asr": True,
+            "auto_detect_language": True,
+            "reuse_autosub_config": True,
+            "asr_api_model": "whisper-1",
+            "asr_chunk_minutes": 10,
+            "use_chatgpt": False,
+            "openai_proxy": False,
+            "compatible": False,
+            "openai_url": "https://api.openai.com",
+            "openai_key": None,
+            "openai_model": "gpt-4o-mini",
+            "context_window": 5,
+            "max_retries": 3,
+            "enable_merge": False,
+            "enable_batch": True,
+            "batch_size": 20,
+        }
+
+    def __legacy_get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
@@ -3012,7 +3334,100 @@ class AutoSubRemoteAsr(_PluginBase):
         }
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return [
+            {
+                "path": "/scan",
+                "endpoint": self.api_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "后台扫描媒体路径",
+                "description": "按当前媒体路径配置在后台扫描新任务。",
+            },
+            {
+                "path": "/retry_failed",
+                "endpoint": self.api_retry_failed,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "重试失败任务",
+                "description": "将失败任务重新加入处理队列。",
+            },
+            {
+                "path": "/clear_completed",
+                "endpoint": self.api_clear_completed,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清理已完成任务",
+                "description": "清理已完成和已忽略任务记录。",
+            },
+            {
+                "path": "/clear_history",
+                "endpoint": self.api_clear_history,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清理历史任务",
+                "description": "清理已完成、已忽略和失败任务记录，保留等待中和处理中任务。",
+            },
+        ]
+
+    def __start_manual_scan(self) -> bool:
+        self.__ensure_runtime_state()
+        with self._auto_scan_lock:
+            if self._auto_scan_thread and self._auto_scan_thread.is_alive():
+                return False
+            thread = threading.Thread(
+                target=self.__manual_scan_worker,
+                name="autosubremoteasr-manual-scan",
+                daemon=True,
+            )
+            self._auto_scan_thread = thread
+            thread.start()
+            return True
+
+    def __manual_scan_worker(self):
+        logger.info(f"AI字幕手动后台扫描开始，路径数：{len(self._path_list or [])}")
+        self._run_at_once(path_list=self._path_list or [])
+
+    def api_scan(self) -> schemas.Response:
+        self.__ensure_runtime_state()
+        if not self._enabled:
+            return schemas.Response(success=False, message="插件未启用")
+        if not self._running or not self._task_queue:
+            return schemas.Response(success=False, message="任务队列未启动")
+        if not self._path_list:
+            return schemas.Response(success=False, message="未配置媒体路径")
+        if not self.__start_manual_scan():
+            return schemas.Response(success=False, message="扫描任务已在后台运行")
+        return schemas.Response(success=True, message="已开始后台扫描")
+
+    def api_retry_failed(self) -> schemas.Response:
+        count = self.retry_failed_tasks_once()
+        return schemas.Response(success=True, message=f"已重新加入 {count} 个失败任务")
+
+    def __clear_tasks_by_status(self, statuses: List[TaskStatus]) -> int:
+        self.__ensure_runtime_state()
+        status_set = set(statuses)
+        with self._tasks_lock:
+            tasks = self._tasks or {}
+            before = len(tasks)
+            self._tasks = {
+                task_id: task
+                for task_id, task in tasks.items()
+                if task.status not in status_set
+            }
+            removed = before - len(self._tasks)
+            if removed:
+                self.save_tasks()
+        return removed
+
+    def api_clear_completed(self) -> schemas.Response:
+        removed = self.__clear_tasks_by_status([TaskStatus.COMPLETED, TaskStatus.IGNORED])
+        return schemas.Response(success=True, message=f"已清理 {removed} 条已完成/已忽略记录")
+
+    def api_clear_history(self) -> schemas.Response:
+        before = len(self._tasks or {})
+        self.clear_tasks()
+        after = len(self._tasks or {})
+        return schemas.Response(success=True, message=f"已清理 {max(0, before - after)} 条历史记录")
 
     @staticmethod
     def get_dashboard_meta() -> Optional[List[Dict[str, str]]]:
@@ -3060,7 +3475,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 "refresh": 2,
                 "border": True,
                 "title": "AI字幕任务进度",
-                "subtitle": f"队列 {counts.get(TaskStatus.PENDING, 0)} · 处理中 {counts.get(TaskStatus.IN_PROGRESS, 0)}",
+                "subtitle": f"队列 {counts.get(TaskStatus.PENDING, 0)} · 处理中 {counts.get(TaskStatus.IN_PROGRESS, 0)} · 翻译并发 {self._translate_concurrency}",
             },
             elements
         )
@@ -3092,6 +3507,27 @@ class AutoSubRemoteAsr(_PluginBase):
                 }
             ]
         }
+
+    @staticmethod
+    def __task_update_age_seconds(task: TaskItem) -> Optional[int]:
+        if not task or not task.progress_updated:
+            return None
+        try:
+            return max(0, int((datetime.now() - task.progress_updated).total_seconds()))
+        except Exception:
+            return None
+
+    @classmethod
+    def __task_waiting_hint(cls, task: TaskItem) -> Optional[str]:
+        age = cls.__task_update_age_seconds(task)
+        if age is None or age < 180 or task.status != TaskStatus.IN_PROGRESS:
+            return None
+        minutes = max(1, age // 60)
+        if task.progress_stage and "翻译" in task.progress_stage:
+            return f"接口等待约 {minutes} 分钟"
+        if task.progress_stage and "ASR" in task.progress_stage:
+            return f"ASR接口等待约 {minutes} 分钟"
+        return f"超过 {minutes} 分钟未更新"
 
     def __dashboard_task_list(self, tasks: List[TaskItem]) -> dict:
         if not tasks:
@@ -3126,6 +3562,9 @@ class AutoSubRemoteAsr(_PluginBase):
                 detail_parts.append(task.progress_stage)
             if task.progress_detail:
                 detail_parts.append(task.progress_detail[:80])
+            waiting_hint = self.__task_waiting_hint(task)
+            if waiting_hint:
+                detail_parts.append(waiting_hint)
             items.append({
                 "component": "div",
                 "props": {"class": "py-2"},
@@ -3172,7 +3611,318 @@ class AutoSubRemoteAsr(_PluginBase):
             "content": items
         }
 
+    @staticmethod
+    def __page_action_button(text: str, icon: str, color: str, api: str) -> dict:
+        return {
+            "component": "VBtn",
+            "props": {
+                "variant": "tonal",
+                "color": color,
+                "prepend-icon": icon,
+                "size": "small",
+                "class": "mr-2 mb-2",
+            },
+            "text": text,
+            "events": {
+                "click": {
+                    "api": api,
+                    "method": "post",
+                }
+            },
+        }
+
+    @staticmethod
+    def __status_label(status: TaskStatus) -> str:
+        return {
+            TaskStatus.PENDING: "等待中",
+            TaskStatus.IN_PROGRESS: "处理中",
+            TaskStatus.WAITING_FILE: "等待文件",
+            TaskStatus.COMPLETED: "已完成",
+            TaskStatus.IGNORED: "已忽略",
+            TaskStatus.FAILED: "失败",
+        }.get(status, str(status))
+
+    @staticmethod
+    def __status_color(status: TaskStatus) -> str:
+        return {
+            TaskStatus.PENDING: "info",
+            TaskStatus.IN_PROGRESS: "warning",
+            TaskStatus.WAITING_FILE: "info",
+            TaskStatus.COMPLETED: "success",
+            TaskStatus.IGNORED: "grey",
+            TaskStatus.FAILED: "error",
+        }.get(status, "info")
+
+    @staticmethod
+    def __format_time(value: Optional[datetime]) -> str:
+        return value.strftime("%Y-%m-%d %H:%M:%S") if value else "-"
+
+    @staticmethod
+    def __task_source_label(source: TaskSource) -> str:
+        return {
+            TaskSource.MANUAL: "手动添加",
+            TaskSource.EVENT: "入库触发",
+            TaskSource.AUTO_SCAN: "定时扫描",
+        }.get(source, str(source))
+
+    def __page_metric(self, title: str, value: int, color: str) -> dict:
+        return {
+            "component": "VCol",
+            "props": {"cols": 6, "md": 2},
+            "content": [
+                {
+                    "component": "VSheet",
+                    "props": {"class": "pa-3 rounded border", "color": "transparent"},
+                    "content": [
+                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": title},
+                        {"component": "div", "props": {"class": f"text-h6 text-{color}"}, "text": str(value)},
+                    ],
+                }
+            ],
+        }
+
+    def __progress_block(self, task: TaskItem) -> List[dict]:
+        progress = self.__clip_progress(task.progress)
+        color = self.__status_color(task.status)
+        detail_parts = [task.progress_stage or self.__status_label(task.status)]
+        if task.progress_detail and task.progress_detail not in detail_parts:
+            detail_parts.append(task.progress_detail)
+        waiting_hint = self.__task_waiting_hint(task)
+        if waiting_hint:
+            detail_parts.append(waiting_hint)
+        if task.progress_updated:
+            detail_parts.append(f"更新 {task.progress_updated.strftime('%H:%M:%S')}")
+        return [
+            {
+                "component": "div",
+                "props": {"class": "d-flex align-center", "style": "gap:8px;min-width:180px"},
+                "content": [
+                    {
+                        "component": "VProgressLinear",
+                        "props": {
+                            "model-value": progress,
+                            "height": 8,
+                            "rounded": True,
+                            "color": color,
+                            "style": "min-width:120px;max-width:180px",
+                        },
+                    },
+                    {"component": "span", "props": {"class": "text-caption text-no-wrap"}, "text": f"{progress:.1f}%"},
+                ],
+            },
+            {
+                "component": "div",
+                "props": {"class": "text-caption text-medium-emphasis mt-1", "style": "max-width:420px;white-space:normal"},
+                "text": " · ".join(detail_parts),
+            },
+        ]
+
+    def __processing_task_card(self, task: TaskItem) -> dict:
+        filename = os.path.basename(task.video_file) or task.video_file
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 4},
+            "content": [
+                {
+                    "component": "VSheet",
+                    "props": {"class": "pa-3 rounded border", "color": "transparent"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-center justify-space-between ga-2"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-body-2 font-weight-medium text-truncate"},
+                                    "text": filename,
+                                },
+                                {
+                                    "component": "VChip",
+                                    "props": {"size": "small", "color": "warning", "variant": "tonal"},
+                                    "text": "处理中",
+                                },
+                            ],
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption text-medium-emphasis text-truncate mt-1"},
+                            "text": task.video_file,
+                        },
+                        {"component": "div", "props": {"class": "mt-3"}, "content": self.__progress_block(task)},
+                    ],
+                }
+            ],
+        }
+
     def get_page(self) -> List[dict]:
+        tasks = sorted(
+            self.load_tasks().values(),
+            key=lambda item: item.add_time,
+            reverse=True,
+        )
+        counts = {status: 0 for status in TaskStatus}
+        for task in tasks:
+            counts[task.status] = counts.get(task.status, 0) + 1
+
+        processing_tasks = [task for task in tasks if task.status == TaskStatus.IN_PROGRESS]
+        latest_update = None
+        for task in tasks:
+            for value in (task.progress_updated, task.complete_time, task.add_time):
+                if value and (not latest_update or value > latest_update):
+                    latest_update = value
+
+        action_row = {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        self.__page_action_button("立即扫描", "mdi-playlist-plus", "primary",
+                                                  "plugin/AutoSubRemoteAsr/scan"),
+                        self.__page_action_button("重试失败", "mdi-reload", "warning",
+                                                  "plugin/AutoSubRemoteAsr/retry_failed"),
+                        self.__page_action_button("清理已完成", "mdi-check-circle-outline", "secondary",
+                                                  "plugin/AutoSubRemoteAsr/clear_completed"),
+                        self.__page_action_button("清理历史", "mdi-delete-sweep-outline", "error",
+                                                  "plugin/AutoSubRemoteAsr/clear_history"),
+                    ],
+                }
+            ],
+        }
+
+        summary = {
+            "component": "VRow",
+            "content": [
+                self.__page_metric("处理中", counts.get(TaskStatus.IN_PROGRESS, 0), "warning"),
+                self.__page_metric("等待中", counts.get(TaskStatus.PENDING, 0), "info"),
+                self.__page_metric("等待文件", counts.get(TaskStatus.WAITING_FILE, 0), "info"),
+                self.__page_metric("失败", counts.get(TaskStatus.FAILED, 0), "error"),
+                self.__page_metric("已完成", counts.get(TaskStatus.COMPLETED, 0), "success"),
+                self.__page_metric("已忽略", counts.get(TaskStatus.IGNORED, 0), "grey"),
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {
+                            "component": "VAlert",
+                            "props": {"type": "info", "variant": "tonal", "density": "compact"},
+                            "text": f"最近任务更新时间：{self.__format_time(latest_update)}；"
+                                    f"任务并行 {self._parallel_tasks}，翻译接口并发 {self._translate_concurrency}，"
+                                    f"每批 {self._batch_size} 行",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        processing_section = {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium mb-2"}, "text": "正在处理"}
+                    ],
+                },
+                *([self.__processing_task_card(task) for task in processing_tasks] or [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VAlert",
+                                "props": {"type": "info", "variant": "tonal", "density": "compact"},
+                                "text": "暂无正在处理任务",
+                            }
+                        ],
+                    }
+                ]),
+            ],
+        }
+
+        rows = []
+        for task in tasks[:200]:
+            filename = os.path.basename(task.video_file) or task.video_file
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {
+                        "component": "td",
+                        "content": [
+                            {"component": "div", "props": {"class": "text-body-2 font-weight-medium"}, "text": filename},
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis", "style": "max-width:520px;white-space:normal"},
+                                "text": task.video_file,
+                            },
+                        ],
+                    },
+                    {"component": "td", "text": self.__task_source_label(task.source)},
+                    {
+                        "component": "td",
+                        "content": [
+                            {
+                                "component": "VChip",
+                                "props": {
+                                    "size": "small",
+                                    "variant": "tonal",
+                                    "color": self.__status_color(task.status),
+                                },
+                                "text": self.__status_label(task.status),
+                            }
+                        ],
+                    },
+                    {"component": "td", "content": self.__progress_block(task)},
+                    {
+                        "component": "td",
+                        "content": [
+                            {"component": "div", "props": {"class": "text-caption"}, "text": f"添加 {self.__format_time(task.add_time)}"},
+                            {"component": "div", "props": {"class": "text-caption"}, "text": f"完成 {self.__format_time(task.complete_time)}"},
+                        ],
+                    },
+                ],
+            })
+
+        task_table = {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium mb-2"}, "text": "任务记录"},
+                        {
+                            "component": "VTable",
+                            "props": {"hover": True, "density": "comfortable"},
+                            "content": [
+                                {
+                                    "component": "thead",
+                                    "content": [
+                                        {
+                                            "component": "tr",
+                                            "content": [
+                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "文件"},
+                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "来源"},
+                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "状态"},
+                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "进度"},
+                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "时间"},
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {"component": "tbody", "content": rows},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        return [action_row, summary, processing_section, task_table]
+
+    def __legacy_get_page(self) -> List[dict]:
         # 加载任务并按添加时间倒序排列
         tasks: Dict[str, TaskItem] = self.load_tasks()
         sorted_tasks = sorted(
