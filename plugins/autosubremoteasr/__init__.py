@@ -78,7 +78,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1062,7 +1062,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 task,
                 base_progress,
                 "提取并识别音频",
-                f"第 {chunk_no}/{expected_chunks or '?'} 段上传ASR中，已等待 {elapsed} 秒"
+                f"第 {chunk_no}/{expected_chunks or '?'} 段上传ASR中，已等待 {elapsed} 秒",
+                force=True
             )
             thread.join(timeout=2)
 
