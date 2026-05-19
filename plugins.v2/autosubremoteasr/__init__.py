@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.19"
+    plugin_version = "1.0.20"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -503,6 +503,12 @@ class AutoSubRemoteAsr(_PluginBase):
                     updated = task.progress_updated or task.add_time or now
                     stale = (now - updated).total_seconds() >= stale_seconds
                     if task.task_id not in current_ids or stale:
+                        self._current_processing_tasks.pop(task.task_id, None)
+                        if self._current_processing_task and self._current_processing_task.task_id == task.task_id:
+                            self._current_processing_task = None
+                        self._queued_task_ids.discard(task.task_id)
+                        current_ids.discard(task.task_id)
+                        queued_ids.discard(task.task_id)
                         task.status = TaskStatus.PENDING
                         task.complete_time = None
                         task.progress_stage = "等待重新处理"
@@ -511,8 +517,14 @@ class AutoSubRemoteAsr(_PluginBase):
                         self._tasks[task.task_id] = task
                         repair_tasks.append(task)
                         changed = True
-                elif task.status == TaskStatus.PENDING and task.task_id not in current_ids and task.task_id not in queued_ids:
-                    repair_tasks.append(task)
+                elif task.status == TaskStatus.PENDING:
+                    if task.task_id in current_ids:
+                        self._current_processing_tasks.pop(task.task_id, None)
+                        if self._current_processing_task and self._current_processing_task.task_id == task.task_id:
+                            self._current_processing_task = None
+                        current_ids.discard(task.task_id)
+                    if task.task_id not in queued_ids:
+                        repair_tasks.append(task)
             if changed:
                 self.save_tasks()
 
