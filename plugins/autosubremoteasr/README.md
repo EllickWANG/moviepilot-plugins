@@ -62,7 +62,7 @@
 | 兼容模式 | 是否避免自动拼接 `/v1` | 否 |
 | OpenAI API URL | 接口地址 | `https://api.openai.com` |
 | API密钥 | 接口密钥 | 空 |
-| 翻译模型 | 翻译中文字幕使用的大模型 | `gpt-4o-mini` |
+| 翻译模型 | 翻译中文字幕使用的大模型 | `gpt-5-chat-latest` |
 
 ### 翻译参数
 

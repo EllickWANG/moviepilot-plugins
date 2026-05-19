@@ -103,7 +103,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.27"
+    plugin_version = "1.0.28"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2850,7 +2850,7 @@ class AutoSubRemoteAsr(_PluginBase):
                         md=4,
                     ),
                     self.__form_col(
-                        self.__form_text("openai_model", "翻译模型", "gpt-4o-mini",
+                        self.__form_text("openai_model", "翻译模型", "gpt-5-chat-latest",
                                          props={"v-show": "!reuse_autosub_config"}),
                         md=4,
                     ),
@@ -2990,7 +2990,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "compatible": False,
             "openai_url": "https://api.openai.com",
             "openai_key": None,
-            "openai_model": "gpt-4o-mini",
+            "openai_model": "gpt-5-chat-latest",
             "context_window": 5,
             "max_retries": 3,
             "enable_merge": False,
@@ -3438,7 +3438,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                                                 'props': {
                                                                     'model': 'openai_model',
                                                                     'label': '翻译模型',
-                                                                    'placeholder': 'gpt-4o-mini',
+                                                                    'placeholder': 'gpt-5-chat-latest',
                                                                     'v-show': '!reuse_autosub_config'
                                                                 }
                                                             }
@@ -3610,7 +3610,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "compatible": False,
             "openai_url": "https://api.openai.com",
             "openai_key": None,
-            "openai_model": "gpt-4o-mini",
+            "openai_model": "gpt-5-chat-latest",
             "context_window": 5,
             "max_retries": 3,
             "enable_merge": False,
