@@ -81,7 +81,7 @@ class AutoSubv2Gpu(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.7.5"
+    plugin_version = "2.7.6"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -883,6 +883,7 @@ class AutoSubv2Gpu(_PluginBase):
             command,
             capture_output=True,
             text=True,
+            env=self.__openvino_subprocess_env(),
             timeout=self._external_asr_timeout,
             check=False,
         )
@@ -1046,6 +1047,7 @@ if not payload["success"]:
                 [sys.executable, "-c", script],
                 capture_output=True,
                 text=True,
+                env=AutoSubv2Gpu.__openvino_subprocess_env(),
                 timeout=20,
                 check=False,
             )
@@ -1057,6 +1059,12 @@ if not payload["success"]:
             return json.loads(completed.stdout.strip() or "[]")
         except Exception as err:
             return [f"openvino_device_probe_error: {type(err).__name__}: {err}"]
+
+    @staticmethod
+    def __openvino_subprocess_env() -> Dict[str, str]:
+        env = os.environ.copy()
+        env.pop("LD_PRELOAD", None)
+        return env
 
     @staticmethod
     def __probe_python_package_versions_safe() -> Dict[str, str]:
