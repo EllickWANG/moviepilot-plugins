@@ -1,9 +1,11 @@
 import copy
 import importlib.util
+import json
 import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -78,7 +80,7 @@ class AutoSubv2Gpu(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.7.0"
+    plugin_version = "2.7.1"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -373,9 +375,7 @@ class AutoSubv2Gpu(_PluginBase):
 
     def __check_asr(self):
         if self._asr_backend == 'openvino_genai':
-            try:
-                import openvino_genai  # noqa
-            except ImportError:
+            if not importlib.util.find_spec("openvino_genai"):
                 logger.warn(f"openvino-genai 未安装，不进行处理")
                 return False
             model_path = self.__prepare_openvino_model()
@@ -468,32 +468,27 @@ class AutoSubv2Gpu(_PluginBase):
     def __do_openvino_genai_recognition(self, audio_lang, audio_file):
         lang = audio_lang or 'auto'
         try:
-            import openvino_genai as ov_genai
-
             model_path = self.__prepare_openvino_model()
             if not model_path:
                 return False, None
+            result = self.__run_openvino_genai_worker(
+                audio_file=audio_file,
+                model_path=model_path,
+                lang=lang,
+            )
+            if not result.get("success"):
+                logger.error(f"OpenVINO GenAI 子进程失败：{result.get('message') or result}")
+                return False, None
 
-            raw_speech = self.__read_wav_16k_mono(audio_file)
-            logger.info(f"开始使用 OpenVINO GenAI 生成字幕：device={self._openvino_device}, model={model_path}")
-            pipe = ov_genai.WhisperPipeline(str(model_path), self._openvino_device)
-            kwargs = {
-                "return_timestamps": True,
-                "max_new_tokens": self._openvino_max_new_tokens,
-            }
-            language_token = self.__openvino_language_token(lang)
-            if language_token:
-                kwargs["language"] = language_token
-            result = pipe.generate(raw_speech, **kwargs)
-            detected_lang = str(getattr(result, "language", "") or "").strip()
+            detected_lang = str(result.get("language") or "").strip()
             if lang == 'auto':
                 lang = detected_lang or self._external_asr_default_language or 'und'
 
-            subs = self.__openvino_result_to_subtitles(result)
+            subs = self.__openvino_payload_to_subtitles(result)
             if not subs:
-                text = self.__openvino_result_text(result).strip()
+                text = str(result.get("text") or "").strip()
                 if text:
-                    duration = max(self.__wav_duration(audio_file), 1.0)
+                    duration = max(float(result.get("duration") or 0), self.__wav_duration(audio_file), 1.0)
                     subs = [srt.Subtitle(
                         index=1,
                         start=timedelta(seconds=0),
@@ -506,9 +501,6 @@ class AutoSubv2Gpu(_PluginBase):
             self.__save_srt(f"{audio_file}.srt", subs)
             logger.info(f"OpenVINO GenAI 音轨转字幕完成，语言：{lang}，字幕条目：{len(subs)}")
             return True, lang
-        except ImportError:
-            logger.warn(f"openvino-genai 未安装，不进行处理")
-            return False, None
         except Exception as e:
             logger.error(f"OpenVINO GenAI 处理异常：{e}")
             logger.error(traceback.format_exc())
@@ -840,15 +832,17 @@ class AutoSubv2Gpu(_PluginBase):
         return f"<|{normalized}|>"
 
     @staticmethod
-    def __openvino_result_to_subtitles(result) -> List[srt.Subtitle]:
-        chunks = getattr(result, "chunks", None) or []
+    def __openvino_payload_to_subtitles(payload: Dict[str, Any]) -> List[srt.Subtitle]:
+        chunks = payload.get("chunks") if isinstance(payload.get("chunks"), list) else []
         subtitles = []
         for index, chunk in enumerate(chunks, start=1):
-            text = str(getattr(chunk, "text", "") or "").strip()
+            if not isinstance(chunk, dict):
+                continue
+            text = str(chunk.get("text") or "").strip()
             if not text:
                 continue
-            start = float(getattr(chunk, "start_ts", 0) or 0)
-            end = float(getattr(chunk, "end_ts", start) or start)
+            start = float(chunk.get("start") or 0)
+            end = float(chunk.get("end") or start)
             if end <= start:
                 end = start + 0.1
             subtitles.append(srt.Subtitle(
@@ -859,28 +853,136 @@ class AutoSubv2Gpu(_PluginBase):
             ))
         return subtitles
 
+    def __run_openvino_genai_worker(self, audio_file: str, model_path: Path, lang: str) -> Dict[str, Any]:
+        language_token = self.__openvino_language_token(lang)
+        output_json = f"{audio_file}.openvino.json"
+        if os.path.exists(output_json):
+            os.remove(output_json)
+        command = [
+            sys.executable,
+            "-c",
+            self.__openvino_worker_script(),
+            str(model_path),
+            str(audio_file),
+            str(output_json),
+            str(self._openvino_device),
+            str(self._openvino_max_new_tokens),
+            language_token,
+        ]
+        started = time.time()
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=self._external_asr_timeout,
+            check=False,
+        )
+        output = "\n".join(
+            item for item in [completed.stdout.strip(), completed.stderr.strip()] if item
+        ).strip()
+        if completed.returncode != 0:
+            return {
+                "success": False,
+                "message": f"退出码 {completed.returncode}: {self.__clip_log(output, 3000)}",
+                "duration": round(time.time() - started, 2),
+            }
+        if not os.path.exists(output_json):
+            return {
+                "success": False,
+                "message": f"子进程未生成结果文件: {self.__clip_log(output, 3000)}",
+                "duration": round(time.time() - started, 2),
+            }
+        try:
+            with open(output_json, 'r', encoding='utf-8') as file_obj:
+                payload = json.load(file_obj)
+            payload["duration"] = round(time.time() - started, 2)
+            if output and not payload.get("worker_output"):
+                payload["worker_output"] = self.__clip_log(output, 3000)
+            return payload
+        finally:
+            try:
+                os.remove(output_json)
+            except Exception:
+                pass
+
     @staticmethod
-    def __openvino_result_text(result) -> str:
-        for attr in ("text", "m_text"):
-            value = getattr(result, attr, None)
-            if value:
-                return str(value)
-        texts = getattr(result, "texts", None)
-        if isinstance(texts, list) and texts:
-            return str(texts[0])
-        return str(result or "")
+    def __openvino_worker_script() -> str:
+        return r'''
+import array
+import json
+import sys
+import traceback
+import wave
+
+
+def read_wav_16k_mono(file_path):
+    with wave.open(file_path, "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+    if channels != 1 or sample_width != 2 or sample_rate != 16000:
+        raise ValueError(
+            f"need 16kHz/16-bit/mono WAV, got {sample_rate}Hz/{sample_width * 8}bit/{channels}ch"
+        )
+    samples = array.array("h")
+    samples.frombytes(frames)
+    return [max(-1.0, min(1.0, sample / 32768.0)) for sample in samples], len(samples) / sample_rate
+
+
+def result_text(result):
+    for attr in ("text", "m_text"):
+        value = getattr(result, attr, None)
+        if value:
+            return str(value)
+    texts = getattr(result, "texts", None)
+    if isinstance(texts, list) and texts:
+        return str(texts[0])
+    return str(result or "")
+
+
+model_path, audio_file, output_json, device, max_new_tokens, language_token = sys.argv[1:7]
+payload = {"success": False, "message": "", "language": "", "text": "", "chunks": []}
+try:
+    import openvino_genai as ov_genai
+
+    raw_speech, duration = read_wav_16k_mono(audio_file)
+    pipe = ov_genai.WhisperPipeline(model_path, device)
+    kwargs = {"return_timestamps": True, "max_new_tokens": int(max_new_tokens or 448)}
+    if language_token:
+        kwargs["language"] = language_token
+    result = pipe.generate(raw_speech, **kwargs)
+    chunks = []
+    for chunk in (getattr(result, "chunks", None) or []):
+        text = str(getattr(chunk, "text", "") or "").strip()
+        if not text:
+            continue
+        chunks.append({
+            "start": float(getattr(chunk, "start_ts", 0) or 0),
+            "end": float(getattr(chunk, "end_ts", 0) or 0),
+            "text": text,
+        })
+    payload.update({
+        "success": True,
+        "message": "ok",
+        "language": str(getattr(result, "language", "") or ""),
+        "text": result_text(result),
+        "chunks": chunks,
+        "duration": duration,
+    })
+except Exception as err:
+    payload.update({"success": False, "message": f"{type(err).__name__}: {err}", "traceback": traceback.format_exc()})
+with open(output_json, "w", encoding="utf-8") as file_obj:
+    json.dump(payload, file_obj, ensure_ascii=False)
+if not payload["success"]:
+    sys.exit(1)
+'''
 
     @staticmethod
     def __probe_asr_runtime() -> Dict[str, Any]:
         openvino_status = "installed" if importlib.util.find_spec("openvino_genai") else "missing"
         hf_status = "installed" if importlib.util.find_spec("huggingface_hub") else "missing"
-        devices = []
-        try:
-            import openvino as ov
-            core = ov.Core()
-            devices = [str(device) for device in core.available_devices]
-        except Exception as err:
-            devices = [f"openvino_device_probe_error: {err}"]
+        devices = AutoSubv2Gpu.__probe_openvino_devices_safe()
         command = (
             "printf 'bins='; "
             "for b in whisper-cli whisper.cpp main whisper; do command -v \"$b\" 2>/dev/null | head -n 1; done; "
@@ -916,6 +1018,33 @@ class AutoSubv2Gpu(_PluginBase):
                 "openvino_devices": devices,
                 "output": str(err),
             }
+
+    @staticmethod
+    def __probe_openvino_devices_safe() -> List[str]:
+        script = (
+            "import json\n"
+            "try:\n"
+            "    import openvino as ov\n"
+            "    print(json.dumps([str(x) for x in ov.Core().available_devices], ensure_ascii=False))\n"
+            "except Exception as err:\n"
+            "    print(json.dumps([f'openvino_device_probe_error: {type(err).__name__}: {err}'], ensure_ascii=False))\n"
+        )
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if completed.returncode != 0:
+                output = "\n".join(
+                    item for item in [completed.stdout.strip(), completed.stderr.strip()] if item
+                ).strip()
+                return [f"openvino_device_probe_exit_{completed.returncode}: {AutoSubv2Gpu.__clip_log(output, 1000)}"]
+            return json.loads(completed.stdout.strip() or "[]")
+        except Exception as err:
+            return [f"openvino_device_probe_error: {type(err).__name__}: {err}"]
 
     @staticmethod
     def __format_external_asr_command(command: str, audio_file: str, output_prefix: str,
