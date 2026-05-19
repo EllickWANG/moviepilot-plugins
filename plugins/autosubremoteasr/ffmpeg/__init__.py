@@ -80,40 +80,19 @@ class Ffmpeg:
                                    duration=duration)
 
     @staticmethod
-    def extract_wav_from_video(video_path, audio_path, audio_index=None, stop_event=None, threads=None):
+    def stream_audio_chunks_from_video(video_path, output_dir, audio_index=None, segment_seconds=600,
+                                       stop_event=None, threads=None, chunk_callback=None):
         """
-        使用ffmpeg从视频文件中提取16000hz, 16-bit的wav格式音频
-        """
-        if not video_path or not audio_path:
-            return False
-
-        # 提取指定音频流
-        if audio_index:
-            command = ['ffmpeg', "-hide_banner", "-loglevel", "warning", "-threads", str(max(1, int(threads or 1))),
-                       '-y', '-i', video_path,
-                       '-map', f'0:a:{audio_index}',
-                       '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', audio_path]
-        else:
-            command = ['ffmpeg', "-hide_banner", "-loglevel", "warning", "-threads", str(max(1, int(threads or 1))),
-                       '-y', '-i', video_path,
-                       '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', audio_path]
-
-        ok, _ = Ffmpeg._run_command(command, stop_event=stop_event)
-        return ok
-
-    @staticmethod
-    def extract_audio_chunks_from_video(video_path, output_dir, audio_index=None, segment_seconds=600,
-                                        stop_event=None, threads=None):
-        """
-        从视频中提取低码率音频分段，用于远程ASR上传。
+        分段提取音频，并在分段文件关闭后回调处理。
+        运行中保留最后一个正在写入的分段，等下一段出现或ffmpeg退出后再处理。
         """
         if not video_path or not output_dir:
-            return False, [], "视频路径或输出目录为空"
+            return False, 0, "视频路径或输出目录为空"
 
         try:
             os.makedirs(output_dir, exist_ok=True)
         except Exception as e:
-            return False, [], str(e)[:1000]
+            return False, 0, str(e)[:1000]
 
         segment_seconds = max(60, int(segment_seconds or 600))
         audio_stream_index = 0 if audio_index is None else int(audio_index)
@@ -131,19 +110,81 @@ class Ffmpeg:
             output_pattern
         ]
 
-        ok, error = Ffmpeg._run_command(command, stop_event=stop_event)
-        if not ok:
-            return False, [], error
+        process = None
+        processed = set()
+        stderr_lines = []
 
-        chunks = sorted(
-            os.path.join(output_dir, file_name)
-            for file_name in os.listdir(output_dir)
-            if file_name.startswith("chunk_") and file_name.endswith(".mp3")
-        )
-        chunks = [chunk for chunk in chunks if os.path.getsize(chunk) > 0]
-        if not chunks:
-            return False, [], "未生成音频分段"
-        return True, chunks, ""
+        def list_chunks():
+            return sorted(
+                os.path.join(output_dir, file_name)
+                for file_name in os.listdir(output_dir)
+                if file_name.startswith("chunk_") and file_name.endswith(".mp3")
+            )
+
+        def handle_ready_chunks(final=False):
+            chunks = [chunk for chunk in list_chunks() if chunk not in processed and os.path.getsize(chunk) > 0]
+            ready_chunks = chunks if final else chunks[:-1]
+            for chunk in ready_chunks:
+                processed.add(chunk)
+                if chunk_callback:
+                    try:
+                        chunk_callback(chunk)
+                    except Exception as e:
+                        raise RuntimeError(f"处理音频分段失败: {e}") from e
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            while True:
+                if stop_event and stop_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                    return False, len(processed), "用户中断当前任务"
+
+                if process.stderr:
+                    readable, _, _ = select.select([process.stderr], [], [], 0.2)
+                    if readable:
+                        line = process.stderr.readline()
+                        if line:
+                            stderr_lines.append(line.strip())
+                            stderr_lines = stderr_lines[-20:]
+
+                ret = process.poll()
+                if ret is None:
+                    handle_ready_chunks(final=False)
+                else:
+                    break
+                time.sleep(0.5)
+
+            if process.stderr:
+                rest = process.stderr.read()
+                if rest:
+                    stderr_lines.extend(line.strip() for line in rest.splitlines() if line.strip())
+                    stderr_lines = stderr_lines[-20:]
+            ret = process.wait()
+            if ret != 0:
+                return False, len(processed), ("\n".join(stderr_lines) or f"ffmpeg退出码：{ret}")[:1000]
+            handle_ready_chunks(final=True)
+            if not processed:
+                return False, 0, "未生成音频分段"
+            return True, len(processed), ""
+        except Exception as e:
+            if process and process.poll() is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            return False, len(processed), str(e)[:1000]
 
     @staticmethod
     def get_video_metadata(video_path, stop_event=None):

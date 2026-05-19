@@ -1,6 +1,8 @@
 import copy
 import inspect
+import math
 import os
+import random
 import tempfile
 import time
 import traceback
@@ -76,7 +78,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -106,6 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _asr_api_model = "whisper-1"
     _asr_chunk_minutes = 10
     _asr_chunk_seconds = 600
+    _asr_random_check_rate = 0.2
     _reuse_autosub_config = True
     _openai_api_key = None
     _openai_api_url = None
@@ -1040,6 +1043,67 @@ class AutoSubRemoteAsr(_PluginBase):
         except Exception:
             return 0.0
 
+    @staticmethod
+    def __get_chunk_no(chunk_file: str) -> int:
+        try:
+            return int(os.path.splitext(os.path.basename(chunk_file))[0].split("_")[-1]) + 1
+        except Exception:
+            return 1
+
+    def __should_check_asr_chunk(self, chunk_no: int, expected_chunks: int) -> bool:
+        if chunk_no == 1 or (expected_chunks and chunk_no >= expected_chunks):
+            return True
+        if expected_chunks and expected_chunks <= 3:
+            return True
+        return random.random() < self._asr_random_check_rate
+
+    def __validate_audio_chunk(self, chunk_file: str, chunk_no: int, expected_chunks: int, force: bool = False):
+        if not os.path.exists(chunk_file):
+            raise RuntimeError(f"音频分段不存在：第 {chunk_no} 段")
+        file_size = os.path.getsize(chunk_file)
+        if file_size <= 128:
+            raise RuntimeError(f"音频分段过小：第 {chunk_no} 段，{file_size} bytes")
+
+        if not force:
+            return
+
+        duration = self.__get_audio_file_duration(chunk_file)
+        if duration <= 0:
+            raise RuntimeError(f"音频分段不可读：第 {chunk_no} 段")
+        logger.info(
+            f"接口ASR随机检查通过：第 {chunk_no}/{expected_chunks or '?'} 段，"
+            f"音频 {round(duration, 2)} 秒，{round(file_size / 1024, 1)} KB"
+        )
+
+    @staticmethod
+    def __validate_asr_response(response: dict, chunk_no: int, expected_chunks: int, checked: bool = False):
+        if not isinstance(response, dict):
+            raise RuntimeError(f"接口ASR响应格式异常：第 {chunk_no} 段")
+        segments = response.get("segments")
+        if segments is not None and not isinstance(segments, list):
+            raise RuntimeError(f"接口ASR segments 格式异常：第 {chunk_no} 段")
+        if not checked:
+            return
+
+        bad_segments = 0
+        last_start = -1.0
+        for segment in segments or []:
+            try:
+                start = float(segment.get("start") or 0)
+                end = float(segment.get("end") or 0)
+            except Exception:
+                bad_segments += 1
+                continue
+            if start < last_start or end <= start:
+                bad_segments += 1
+            last_start = start
+        if bad_segments:
+            raise RuntimeError(f"接口ASR时间轴异常：第 {chunk_no} 段，异常 segments {bad_segments}")
+        logger.info(
+            f"接口ASR随机检查通过：第 {chunk_no}/{expected_chunks or '?'} 段，"
+            f"segments={len(segments or [])}，text={len(response.get('text') or '')}"
+        )
+
     def __append_asr_response_subs(self, subs: List[srt.Subtitle], response: dict, offset: float, chunk_file: str):
         segments = response.get("segments") or []
         for segment in segments:
@@ -1076,36 +1140,66 @@ class AutoSubRemoteAsr(_PluginBase):
             content=text
         ))
 
-    def __do_speech_recognition(self, audio_lang, audio_chunks: List[str], task: Optional[TaskItem] = None):
+    def __do_speech_recognition(self, video_file: str, audio_index: int, audio_lang: str, audio_dir: str,
+                                expected_chunks: int, task: Optional[TaskItem] = None):
         """
-        调用远程语音识别接口生成字幕。
+        流水线调用远程语音识别接口生成字幕。
         :param audio_lang:
-        :param audio_chunks:
         :return:
         """
         lang = audio_lang
         try:
-            if not audio_chunks:
-                logger.error("接口ASR没有可识别的音频分段")
-                return False, None, []
             self.__update_task_progress(task, 34, "接口语音识别",
-                                        f"模型：{self._asr_api_model}，共 {len(audio_chunks)} 段", force=True)
+                                        f"模型：{self._asr_api_model}，预计 {expected_chunks} 段", force=True)
             subs = []
             detected_lang = None
-            for idx, chunk_file in enumerate(audio_chunks, start=1):
+            processed_chunks = 0
+
+            def handle_chunk(chunk_file: str):
+                nonlocal detected_lang, processed_chunks
                 if self._event.is_set():
                     logger.info("接口ASR服务停止")
                     raise UserInterruptException("用户中断当前任务")
-                percent = self.__scale_progress(34, 72, idx - 1, len(audio_chunks))
-                self.__update_task_progress(task, percent, "接口语音识别",
-                                            f"{idx}/{len(audio_chunks)} 段")
+                chunk_no = self.__get_chunk_no(chunk_file)
+                checked = self.__should_check_asr_chunk(chunk_no, expected_chunks)
+                self.__validate_audio_chunk(chunk_file, chunk_no, expected_chunks, force=checked)
+                percent = self.__scale_progress(24, 72, processed_chunks, expected_chunks)
+                self.__update_task_progress(task, percent, "提取并识别音频",
+                                            f"第 {chunk_no}/{expected_chunks or '?'} 段正在上传ASR")
                 response = self.__transcribe_audio_chunk(chunk_file, lang)
+                self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
                 detected_lang = detected_lang or response.get("language")
-                offset = (idx - 1) * self._asr_chunk_seconds
+                offset = (chunk_no - 1) * self._asr_chunk_seconds
                 self.__append_asr_response_subs(subs, response, offset, chunk_file)
-                percent = self.__scale_progress(34, 72, idx, len(audio_chunks))
-                self.__update_task_progress(task, percent, "接口语音识别",
-                                            f"{idx}/{len(audio_chunks)} 段，已识别 {len(subs)} 条")
+                processed_chunks += 1
+                try:
+                    os.remove(chunk_file)
+                except Exception as err:
+                    logger.warn(f"删除临时音频分段失败：{chunk_file} - {err}")
+                percent = self.__scale_progress(24, 72, processed_chunks, expected_chunks)
+                self.__update_task_progress(task, percent, "提取并识别音频",
+                                            f"已处理 {processed_chunks}/{expected_chunks or '?'} 段，"
+                                            f"已识别 {len(subs)} 条")
+
+            ok, chunk_count, error = Ffmpeg().stream_audio_chunks_from_video(
+                video_file,
+                audio_dir,
+                audio_index,
+                segment_seconds=self._asr_chunk_seconds,
+                stop_event=self._event,
+                threads=self._cpu_threads,
+                chunk_callback=handle_chunk
+            )
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            if not ok:
+                logger.error(f"接口ASR音频流水线失败：{error}")
+                if error and not error.startswith("处理音频分段失败"):
+                    self.__mark_waiting_file(task, error or "提取音频失败，可能文件仍未完整")
+                return False, None, []
+            if chunk_count <= 0:
+                logger.error("接口ASR没有可识别的音频分段")
+                return False, None, []
 
             final_lang = self.__normalize_language_code(
                 detected_lang if lang == "auto" else lang,
@@ -1116,6 +1210,8 @@ class AutoSubRemoteAsr(_PluginBase):
             self.__update_task_progress(task, 72, "语音识别完成", f"识别到 {len(subs)} 条字幕", force=True)
             logger.info("接口音轨转字幕完成")
             return True, final_lang, subs
+        except UserInterruptException:
+            raise
         except Exception as e:
             logger.error(f"接口ASR处理异常：{e}")
             logger.error(traceback.format_exc())
@@ -1239,28 +1335,22 @@ class AutoSubRemoteAsr(_PluginBase):
             return False, None, None
 
         with tempfile.TemporaryDirectory(prefix='autosubremoteasr-') as audio_dir:
-            logger.info(f"正在分段提取音频：{audio_dir} ...")
-            self.__update_task_progress(task, 24, "提取音频", f"正在按 {self._asr_chunk_minutes} 分钟分段", force=True)
-            ok, audio_chunks, error = Ffmpeg().extract_audio_chunks_from_video(
-                video_file,
-                audio_dir,
-                audio_index,
-                segment_seconds=self._asr_chunk_seconds,
-                stop_event=self._event,
-                threads=self._cpu_threads
+            duration = self.__get_video_duration(video_meta)
+            expected_chunks = max(1, math.ceil(duration / self._asr_chunk_seconds)) if duration else 0
+            logger.info(
+                f"开始接口ASR流水线，语言 {audio_lang}，模型 {self._asr_api_model}，"
+                f"分段 {self._asr_chunk_minutes} 分钟，预计 {expected_chunks or '?'} 段"
             )
-            if not ok:
-                if self._event.is_set():
-                    raise UserInterruptException("用户中断当前任务")
-                self.__mark_waiting_file(task, error or "提取音频失败，可能文件仍未完整")
-                return False, None, None
-            logger.info(f"提取音频完成，共 {len(audio_chunks)} 段")
-            self.__update_task_progress(task, 30, "提取音频完成",
-                                        f"共 {len(audio_chunks)} 段，准备调用接口ASR", force=True)
-
-            # 生成字幕
-            logger.info(f"开始接口ASR生成字幕, 语言 {audio_lang}, 模型 {self._asr_api_model} ...")
-            ret, lang, subs = self.__do_speech_recognition(audio_lang, audio_chunks, task)
+            self.__update_task_progress(task, 24, "提取并识别音频",
+                                        f"按 {self._asr_chunk_minutes} 分钟分段，生成后立即识别", force=True)
+            ret, lang, subs = self.__do_speech_recognition(
+                video_file,
+                audio_index,
+                audio_lang,
+                audio_dir,
+                expected_chunks,
+                task
+            )
             if ret:
                 logger.info(f"生成字幕成功，原始语言：{lang}")
                 gen_subtitle_path = Path(f"{subtitle_file}.{lang}.srt")
