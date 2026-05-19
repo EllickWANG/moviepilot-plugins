@@ -1,8 +1,10 @@
 import copy
 import inspect
+import json
 import math
 import os
 import random
+import re
 import tempfile
 import time
 import traceback
@@ -88,7 +90,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -112,6 +114,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _scheduled_retry_tasks: Dict[str, float] = None
     _auto_scan_thread = None
     _auto_scan_lock = None
+    _translate_lock = None
     _parallel_tasks = 1
     _cpu_threads = 1
     _full_integrity_check = False
@@ -163,6 +166,8 @@ class AutoSubRemoteAsr(_PluginBase):
             self._scheduled_retry_tasks = {}
         if self._auto_scan_lock is None:
             self._auto_scan_lock = threading.Lock()
+        if self._translate_lock is None:
+            self._translate_lock = threading.Semaphore(1)
 
     @staticmethod
     def __normalize_parallel_tasks(value) -> int:
@@ -1068,7 +1073,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 f"无效路径 {stats['invalid']}，其他跳过 {stats['skipped']}，耗时 {seconds} 秒"
             )
 
-    def __scan_video_file_for_task(self, video_file: str) -> str:
+    def __scan_video_file_for_task(self, video_file: str, source: TaskSource = TaskSource.AUTO_SCAN) -> str:
         now = datetime.now()
         latest_task = self.__find_latest_task_by_video_file(video_file)
         if latest_task:
@@ -1089,19 +1094,38 @@ class AutoSubRemoteAsr(_PluginBase):
         if self.__target_subtitle_exists(video_file):
             return "subtitle_exists"
 
-        return "added" if self.add_task(video_file, TaskSource.AUTO_SCAN) else "skipped"
+        return "added" if self.add_task(video_file, source) else "skipped"
 
     def _run_at_once(self, path_list: List[str]):
-        # 依次处理每个目录
+        stats = {
+            "added": 0,
+            "requeued": 0,
+            "waiting": 0,
+            "active": 0,
+            "done": 0,
+            "subtitle_exists": 0,
+            "failed": 0,
+            "invalid": 0,
+            "skipped": 0,
+        }
         for path in path_list:
             if not os.path.exists(path) or not os.path.isabs(path):
+                stats["invalid"] += 1
                 logger.warn(f"目录/文件无效，不进行处理:{path}")
                 continue
             if os.path.isdir(path):
                 for video_file in self.__get_library_files(path):
-                    self.add_task(video_file, TaskSource.MANUAL)
+                    result = self.__scan_video_file_for_task(video_file, TaskSource.MANUAL)
+                    stats[result] = stats.get(result, 0) + 1
             elif os.path.splitext(path)[-1].lower() in settings.RMT_MEDIAEXT:
-                self.add_task(path, TaskSource.MANUAL)
+                result = self.__scan_video_file_for_task(path, TaskSource.MANUAL)
+                stats[result] = stats.get(result, 0) + 1
+        logger.info(
+            f"AI字幕手动扫描完成：新增 {stats['added']}，重新排队 {stats['requeued']}，"
+            f"等待完整 {stats['waiting']}，已在队列 {stats['active']}，已处理 {stats['done']}，"
+            f"已有字幕 {stats['subtitle_exists']}，失败跳过 {stats['failed']}，"
+            f"无效路径 {stats['invalid']}，其他跳过 {stats['skipped']}"
+        )
 
     def __check_asr(self):
         if not self._openai_api_key:
@@ -1977,31 +2001,157 @@ class AutoSubRemoteAsr(_PluginBase):
     def __translate_to_zh(self, text: str, context: str = None) -> str:
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
-        return self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
+        with self._translate_lock:
+            ret = self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+        return ret
+
+    def __translate_subtitle_items_to_zh(self, items: List[dict], context: str = None):
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+        with self._translate_lock:
+            ret = self._openai.translate_subtitle_items_to_zh(items, context, max_retries=self._max_retries)
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+        return ret
+
+    @staticmethod
+    def __clean_json_response(text: str) -> str:
+        text = (text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        return text
+
+    @classmethod
+    def __load_json_response(cls, text: str):
+        text = cls.__clean_json_response(text)
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        candidates = []
+        for start_char, end_char in [("{", "}"), ("[", "]")]:
+            start = text.find(start_char)
+            end = text.rfind(end_char)
+            if start >= 0 and end > start:
+                candidates.append(text[start:end + 1])
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except Exception:
+                continue
+        raise ValueError("模型未返回可解析的JSON")
+
+    @staticmethod
+    def __parse_numbered_translation_lines(text: str, expected_count: int) -> List[str]:
+        translations = {}
+        for line in (text or "").splitlines():
+            match = re.match(r"^\s*(\d+)\s*[\.\):：、-]\s*(.+?)\s*$", line)
+            if not match:
+                continue
+            index = int(match.group(1))
+            if 1 <= index <= expected_count:
+                translations[index] = match.group(2).strip()
+        if len(translations) != expected_count:
+            raise ValueError(f"编号行数不匹配 {len(translations)}/{expected_count}")
+        return [translations[index] for index in range(1, expected_count + 1)]
+
+    def __parse_batch_translation_response(self, result: str, expected_count: int) -> List[str]:
+        try:
+            data = self.__load_json_response(result)
+        except Exception:
+            return self.__parse_numbered_translation_lines(result, expected_count)
+
+        if isinstance(data, dict):
+            for key in ("items", "translations", "results", "data"):
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
+            else:
+                translations = {}
+                for key, value in data.items():
+                    try:
+                        index = int(key)
+                    except Exception:
+                        continue
+                    if isinstance(value, dict):
+                        value = value.get("text") or value.get("translation") or value.get("zh")
+                    if isinstance(value, str) and value.strip():
+                        translations[index] = value.strip()
+                if len(translations) == expected_count:
+                    return [translations[index] for index in range(1, expected_count + 1)]
+                raise ValueError(f"JSON编号不匹配 {len(translations)}/{expected_count}")
+
+        if not isinstance(data, list):
+            raise ValueError("JSON结果不是数组")
+
+        translations = {}
+        sequential_values = []
+        for entry in data:
+            if isinstance(entry, dict):
+                raw_id = entry.get("id") or entry.get("index") or entry.get("line") or entry.get("no")
+                text = entry.get("text") or entry.get("translation") or entry.get("zh") or entry.get("content")
+                try:
+                    index = int(raw_id)
+                except Exception:
+                    index = None
+                if index and isinstance(text, str) and text.strip():
+                    translations[index] = text.strip()
+                elif isinstance(text, str) and text.strip():
+                    sequential_values.append(text.strip())
+            elif isinstance(entry, str) and entry.strip():
+                sequential_values.append(entry.strip())
+
+        if len(translations) == expected_count:
+            return [translations[index] for index in range(1, expected_count + 1)]
+        if not translations and len(sequential_values) == expected_count:
+            return sequential_values
+        raise ValueError(f"JSON条目数不匹配 {len(translations) or len(sequential_values)}/{expected_count}")
 
     def __process_batch(self, all_subs: list, batch: list, stats: dict) -> list:
         """批量处理逻辑"""
         indices = [all_subs.index(item) for item in batch]
         context = self.__get_context(all_subs, indices, is_batch=True) if self._context_window > 0 else None
-        batch_text = '\n'.join([item.content for item in batch])
+        batch_items = [
+            {
+                "id": index + 1,
+                "text": item.content.replace("\n", " ").strip()
+            }
+            for index, item in enumerate(batch)
+        ]
 
         try:
-            ret, result = self.__translate_to_zh(batch_text, context)
+            ret, result = self.__translate_subtitle_items_to_zh(batch_items, context)
             if not ret:
                 raise Exception(result)
-
-            translated = [line.strip() for line in result.split('\n') if line.strip()]
-            if len(translated) != len(batch):
-                raise Exception(f"批次行数不匹配 {len(translated)}/{len(batch)}")
+            translated = self.__parse_batch_translation_response(result, len(batch))
 
             for item, trans in zip(batch, translated):
                 item.content = f"{trans}\n{item.content}"
             stats['batch_success'] += len(batch)
             return batch
+        except UserInterruptException:
+            raise
         except Exception as e:
-            logger.warning(f"批次翻译失败（{str(e)}），降级到单行匹配...")
             stats['batch_fail'] += 1
-            return [self.__process_single(all_subs, item, stats) for item in batch]
+            if len(batch) <= 1:
+                logger.warning(f"批次翻译失败（{str(e)}），降级到单行匹配...")
+                return [self.__process_single(all_subs, item, stats) for item in batch]
+            split_at = max(1, len(batch) // 2)
+            logger.warning(
+                f"批次翻译失败（{str(e)}），拆分为 {split_at}/{len(batch) - split_at} 行重试..."
+            )
+            return (
+                self.__process_batch(all_subs, batch[:split_at], stats)
+                + self.__process_batch(all_subs, batch[split_at:], stats)
+            )
 
     def __process_single(self, all_subs: List[srt.Subtitle], item: srt.Subtitle, stats: dict) -> srt.Subtitle:
         """单条处理逻辑"""

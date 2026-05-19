@@ -1,6 +1,7 @@
 import time
 import random
 import inspect
+import json
 from types import SimpleNamespace
 from typing import List, Union
 
@@ -186,4 +187,46 @@ class OpenAi:
                     time.sleep(sleep_time)
                 else:
                     print(f"翻译请求失败 (已重试{max_retries}次)：{last_error}")
+                    return False, f"{last_error}"
+
+    def translate_subtitle_items_to_zh(self, items: List[dict], context: str = None, max_retries: int = 3):
+        """
+        按编号批量翻译字幕条目，返回严格JSON，便于调用方按id回填。
+        """
+        system_prompt = """您是一位专业字幕翻译专家，请严格遵循以下规则：
+1. 将字幕文本精准翻译为简体中文，保持原文本意
+2. 使用自然口语化表达，符合中文观影习惯
+3. 结合上下文保持人物称谓、专业术语、情绪语气一致
+4. 必须逐条翻译输入items里的text，必须保留每个id
+5. 输出必须是合法JSON对象，格式严格为 {"items":[{"id":1,"text":"译文"}]}
+6. 不要输出Markdown代码块、解释、总结或任何JSON之外的内容"""
+        payload = {
+            "context": context or "",
+            "items": items or []
+        }
+        user_prompt = (
+            "请翻译下面JSON中的字幕items。只翻译text字段，id原样返回；"
+            "items数量必须完全一致，不要合并、拆分、删除任何条目。\n"
+            f"{json.dumps(payload, ensure_ascii=False)}"
+        )
+
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            try:
+                completion = self.__get_model(prompt=system_prompt,
+                                              message=user_prompt,
+                                              temperature=0.1,
+                                              top_p=0.9)
+                result = completion.choices[0].message.content.strip()
+                return True, result
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    base_delay = 2 ** attempt
+                    jitter = random.uniform(0.1, 0.9)
+                    sleep_time = base_delay + jitter
+                    print(f"批量字幕翻译请求失败 (第{attempt + 1}次尝试)：{last_error}，{sleep_time:.1f}秒后重试...")
+                    time.sleep(sleep_time)
+                else:
+                    print(f"批量字幕翻译请求失败 (已重试{max_retries}次)：{last_error}")
                     return False, f"{last_error}"
