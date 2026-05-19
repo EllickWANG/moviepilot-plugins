@@ -38,11 +38,13 @@ class OpenAi:
     _api_url: str = None
     _model: str = "gpt-3.5-turbo"
     _timeout: int = 120
+    _detailed_log: bool = False
 
     def __init__(self, api_key: str = None, api_url: str = None, proxy: dict = None, model: str = None,
-                 compatible: bool = False, timeout: int = 120):
+                 compatible: bool = False, timeout: int = 120, detailed_log: bool = False):
         self._api_key = api_key
         self._api_url = api_url
+        self._detailed_log = bool(detailed_log)
         try:
             self._timeout = max(5, int(timeout or 120))
         except Exception:
@@ -145,10 +147,17 @@ class OpenAi:
         }
         payload.update(kwargs)
         url = f"{self._base_url}/chat/completions"
-        logger.info(
-            f"接口翻译请求：url={url} model={self._model} timeout={self._timeout}s "
-            f"messages={len(payload.get('messages') or [])} payload={_preview(payload)}"
-        )
+        message_count = len(payload.get("messages") or [])
+        if self._detailed_log:
+            logger.info(
+                f"接口翻译请求：url={url} model={self._model} timeout={self._timeout}s "
+                f"messages={message_count} payload={_preview(payload)}"
+            )
+        else:
+            logger.info(
+                f"接口翻译请求：url={url} model={self._model} timeout={self._timeout}s "
+                f"messages={message_count}"
+            )
         started_at = time.time()
         try:
             response = self.client.post(
@@ -165,10 +174,16 @@ class OpenAi:
                 f"elapsed={time.time() - started_at:.2f}s error={err}"
             )
             raise
-        logger.info(
-            f"接口翻译响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
-            f"body={_preview(response.text)}"
-        )
+        if self._detailed_log:
+            logger.info(
+                f"接口翻译响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
+                f"body={_preview(response.text)}"
+            )
+        else:
+            logger.info(
+                f"接口翻译响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
+                f"body_chars={len(response.text or '')}"
+            )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as err:

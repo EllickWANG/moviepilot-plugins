@@ -103,7 +103,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.28"
+    plugin_version = "1.0.29"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -156,6 +156,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _clear_history = None
     _listen_transfer_event = None
     _send_notify = None
+    _detailed_log = False
     _retry_failed_once = None
     _translate_preference = None
     _run_now = None
@@ -339,6 +340,7 @@ class AutoSubRemoteAsr(_PluginBase):
         self._retry_failed_once = config.get('retry_failed_once')
         self._path_list = self.__normalize_path_list(config.get('path_list'))
         self._send_notify = config.get('send_notify', False)
+        self._detailed_log = bool(config.get('detailed_log', False))
         self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
         self._translate_concurrency = self.__normalize_translate_concurrency(config.get('translate_concurrency', 1))
         self._translate_lock = threading.Semaphore(self._translate_concurrency)
@@ -383,7 +385,7 @@ class AutoSubRemoteAsr(_PluginBase):
             self._openai = OpenAi(api_key=self._openai_api_key, api_url=self._openai_api_url,
                                   proxy=settings.PROXY if self._openai_api_proxy else None,
                                   model=self._openai_model, compatible=bool(self._openai_api_compatible),
-                                  timeout=self._translate_request_timeout)
+                                  timeout=self._translate_request_timeout, detailed_log=self._detailed_log)
 
         if self._enabled:
             alive_threads = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
@@ -1461,10 +1463,16 @@ class AutoSubRemoteAsr(_PluginBase):
             audio_size = os.path.getsize(audio_file)
         except Exception:
             audio_size = -1
-        logger.info(
-            f"接口ASR请求：url={url} model={self._asr_api_model} timeout={self._asr_request_timeout}s "
-            f"file={os.path.basename(audio_file)} size={audio_size} data={_log_preview(data)}"
-        )
+        if self._detailed_log:
+            logger.info(
+                f"接口ASR请求：url={url} model={self._asr_api_model} timeout={self._asr_request_timeout}s "
+                f"file={os.path.basename(audio_file)} size={audio_size} data={_log_preview(data)}"
+            )
+        else:
+            logger.info(
+                f"接口ASR请求：url={url} model={self._asr_api_model} timeout={self._asr_request_timeout}s "
+                f"file={os.path.basename(audio_file)} size={audio_size}"
+            )
         started_at = time.time()
         with self.__create_openai_http_client(timeout=self._asr_request_timeout) as client:
             with open(audio_file, "rb") as file_obj:
@@ -1481,10 +1489,16 @@ class AutoSubRemoteAsr(_PluginBase):
                         f"elapsed={time.time() - started_at:.2f}s error={err}"
                     )
                     raise
-        logger.info(
-            f"接口ASR响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
-            f"body={_log_preview(response.text)}"
-        )
+        if self._detailed_log:
+            logger.info(
+                f"接口ASR响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
+                f"body={_log_preview(response.text)}"
+            )
+        else:
+            logger.info(
+                f"接口ASR响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
+                f"body_chars={len(response.text or '')}"
+            )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as err:
@@ -2838,7 +2852,15 @@ class AutoSubRemoteAsr(_PluginBase):
                             "关闭后使用当前插件填写的接口地址、密钥和模型",
                             color="primary",
                         ),
-                        md=4,
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_switch(
+                            "detailed_log",
+                            "详细接口日志",
+                            "开启后记录完整接口入参和返回，日志量很大，排查问题时再开启",
+                        ),
+                        md=3,
                     ),
                     self.__form_col(
                         self.__form_text(
@@ -2847,12 +2869,12 @@ class AutoSubRemoteAsr(_PluginBase):
                             "whisper-1",
                             "需要支持 verbose_json 和 segments",
                         ),
-                        md=4,
+                        md=3,
                     ),
                     self.__form_col(
                         self.__form_text("openai_model", "翻译模型", "gpt-5-chat-latest",
                                          props={"v-show": "!reuse_autosub_config"}),
-                        md=4,
+                        md=3,
                     ),
                 ],
             },
@@ -2966,6 +2988,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "enabled": False,
             "clear_history": False,
             "send_notify": False,
+            "detailed_log": False,
             "retry_failed_once": False,
             "listen_transfer_event": True,
             "run_now": False,
@@ -3338,7 +3361,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                                 'content': [
                                                     {
                                                         'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 4},
+                                                        'props': {'cols': 12, 'md': 3},
                                                         'content': [
                                                             {
                                                                 'component': 'VSwitch',
@@ -3354,7 +3377,24 @@ class AutoSubRemoteAsr(_PluginBase):
                                                         'component': 'VCol',
                                                         'props': {
                                                             'cols': 12,
-                                                            'md': 4,
+                                                            'md': 3,
+                                                        },
+                                                        'content': [
+                                                            {
+                                                                'component': 'VSwitch',
+                                                                'props': {
+                                                                    'model': 'detailed_log',
+                                                                    'label': '详细接口日志',
+                                                                    'hint': '开启后记录完整接口入参和返回，日志量很大'
+                                                                }
+                                                            }
+                                                        ]
+                                                    },
+                                                    {
+                                                        'component': 'VCol',
+                                                        'props': {
+                                                            'cols': 12,
+                                                            'md': 3,
                                                         },
                                                         'content': [
                                                             {
@@ -3372,7 +3412,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                                         'component': 'VCol',
                                                         'props': {
                                                             'cols': 12,
-                                                            'md': 4,
+                                                            'md': 3,
                                                         },
                                                         'content': [
                                                             {
@@ -3589,6 +3629,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "enabled": False,
             "clear_history": False,
             "send_notify": False,
+            "detailed_log": False,
             "retry_failed_once": False,
             "listen_transfer_event": True,
             "run_now": False,
