@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.24"
+    plugin_version = "1.0.25"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -509,6 +509,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 self._consumer_threads = {}
                 alive_workers = []
                 logger.warn(f"AI字幕队列自修复：{reason} 重建消费者线程注册")
+            self._translate_lock = threading.Semaphore(self._translate_concurrency)
+            logger.warn(f"AI字幕队列自修复：{reason} 重置翻译并发锁")
         if len(alive_workers) < self._parallel_tasks:
             self.__start_workers()
 
