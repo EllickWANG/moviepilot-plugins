@@ -39,6 +39,14 @@
     "author": "Ellick",
     "level": 2
   },
+  "AutoSubv2": {
+    "name": "AI字幕自动生成(v2)",
+    "description": "使用 whisper 自动生成视频文件字幕，并使用大模型翻译字幕成中文；私有修复 OpenAI 代理兼容。",
+    "version": "2.5.2",
+    "icon": "mdi-subtitles-outline",
+    "author": "Ellick",
+    "level": 2
+  },
   "IYUUAutoSeedPlus": {
     "name": "IYUU自动辅种增强",
     "description": "复刻官方IYUU自动辅种，增加IYUU/下载器请求超时、每批Hash数量和站点域名匹配配置。",
