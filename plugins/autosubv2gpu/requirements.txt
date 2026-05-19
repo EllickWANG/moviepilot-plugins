@@ -1,8 +1,0 @@
-iso639~=0.1.4
-srt~=3.5.3
-cacheout~=0.16.0
-huggingface_hub>=0.23.0
-hf_xet>=1.1.0
-openvino==2026.1.0
-openvino-tokenizers==2026.1.0.0
-openvino-genai==2026.1.0.0
