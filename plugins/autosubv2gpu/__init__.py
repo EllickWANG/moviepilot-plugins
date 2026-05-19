@@ -81,7 +81,7 @@ class AutoSubv2Gpu(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.7.2"
+    plugin_version = "2.7.3"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -128,6 +128,7 @@ class AutoSubv2Gpu(_PluginBase):
     _openvino_auto_download = None
     _openvino_max_new_tokens = None
     _latest_asr_test: Dict[str, Any] = None
+    _last_asr_error = ""
     _huggingface_proxy = None
     _faster_whisper_model_path = None
     _faster_whisper_model = None
@@ -468,9 +469,11 @@ class AutoSubv2Gpu(_PluginBase):
 
     def __do_openvino_genai_recognition(self, audio_lang, audio_file):
         lang = audio_lang or 'auto'
+        self._last_asr_error = ""
         try:
             model_path = self.__prepare_openvino_model()
             if not model_path:
+                self._last_asr_error = "OpenVINO 模型未就绪"
                 return False, None
             result = self.__run_openvino_genai_worker(
                 audio_file=audio_file,
@@ -478,7 +481,8 @@ class AutoSubv2Gpu(_PluginBase):
                 lang=lang,
             )
             if not result.get("success"):
-                logger.error(f"OpenVINO GenAI 子进程失败：{result.get('message') or result}")
+                self._last_asr_error = str(result.get('message') or result)
+                logger.error(f"OpenVINO GenAI 子进程失败：{self._last_asr_error}")
                 return False, None
 
             detected_lang = str(result.get("language") or "").strip()
@@ -503,7 +507,8 @@ class AutoSubv2Gpu(_PluginBase):
             logger.info(f"OpenVINO GenAI 音轨转字幕完成，语言：{lang}，字幕条目：{len(subs)}")
             return True, lang
         except Exception as e:
-            logger.error(f"OpenVINO GenAI 处理异常：{e}")
+            self._last_asr_error = f"{type(e).__name__}: {e}"
+            logger.error(f"OpenVINO GenAI 处理异常：{self._last_asr_error}")
             logger.error(traceback.format_exc())
             return False, None
 
@@ -710,6 +715,8 @@ class AutoSubv2Gpu(_PluginBase):
                         result["srt_preview"] = self.__clip_log(file_obj.read(), 1000)
                     os.remove(srt_path)
                 result["success"] = bool(ret and result["srt_exists"])
+                if not result["success"] and self._last_asr_error:
+                    result["error"] = self._last_asr_error
                 backend_name = "OpenVINO GenAI" if self._asr_backend == "openvino_genai" else "外部ASR"
                 result["message"] = f"{backend_name}自检成功" if result["success"] else f"{backend_name}自检失败，未生成有效SRT"
                 return schemas.Response(success=result["success"], message=result["message"], data=result)
