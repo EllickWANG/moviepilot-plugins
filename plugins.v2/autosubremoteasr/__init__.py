@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.11"
+    plugin_version = "1.0.12"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -181,7 +181,7 @@ class AutoSubRemoteAsr(_PluginBase):
     @staticmethod
     def __normalize_translate_concurrency(value) -> int:
         try:
-            return max(1, min(3, int(value or 1)))
+            return max(1, int(value or 1))
         except Exception:
             return 1
 
@@ -2551,7 +2551,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "translate_concurrency",
                             "翻译接口并发数",
                             "1",
-                            "同一时间发起的翻译请求数量，范围1-3",
+                            "同一时间发起的翻译请求数量，接口不稳定时建议保持1",
                         ),
                         md=4,
                     ),
