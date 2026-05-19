@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.12"
+    plugin_version = "1.0.13"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -975,6 +975,10 @@ class AutoSubRemoteAsr(_PluginBase):
                     self._tasks[task.task_id] = task
                     self.save_tasks()
                 task.status = self.__process_autosub(task.video_file, task)
+                if self._event.is_set() and task.status == TaskStatus.PENDING:
+                    logger.info(f"工作线程 {worker_index} 收到停止信号，跳过旧任务状态回写：{task.video_file}")
+                    self.__safe_task_done()
+                    continue
                 task.complete_time = datetime.now() if task.status in [
                     TaskStatus.COMPLETED, TaskStatus.IGNORED, TaskStatus.FAILED
                 ] else None
@@ -1010,7 +1014,10 @@ class AutoSubRemoteAsr(_PluginBase):
                         if self._current_processing_task and self._current_processing_task.task_id == task.task_id:
                             self._current_processing_task = None
                         self._progress_save_at.pop(task.task_id, None)
-        logger.info(f"消费线程 {worker_index} 已退出")
+        if self._event.is_set():
+            logger.debug(f"消费线程 {worker_index} 已退出")
+        else:
+            logger.info(f"消费线程 {worker_index} 已退出")
 
     # 监听媒体入库事件，每个事件触发一次自动字幕任务
     @eventmanager.register(EventType.TransferComplete)
@@ -1268,9 +1275,13 @@ class AutoSubRemoteAsr(_PluginBase):
                 self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
             return TaskStatus.COMPLETED
         except UserInterruptException:
-            logger.info(f"用户中断当前任务：{video_file}")
-            self.__update_task_progress(task, task.progress if task else 0, "等待重新处理",
-                                        "用户中断当前任务", force=True)
+            logger.info(f"插件停止或重载，中断当前任务，后续将从断点恢复：{video_file}")
+            if task:
+                task.status = TaskStatus.PENDING
+                task.complete_time = None
+                task.progress_stage = "等待重新处理"
+                task.progress_detail = "插件停止或重载，稍后从断点恢复"
+                task.progress_updated = datetime.now()
             return TaskStatus.PENDING
         except Exception as e:
             logger.error(f"自动字幕生成 处理异常：{e}")
