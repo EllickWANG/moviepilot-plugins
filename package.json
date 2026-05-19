@@ -46,8 +46,8 @@
   },
   "AutoSubv2Plus": {
     "name": "AI字幕自动生成(v2) 私有版",
-    "description": "复刻 AI 字幕自动生成，使用 whisper 生成字幕并支持大模型翻译；增加任务阶段和百分比进度显示。",
-    "version": "2.5.7",
+    "description": "复刻 AI 字幕自动生成，使用 whisper 生成字幕并支持大模型翻译；支持百分比进度和可配置并行处理。",
+    "version": "2.5.8",
     "icon": "mdi-subtitles-outline",
     "author": "Ellick",
     "level": 2,

@@ -6,7 +6,7 @@ import traceback
 from datetime import timedelta, datetime
 from pathlib import Path
 from typing import Tuple, Dict, Any, List, Optional
-from threading import Event
+from threading import Event, RLock
 import iso639
 import psutil
 import srt
@@ -70,7 +70,7 @@ class AutoSubv2Plus(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.5.7"
+    plugin_version = "2.5.8"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -86,8 +86,12 @@ class AutoSubv2Plus(_PluginBase):
     _tasks: Dict[str, TaskItem] = None
     _task_queue = None
     _consumer_thread = None
+    _consumer_threads: Dict[int, threading.Thread] = None
     _current_processing_task = None
+    _current_processing_tasks: Dict[str, TaskItem] = None
+    _tasks_lock = None
     _progress_save_at: Dict[str, float] = None
+    _parallel_tasks = 1
     _running = False
     _event = Event()
     _enabled = None
@@ -111,10 +115,28 @@ class AutoSubv2Plus(_PluginBase):
     _faster_whisper_model_path = None
     _faster_whisper_model = None
 
+    def __ensure_runtime_state(self):
+        if self._tasks_lock is None:
+            self._tasks_lock = RLock()
+        if self._consumer_threads is None:
+            self._consumer_threads = {}
+        if self._current_processing_tasks is None:
+            self._current_processing_tasks = {}
+        if self._progress_save_at is None:
+            self._progress_save_at = {}
+
+    @staticmethod
+    def __normalize_parallel_tasks(value) -> int:
+        try:
+            return max(1, min(3, int(value or 1)))
+        except Exception:
+            return 1
+
     def init_plugin(self, config=None):
         # 如果没有配置信息， 则不处理
         if not config:
             return
+        self.__ensure_runtime_state()
         self._tasks = self.load_tasks()
         self._progress_save_at = {}
         self._enabled = config.get('enabled', False)
@@ -125,6 +147,7 @@ class AutoSubv2Plus(_PluginBase):
             self._path_list = list(set(config.get('path_list').split('\n')))
         self._send_notify = config.get('send_notify', False)
         self._file_size = int(config.get('file_size')) if config.get('file_size') else 10
+        self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
         # 字幕生成设置
         self._translate_preference = config.get('translate_preference', 'english_first')
         self._enable_asr = config.get('enable_asr', True)
@@ -187,10 +210,8 @@ class AutoSubv2Plus(_PluginBase):
 
             if not self._running:
                 self._task_queue = queue.Queue()
-                self._consumer_thread = threading.Thread(target=self._consume_tasks, daemon=True)
-                self._consumer_thread.start()
-                logger.info("任务队列和消费者线程已启动")
                 self._running = True
+            self.__start_workers()
 
             if self._run_now:
                 config['run_now'] = False
@@ -199,6 +220,28 @@ class AutoSubv2Plus(_PluginBase):
                 self._run_at_once(path_list=self._path_list)
         else:
             self.stop_service()
+
+    def __start_workers(self):
+        self.__ensure_runtime_state()
+        if not self._task_queue:
+            self._task_queue = queue.Queue()
+        for worker_index, thread in list(self._consumer_threads.items()):
+            if not thread.is_alive():
+                self._consumer_threads.pop(worker_index, None)
+        for worker_index in range(1, self._parallel_tasks + 1):
+            thread = self._consumer_threads.get(worker_index)
+            if thread and thread.is_alive():
+                continue
+            thread = threading.Thread(
+                target=self._consume_tasks,
+                args=(worker_index,),
+                name=f"autosubv2plus-worker-{worker_index}",
+                daemon=True
+            )
+            thread.start()
+            self._consumer_threads[worker_index] = thread
+        self._consumer_thread = self._consumer_threads.get(1)
+        logger.info(f"任务队列和消费者线程已启动，并行任务数：{self._parallel_tasks}")
 
     @staticmethod
     def __default_task_progress(status: TaskStatus) -> Tuple[float, str]:
@@ -261,8 +304,10 @@ class AutoSubv2Plus(_PluginBase):
         }
 
     def save_tasks(self):
-        tasks_dict = {task_id: self._serialize_task(task) for task_id, task in self._tasks.items()}
-        self.save_data("tasks", tasks_dict)
+        self.__ensure_runtime_state()
+        with self._tasks_lock:
+            tasks_dict = {task_id: self._serialize_task(task) for task_id, task in (self._tasks or {}).items()}
+            self.save_data("tasks", tasks_dict)
 
     @staticmethod
     def __clip_progress(progress: float) -> float:
@@ -284,25 +329,26 @@ class AutoSubv2Plus(_PluginBase):
     def __update_task_progress(self, task: Optional[TaskItem] = None, progress: Optional[float] = None,
                                stage: Optional[str] = None, detail: Optional[str] = None,
                                force: bool = False):
-        task = task or self._current_processing_task
+        self.__ensure_runtime_state()
+        if not task and len(self._current_processing_tasks) == 1:
+            task = next(iter(self._current_processing_tasks.values()))
         if not task:
             return
-        if progress is not None:
-            task.progress = self.__clip_progress(progress)
-        if stage is not None:
-            task.progress_stage = stage
-        if detail is not None:
-            task.progress_detail = detail
-        task.progress_updated = datetime.now()
-        self._tasks[task.task_id] = task
+        with self._tasks_lock:
+            if progress is not None:
+                task.progress = self.__clip_progress(progress)
+            if stage is not None:
+                task.progress_stage = stage
+            if detail is not None:
+                task.progress_detail = detail
+            task.progress_updated = datetime.now()
+            self._tasks[task.task_id] = task
 
-        now = time.time()
-        if self._progress_save_at is None:
-            self._progress_save_at = {}
-        last_save_at = self._progress_save_at.get(task.task_id, 0)
-        if force or now - last_save_at >= 3 or task.progress >= 100:
-            self.save_tasks()
-            self._progress_save_at[task.task_id] = now
+            now = time.time()
+            last_save_at = self._progress_save_at.get(task.task_id, 0)
+            if force or now - last_save_at >= 3 or task.progress >= 100:
+                self.save_tasks()
+                self._progress_save_at[task.task_id] = now
 
     def add_task(self, video_file: str, source: TaskSource):
         """
@@ -321,44 +367,56 @@ class AutoSubv2Plus(_PluginBase):
             logger.info(f"任务已存在，跳过添加：{video_file}")
             return False
 
+        if not self._running or not self._task_queue:
+            logger.warn(f"任务队列未启动，跳过添加：{video_file}")
+            return False
+
         self._task_queue.put(task)
-        self._tasks[task.task_id] = task
-        self.save_tasks()
+        with self._tasks_lock:
+            self._tasks[task.task_id] = task
+            self.save_tasks()
         logger.info(f"加入任务队列: {video_file}")
         return True
 
     def clear_tasks(self):
-        self._tasks = {task_id: task for task_id, task in self._tasks.items() if task.status in [
-            TaskStatus.PENDING, TaskStatus.IN_PROGRESS
-        ]}
-        self.save_tasks()
+        self.__ensure_runtime_state()
+        with self._tasks_lock:
+            self._tasks = {task_id: task for task_id, task in self._tasks.items() if task.status in [
+                TaskStatus.PENDING, TaskStatus.IN_PROGRESS
+            ]}
+            self.save_tasks()
         logger.info("插件历史任务已清除")
 
     def __is_duplicate_task(self, video_file: str) -> bool:
-        with self._task_queue.mutex:
-            for task in self._task_queue.queue:
-                if task.video_file == video_file:
+        self.__ensure_runtime_state()
+        with self._tasks_lock:
+            for task in (self._tasks or {}).values():
+                if task.video_file == video_file and task.status in [TaskStatus.PENDING, TaskStatus.IN_PROGRESS]:
                     return True
-            # 还要检查当前正在处理的任务（即可能不在队列中，但正在被消费）
-            if self._consumer_thread and self._current_processing_task and self._current_processing_task.video_file == video_file:
-                return True
         return False
 
-    def _consume_tasks(self):
+    def _consume_tasks(self, worker_index: int = 1):
         while not self._event.is_set():
+            if worker_index > self._parallel_tasks:
+                break
+            task = None
             try:
                 task = self._task_queue.get(timeout=1)
                 if task is None:
+                    self._task_queue.task_done()
                     continue
-                self._current_processing_task = task
-                logger.info(f"开始处理任务 {task.task_id}: {task.video_file}")
+                with self._tasks_lock:
+                    self._current_processing_task = task if worker_index == 1 else self._current_processing_task
+                    self._current_processing_tasks[task.task_id] = task
+                logger.info(f"工作线程 {worker_index} 开始处理任务 {task.task_id}: {task.video_file}")
                 task.status = TaskStatus.IN_PROGRESS
                 task.progress = 1.0
                 task.progress_stage = "准备处理"
                 task.progress_detail = "任务已开始"
                 task.progress_updated = datetime.now()
-                self._tasks[task.task_id] = task
-                self.save_tasks()
+                with self._tasks_lock:
+                    self._tasks[task.task_id] = task
+                    self.save_tasks()
                 task.status = self.__process_autosub(task.video_file, task)
                 task.complete_time = datetime.now()
                 if task.status == TaskStatus.COMPLETED:
@@ -368,17 +426,31 @@ class AutoSubv2Plus(_PluginBase):
                 elif task.status == TaskStatus.FAILED:
                     self.__update_task_progress(task, task.progress, "处理失败",
                                                 task.progress_detail or "任务处理失败", force=True)
-                self._tasks[task.task_id] = task
-                self.save_tasks()
+                with self._tasks_lock:
+                    self._tasks[task.task_id] = task
+                    self.save_tasks()
                 self._task_queue.task_done()
-                self._current_processing_task = None
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.error(f"消费任务时发生异常: {e}")
                 logger.error(traceback.format_exc())
-                self._current_processing_task = None
-        logger.info("消费线程已退出")
+                if task:
+                    task.status = TaskStatus.FAILED
+                    task.complete_time = datetime.now()
+                    self.__update_task_progress(task, task.progress, "处理异常", str(e)[:120], force=True)
+                    try:
+                        self._task_queue.task_done()
+                    except ValueError:
+                        pass
+            finally:
+                if task:
+                    with self._tasks_lock:
+                        self._current_processing_tasks.pop(task.task_id, None)
+                        if self._current_processing_task and self._current_processing_task.task_id == task.task_id:
+                            self._current_processing_task = None
+                        self._progress_save_at.pop(task.task_id, None)
+        logger.info(f"消费线程 {worker_index} 已退出")
 
     # 监听媒体入库事件，每个事件触发一次自动字幕任务
     @eventmanager.register(EventType.TransferComplete)
@@ -950,18 +1022,18 @@ class AutoSubv2Plus(_PluginBase):
 
         return "\n".join(context)
 
-    def __process_items(self, all_subs: list, items: list) -> list:
+    def __process_items(self, all_subs: list, items: list, stats: dict) -> list:
         """统一处理入口（支持批量和单条）"""
         if self._enable_batch and len(items) > 1:
-            return self.__process_batch(all_subs, items)
-        return [self.__process_single(all_subs, item) for item in items]
+            return self.__process_batch(all_subs, items, stats)
+        return [self.__process_single(all_subs, item, stats) for item in items]
 
     def __translate_to_zh(self, text: str, context: str = None) -> str:
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
         return self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
 
-    def __process_batch(self, all_subs: list, batch: list) -> list:
+    def __process_batch(self, all_subs: list, batch: list, stats: dict) -> list:
         """批量处理逻辑"""
         indices = [all_subs.index(item) for item in batch]
         context = self.__get_context(all_subs, indices, is_batch=True) if self._context_window > 0 else None
@@ -978,14 +1050,14 @@ class AutoSubv2Plus(_PluginBase):
 
             for item, trans in zip(batch, translated):
                 item.content = f"{trans}\n{item.content}"
-            self._stats['batch_success'] += len(batch)
+            stats['batch_success'] += len(batch)
             return batch
         except Exception as e:
             logger.warning(f"批次翻译失败（{str(e)}），降级到单行匹配...")
-            self._stats['batch_fail'] += 1
-            return [self.__process_single(all_subs, item) for item in batch]
+            stats['batch_fail'] += 1
+            return [self.__process_single(all_subs, item, stats) for item in batch]
 
-    def __process_single(self, all_subs: List[srt.Subtitle], item: srt.Subtitle) -> srt.Subtitle:
+    def __process_single(self, all_subs: List[srt.Subtitle], item: srt.Subtitle, stats: dict) -> srt.Subtitle:
         """单条处理逻辑"""
         idx = all_subs.index(item)
         context = self.__get_context(all_subs, [idx], is_batch=False) if self._context_window > 0 else None
@@ -993,7 +1065,7 @@ class AutoSubv2Plus(_PluginBase):
 
         if success:
             item.content = f"{trans}\n{item.content}"
-            self._stats['line_fallback'] += 1
+            stats['line_fallback'] += 1
             return item
         else:
             item.content = f"[翻译失败]\n{item.content}"
@@ -1001,7 +1073,7 @@ class AutoSubv2Plus(_PluginBase):
 
     def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str,
                                 task: Optional[TaskItem] = None):
-        self._stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0}
+        stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0}
         subs = self.__load_srt(source_subtitle)
         if source_lang in ["en", "eng"] and self._enable_merge:
             valid_subs = self.__merge_srt(subs)
@@ -1016,7 +1088,7 @@ class AutoSubv2Plus(_PluginBase):
             self.__update_task_progress(task, 98, "翻译完成", "字幕为空，已生成空中文字幕", force=True)
             return
             
-        self._stats['total'] = len(valid_subs)
+        stats['total'] = len(valid_subs)
         self.__update_task_progress(task, 76, "翻译字幕", f"共 {len(valid_subs)} 行", force=True)
         processed = []
         current_batch = []
@@ -1025,7 +1097,7 @@ class AutoSubv2Plus(_PluginBase):
             current_batch.append(item)
 
             if len(current_batch) >= self._batch_size:
-                processed += self.__process_items(valid_subs, current_batch)
+                processed += self.__process_items(valid_subs, current_batch, stats)
                 current_batch = []
                 logger.info(f"进度: {len(processed)}/{len(valid_subs)}")
                 percent = self.__scale_progress(76, 98, len(processed), len(valid_subs))
@@ -1033,7 +1105,7 @@ class AutoSubv2Plus(_PluginBase):
                                             f"{len(processed)}/{len(valid_subs)} 行")
 
         if current_batch:
-            processed += self.__process_items(valid_subs, current_batch)
+            processed += self.__process_items(valid_subs, current_batch, stats)
             percent = self.__scale_progress(76, 98, len(processed), len(valid_subs))
             self.__update_task_progress(task, percent, "翻译字幕",
                                         f"{len(processed)}/{len(valid_subs)} 行", force=True)
@@ -1041,14 +1113,14 @@ class AutoSubv2Plus(_PluginBase):
         self.__save_srt(dest_subtitle, processed)
         self.__update_task_progress(task, 98, "翻译完成", f"已翻译 {len(processed)} 行", force=True)
         
-        success_rate = (self._stats['batch_success'] / self._stats['total'] * 100) if self._stats['total'] > 0 else 0.0
+        success_rate = (stats['batch_success'] / stats['total'] * 100) if stats['total'] > 0 else 0.0
         
         logger.info(f"""
     翻译完成！
-    总处理条目: {self._stats['total']}
-    批次成功: {self._stats['batch_success']} ({success_rate:.1f}%)
-    批次失败: {self._stats['batch_fail']}
-    行补偿翻译: {self._stats['line_fallback']}
+    总处理条目: {stats['total']}
+    批次成功: {stats['batch_success']} ({success_rate:.1f}%)
+    批次失败: {stats['batch_fail']}
+    行补偿翻译: {stats['line_fallback']}
             """)
 
     @staticmethod
@@ -1281,7 +1353,7 @@ class AutoSubv2Plus(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
+                                'props': {'cols': 12, 'md': 3},
                                 'content': [
                                     {
                                         'component': 'VTextField',
@@ -1295,7 +1367,7 @@ class AutoSubv2Plus(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
+                                'props': {'cols': 12, 'md': 3},
                                 'content': [
                                     {
                                         'component': 'VSelect',
@@ -1314,7 +1386,22 @@ class AutoSubv2Plus(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'parallel_tasks',
+                                            'label': '并行任务数',
+                                            'placeholder': '默认1，建议1-2',
+                                            'hint': '同一时间处理的字幕任务数量，范围1-3'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -1679,6 +1766,7 @@ class AutoSubv2Plus(_PluginBase):
             "run_now": False,
             "path_list": "",
             "file_size": "10",
+            "parallel_tasks": 1,
             "translate_preference": "english_first",
             "translate_zh": False,
             "enable_asr": True,
@@ -1885,12 +1973,14 @@ class AutoSubv2Plus(_PluginBase):
         """
         退出插件
         """
-        if self._running:
+        self.__ensure_runtime_state()
+        alive_threads = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
+        if self._running or alive_threads:
             self._event.set()
-        if self._consumer_thread and self._consumer_thread.is_alive():
+        if alive_threads:
             logger.info("正在停止当前任务...")
-            # self._consumer_thread.join(timeout=3)
-            self._consumer_thread.join()
+            for thread in alive_threads:
+                thread.join()
 
         if self._task_queue:
             while not self._task_queue.empty():
@@ -1908,5 +1998,9 @@ class AutoSubv2Plus(_PluginBase):
                     task.progress_updated = datetime.now()
             self.save_tasks()  # 持久化更新后的任务列表
         self._running = False
+        self._consumer_threads = {}
+        self._consumer_thread = None
+        self._current_processing_task = None
+        self._current_processing_tasks = {}
         self._event.clear()
         logger.info(f"自动字幕生成服务已停止")
