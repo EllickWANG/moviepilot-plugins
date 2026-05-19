@@ -37,6 +37,17 @@ class UserInterruptException(Exception):
     pass
 
 
+class AsrTransientException(Exception):
+    """远程ASR临时网络异常，可等待后重试任务"""
+    pass
+
+
+class AsrRequestError(RuntimeError):
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 class TaskSource(Enum):
     MANUAL = "manual"
     EVENT = "event"
@@ -78,7 +89,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -109,6 +120,8 @@ class AutoSubRemoteAsr(_PluginBase):
     _asr_chunk_minutes = 10
     _asr_chunk_seconds = 600
     _asr_random_check_rate = 0.2
+    _asr_request_retries = 3
+    _asr_retry_delays = (10, 30, 60)
     _reuse_autosub_config = True
     _openai_api_key = None
     _openai_api_url = None
@@ -685,6 +698,14 @@ class AutoSubRemoteAsr(_PluginBase):
                     return True
         return False
 
+    def __safe_task_done(self):
+        if not self._task_queue:
+            return
+        try:
+            self._task_queue.task_done()
+        except ValueError:
+            logger.debug("任务队列完成计数已归零，忽略重复 task_done")
+
     def _consume_tasks(self, worker_index: int = 1):
         while not self._event.is_set():
             if worker_index > self._parallel_tasks:
@@ -693,7 +714,7 @@ class AutoSubRemoteAsr(_PluginBase):
             try:
                 task = self._task_queue.get(timeout=1)
                 if task is None:
-                    self._task_queue.task_done()
+                    self.__safe_task_done()
                     continue
                 with self._tasks_lock:
                     self._current_processing_task = task if worker_index == 1 else self._current_processing_task
@@ -723,7 +744,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 with self._tasks_lock:
                     self._tasks[task.task_id] = task
                     self.save_tasks()
-                self._task_queue.task_done()
+                self.__safe_task_done()
             except queue.Empty:
                 continue
             except Exception as e:
@@ -733,10 +754,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     task.status = TaskStatus.FAILED
                     task.complete_time = datetime.now()
                     self.__update_task_progress(task, task.progress, "处理异常", str(e)[:120], force=True)
-                    try:
-                        self._task_queue.task_done()
-                    except ValueError:
-                        pass
+                    self.__safe_task_done()
             finally:
                 if task:
                     with self._tasks_lock:
@@ -1029,49 +1047,106 @@ class AutoSubRemoteAsr(_PluginBase):
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as err:
-            raise RuntimeError(f"接口ASR返回错误 {response.status_code}: {response.text[:500]}") from err
+            status_code = response.status_code
+            retryable = status_code == 429 or status_code >= 500
+            raise AsrRequestError(
+                f"接口ASR返回错误 {status_code}: {response.text[:500]}",
+                retryable=retryable
+            ) from err
         try:
             return response.json()
         except ValueError as err:
             raise RuntimeError(f"接口ASR返回非JSON响应: {response.text[:500]}") from err
 
-    def __transcribe_audio_chunk_with_progress(self, audio_file: str, audio_lang: str, chunk_no: int,
-                                               expected_chunks: int, task: Optional[TaskItem],
-                                               base_progress: float) -> dict:
-        result = {}
+    @staticmethod
+    def __is_retryable_asr_error(err: Exception) -> bool:
+        if isinstance(err, AsrRequestError):
+            return err.retryable
+        return isinstance(err, (httpx.TimeoutException, httpx.TransportError))
 
-        def worker():
-            try:
-                result["response"] = self.__transcribe_audio_chunk(audio_file, audio_lang)
-            except Exception as err:
-                result["error"] = err
-                result["traceback"] = traceback.format_exc()
-
-        thread = threading.Thread(
-            target=worker,
-            name=f"autosubremoteasr-asr-{chunk_no}",
-            daemon=True
-        )
-        started_at = time.time()
-        thread.start()
-        while thread.is_alive():
+    def __wait_before_asr_retry(self, seconds: int, task: Optional[TaskItem], chunk_no: int, expected_chunks: int,
+                                attempt: int, max_attempts: int, base_progress: float):
+        deadline = time.time() + max(0, seconds)
+        while time.time() < deadline:
             if self._event.is_set():
                 raise UserInterruptException("用户中断当前任务")
-            elapsed = int(time.time() - started_at)
+            remaining = int(max(0, deadline - time.time()))
             self.__update_task_progress(
                 task,
                 base_progress,
                 "提取并识别音频",
-                f"第 {chunk_no}/{expected_chunks or '?'} 段上传ASR中，已等待 {elapsed} 秒",
+                f"第 {chunk_no}/{expected_chunks or '?'} 段ASR失败，"
+                f"准备第 {attempt + 1}/{max_attempts} 次重试，等待 {remaining} 秒",
                 force=True
             )
-            thread.join(timeout=2)
+            time.sleep(min(2, max(0.2, remaining)))
 
-        if result.get("error"):
-            if result.get("traceback"):
-                logger.error(result["traceback"])
-            raise result["error"]
-        return result.get("response") or {}
+    def __transcribe_audio_chunk_with_progress(self, audio_file: str, audio_lang: str, chunk_no: int,
+                                               expected_chunks: int, task: Optional[TaskItem],
+                                               base_progress: float) -> dict:
+        max_attempts = max(1, int(self._asr_request_retries or 1))
+        last_error = None
+        last_traceback = ""
+
+        for attempt in range(1, max_attempts + 1):
+            result = {}
+
+            def worker():
+                try:
+                    result["response"] = self.__transcribe_audio_chunk(audio_file, audio_lang)
+                except Exception as err:
+                    result["error"] = err
+                    result["traceback"] = traceback.format_exc()
+
+            thread = threading.Thread(
+                target=worker,
+                name=f"autosubremoteasr-asr-{chunk_no}-{attempt}",
+                daemon=True
+            )
+            started_at = time.time()
+            thread.start()
+            while thread.is_alive():
+                if self._event.is_set():
+                    raise UserInterruptException("用户中断当前任务")
+                elapsed = int(time.time() - started_at)
+                self.__update_task_progress(
+                    task,
+                    base_progress,
+                    "提取并识别音频",
+                    f"第 {chunk_no}/{expected_chunks or '?'} 段上传ASR中，"
+                    f"第 {attempt}/{max_attempts} 次，已等待 {elapsed} 秒",
+                    force=True
+                )
+                thread.join(timeout=2)
+
+            if not result.get("error"):
+                if attempt > 1:
+                    logger.info(f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段第 {attempt} 次重试成功")
+                return result.get("response") or {}
+
+            last_error = result["error"]
+            last_traceback = result.get("traceback") or ""
+            retryable = self.__is_retryable_asr_error(last_error)
+            if not retryable or attempt >= max_attempts:
+                break
+
+            delay = self._asr_retry_delays[min(attempt - 1, len(self._asr_retry_delays) - 1)]
+            logger.warn(
+                f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段第 {attempt}/{max_attempts} 次失败，"
+                f"{delay} 秒后重试：{last_error}"
+            )
+            self.__wait_before_asr_retry(delay, task, chunk_no, expected_chunks, attempt, max_attempts, base_progress)
+
+        if last_traceback:
+            logger.error(last_traceback)
+        if last_error and self.__is_retryable_asr_error(last_error):
+            raise AsrTransientException(
+                f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段网络异常，"
+                f"已重试 {max_attempts} 次：{last_error}"
+            ) from last_error
+        if last_error:
+            raise last_error
+        return {}
 
     @staticmethod
     def __get_audio_file_duration(audio_file: str) -> float:
@@ -1204,14 +1279,18 @@ class AutoSubRemoteAsr(_PluginBase):
                 percent = self.__scale_progress(24, 72, processed_chunks, expected_chunks)
                 self.__update_task_progress(task, percent, "提取并识别音频",
                                             f"第 {chunk_no}/{expected_chunks or '?'} 段正在上传ASR")
-                response = self.__transcribe_audio_chunk_with_progress(
-                    chunk_file,
-                    lang,
-                    chunk_no,
-                    expected_chunks,
-                    task,
-                    percent
-                )
+                try:
+                    response = self.__transcribe_audio_chunk_with_progress(
+                        chunk_file,
+                        lang,
+                        chunk_no,
+                        expected_chunks,
+                        task,
+                        percent
+                    )
+                except AsrTransientException as err:
+                    self.__mark_waiting_file(task, str(err))
+                    raise
                 self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
                 detected_lang = detected_lang or response.get("language")
                 offset = (chunk_no - 1) * self._asr_chunk_seconds
@@ -1239,6 +1318,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 raise UserInterruptException("用户中断当前任务")
             if not ok:
                 logger.error(f"接口ASR音频流水线失败：{error}")
+                if task and task.status == TaskStatus.WAITING_FILE:
+                    return False, None, []
                 if error and not error.startswith("处理音频分段失败"):
                     self.__mark_waiting_file(task, error or "提取音频失败，可能文件仍未完整")
                 return False, None, []
@@ -2862,9 +2943,12 @@ class AutoSubRemoteAsr(_PluginBase):
                 logger.warn(f"仍有 {len(alive_threads)} 个任务线程未退出，将在后台继续等待中断")
 
         if self._task_queue:
-            while not self._task_queue.empty():
-                self._task_queue.get_nowait()
-                self._task_queue.task_done()
+            while True:
+                try:
+                    self._task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self.__safe_task_done()
             logger.info("任务队列已清空")
         if self._tasks is not None:
             for task_id in list(self._tasks.keys()):
