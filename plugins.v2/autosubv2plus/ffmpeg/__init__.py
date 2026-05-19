@@ -3,6 +3,49 @@ import subprocess
 
 
 class Ffmpeg:
+    @staticmethod
+    def check_video_integrity(video_path, duration=None, progress_callback=None):
+        """
+        完整解码扫描视频和音频流，判断文件是否可完整读取。
+        """
+        if not video_path:
+            return False, "视频路径为空"
+
+        command = [
+            'ffmpeg', "-hide_banner", "-nostats", "-v", "error", "-xerror",
+            "-progress", "pipe:1",
+            "-i", video_path,
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-f", "null", "-"
+        ]
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            if process.stdout:
+                for line in process.stdout:
+                    line = line.strip()
+                    if not line.startswith("out_time_ms=") or not progress_callback or not duration:
+                        continue
+                    try:
+                        out_time = int(line.split("=", 1)[1]) / 1000000
+                        progress_callback(out_time, duration)
+                    except Exception:
+                        continue
+            stderr = process.stderr.read() if process.stderr else ""
+            ret = process.wait()
+            if ret == 0:
+                return True, ""
+            return False, (stderr.strip() or f"ffmpeg退出码：{ret}")[:1000]
+        except Exception as e:
+            return False, str(e)[:1000]
 
     @staticmethod
     def extract_wav_from_video(video_path, audio_path, audio_index=None):

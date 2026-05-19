@@ -70,7 +70,7 @@ class AutoSubv2Plus(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.5.8"
+    plugin_version = "2.5.9"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -101,7 +101,6 @@ class AutoSubv2Plus(_PluginBase):
     _translate_preference = None
     _run_now = None
     _path_list = None
-    _file_size = None
     _translate_zh = None
     _openai = None
     _enable_batch = None
@@ -146,7 +145,6 @@ class AutoSubv2Plus(_PluginBase):
         if self._run_now:
             self._path_list = list(set(config.get('path_list').split('\n')))
         self._send_notify = config.get('send_notify', False)
-        self._file_size = int(config.get('file_size')) if config.get('file_size') else 10
         self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
         # 字幕生成设置
         self._translate_preference = config.get('translate_preference', 'english_first')
@@ -500,13 +498,40 @@ class AutoSubv2Plus(_PluginBase):
             return False
         return True
 
+    @staticmethod
+    def __get_video_duration(video_meta: Optional[dict]) -> float:
+        try:
+            duration = (video_meta or {}).get("format", {}).get("duration")
+            return float(duration or 0)
+        except Exception:
+            return 0.0
+
+    def __check_video_integrity(self, video_file: str, task: Optional[TaskItem] = None) -> bool:
+        video_meta = Ffmpeg().get_video_metadata(video_file)
+        duration = self.__get_video_duration(video_meta)
+
+        def update_progress(out_time: float, total_duration: float):
+            percent = self.__scale_progress(5, 24, out_time, total_duration)
+            detail = f"{out_time:.1f}/{total_duration:.1f} 秒" if total_duration else "正在完整扫描视频"
+            self.__update_task_progress(task, percent, "校验视频完整性", detail)
+
+        self.__update_task_progress(task, 5, "校验视频完整性", "正在完整扫描视频", force=True)
+        ok, error = Ffmpeg().check_video_integrity(
+            video_file,
+            duration=duration,
+            progress_callback=update_progress if duration else None
+        )
+        if ok:
+            self.__update_task_progress(task, 24, "视频完整性通过", "视频可完整解码", force=True)
+            return True
+
+        logger.warn(f"视频完整性校验失败：{video_file} - {error}")
+        self.__update_task_progress(task, task.progress if task else 0, "视频不完整", error or "视频完整性校验失败", force=True)
+        return False
+
     def __process_autosub(self, video_file, task: Optional[TaskItem] = None) -> TaskStatus:
         if not video_file:
             return TaskStatus.FAILED
-        # 如果文件大小小于指定大小， 则不处理
-        if os.path.getsize(video_file) < self._file_size * 1024 * 1024:
-            self.__update_task_progress(task, 100, "已忽略", "文件小于配置的处理大小", force=True)
-            return TaskStatus.IGNORED
 
         start_time = time.time()
         file_path, file_ext = os.path.splitext(video_file)
@@ -520,6 +545,8 @@ class AutoSubv2Plus(_PluginBase):
                 logger.warn(f"字幕文件已经存在，不进行处理")
                 self.__update_task_progress(task, 100, "已忽略", "目标字幕已存在", force=True)
                 return TaskStatus.IGNORED
+            if not self.__check_video_integrity(video_file, task):
+                return TaskStatus.FAILED
             # 生成字幕
             ret, lang, gen_sub_path = self.__generate_subtitle(video_file, file_path, self._enable_asr, task)
             if not ret:
@@ -1353,21 +1380,7 @@ class AutoSubv2Plus(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'file_size',
-                                            'label': '触发字幕生成的视频文件不小于(MB)',
-                                            'placeholder': '默认10'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
                                         'component': 'VSelect',
@@ -1386,7 +1399,7 @@ class AutoSubv2Plus(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
                                         'component': 'VTextField',
@@ -1401,7 +1414,7 @@ class AutoSubv2Plus(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -1765,7 +1778,6 @@ class AutoSubv2Plus(_PluginBase):
             "listen_transfer_event": True,
             "run_now": False,
             "path_list": "",
-            "file_size": "10",
             "parallel_tasks": 1,
             "translate_preference": "english_first",
             "translate_zh": False,
