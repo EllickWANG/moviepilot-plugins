@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.17"
+    plugin_version = "1.0.18"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2090,23 +2090,46 @@ class AutoSubRemoteAsr(_PluginBase):
             return self.__process_batch(all_subs, items, stats)
         return [self.__process_single(all_subs, item, stats) for item in items]
 
-    def __translate_to_zh(self, text: str, context: str = None) -> str:
+    def __run_translate_request(self, request_func):
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
+
+        result = {}
+
+        def worker():
+            try:
+                result["value"] = request_func()
+            except Exception as err:
+                result["error"] = err
+                result["traceback"] = traceback.format_exc()
+
         with self._translate_lock:
-            ret = self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
+            thread = threading.Thread(
+                target=worker,
+                name="autosubremoteasr-translate-request",
+                daemon=True,
+            )
+            thread.start()
+            while thread.is_alive():
+                if self._event.is_set():
+                    raise UserInterruptException("用户中断当前任务")
+                thread.join(timeout=1)
+
+        if result.get("error"):
+            raise result["error"]
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
-        return ret
+        return result.get("value")
+
+    def __translate_to_zh(self, text: str, context: str = None) -> str:
+        return self.__run_translate_request(
+            lambda: self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
+        )
 
     def __translate_subtitle_items_to_zh(self, items: List[dict], context: str = None):
-        if self._event.is_set():
-            raise UserInterruptException("用户中断当前任务")
-        with self._translate_lock:
-            ret = self._openai.translate_subtitle_items_to_zh(items, context, max_retries=self._max_retries)
-        if self._event.is_set():
-            raise UserInterruptException("用户中断当前任务")
-        return ret
+        return self.__run_translate_request(
+            lambda: self._openai.translate_subtitle_items_to_zh(items, context, max_retries=self._max_retries)
+        )
 
     @staticmethod
     def __clean_json_response(text: str) -> str:
