@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.18"
+    plugin_version = "1.0.19"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -477,6 +477,52 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__enqueue_task(task)
         if changed:
             self.save_tasks()
+
+    def __repair_queue_state(self, reason: str = "健康检查") -> int:
+        self.__ensure_runtime_state()
+        if not self._enabled:
+            return 0
+        if not self._running:
+            self._task_queue = queue.Queue()
+            self._running = True
+        alive_workers = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
+        if len(alive_workers) < self._parallel_tasks:
+            self.__start_workers()
+        if self._tasks is None:
+            self._tasks = self.load_tasks()
+
+        now = datetime.now()
+        stale_seconds = max(90, int(self._translate_request_timeout or 60) + 30)
+        repair_tasks = []
+        changed = False
+        with self._tasks_lock:
+            current_ids = set(self._current_processing_tasks.keys())
+            queued_ids = set(self._queued_task_ids)
+            for task in list((self._tasks or {}).values()):
+                if task.status == TaskStatus.IN_PROGRESS:
+                    updated = task.progress_updated or task.add_time or now
+                    stale = (now - updated).total_seconds() >= stale_seconds
+                    if task.task_id not in current_ids or stale:
+                        task.status = TaskStatus.PENDING
+                        task.complete_time = None
+                        task.progress_stage = "等待重新处理"
+                        task.progress_detail = f"{reason}发现任务未继续消费，已重新排队"
+                        task.progress_updated = now
+                        self._tasks[task.task_id] = task
+                        repair_tasks.append(task)
+                        changed = True
+                elif task.status == TaskStatus.PENDING and task.task_id not in current_ids and task.task_id not in queued_ids:
+                    repair_tasks.append(task)
+            if changed:
+                self.save_tasks()
+
+        repaired = 0
+        for task in repair_tasks:
+            if self.__enqueue_task(task):
+                repaired += 1
+        if repaired:
+            logger.warn(f"AI字幕队列自修复：{reason} 重新加入 {repaired} 个任务")
+        return repaired
 
     def __schedule_waiting_file_retry(self, task: TaskItem):
         self.__ensure_runtime_state()
@@ -2109,10 +2155,18 @@ class AutoSubRemoteAsr(_PluginBase):
                 name="autosubremoteasr-translate-request",
                 daemon=True,
             )
+            started_at = time.time()
+            forced_timeout = max(15, int(self._translate_request_timeout or 60) + 5)
             thread.start()
             while thread.is_alive():
                 if self._event.is_set():
                     raise UserInterruptException("用户中断当前任务")
+                elapsed = int(time.time() - started_at)
+                if elapsed >= forced_timeout:
+                    logger.warn(f"翻译请求等待超过 {self._translate_request_timeout} 秒，强制放弃本次请求")
+                    raise httpx.TimeoutException(
+                        f"翻译请求超过 {self._translate_request_timeout} 秒，已放弃本次请求"
+                    )
                 thread.join(timeout=1)
 
         if result.get("error"):
@@ -4032,6 +4086,7 @@ class AutoSubRemoteAsr(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
+        self.__repair_queue_state("页面刷新")
         tasks = sorted(
             self.load_tasks().values(),
             key=lambda item: item.add_time,
