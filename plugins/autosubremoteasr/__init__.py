@@ -90,7 +90,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -694,11 +694,17 @@ class AutoSubRemoteAsr(_PluginBase):
             logger.warn(f"清理接口ASR断点失败：{err}")
 
     @staticmethod
+    def __checkpoint_path(path) -> str:
+        return str(path) if path is not None else ""
+
+    @staticmethod
     def __translate_checkpoint_key(task: Optional[TaskItem], source_subtitle: str, dest_subtitle: str) -> Optional[str]:
         if task and task.task_id:
             return task.task_id
-        if source_subtitle and dest_subtitle:
-            return f"{source_subtitle}->{dest_subtitle}"
+        source_path = AutoSubRemoteAsr.__checkpoint_path(source_subtitle)
+        dest_path = AutoSubRemoteAsr.__checkpoint_path(dest_subtitle)
+        if source_path and dest_path:
+            return f"{source_path}->{dest_path}"
         return None
 
     @staticmethod
@@ -717,18 +723,20 @@ class AutoSubRemoteAsr(_PluginBase):
         key = self.__translate_checkpoint_key(task, source_subtitle, dest_subtitle)
         if not key:
             return None
+        source_path = self.__checkpoint_path(source_subtitle)
+        dest_path = self.__checkpoint_path(dest_subtitle)
         try:
             with self._tasks_lock:
                 checkpoint = self.__load_translate_checkpoints_unlocked().get(key)
             if not isinstance(checkpoint, dict):
                 return None
-            if checkpoint.get("source_subtitle") != source_subtitle:
+            if checkpoint.get("source_subtitle") != source_path:
                 return None
-            if checkpoint.get("dest_subtitle") != dest_subtitle:
+            if checkpoint.get("dest_subtitle") != dest_path:
                 return None
             if int(checkpoint.get("total") or 0) != int(total or 0):
                 return None
-            if float(checkpoint.get("source_mtime") or 0) != float(self.__file_mtime(source_subtitle)):
+            if float(checkpoint.get("source_mtime") or 0) != float(self.__file_mtime(source_path)):
                 return None
             items = checkpoint.get("items") or {}
             if items:
@@ -744,6 +752,8 @@ class AutoSubRemoteAsr(_PluginBase):
         if not key:
             return
         try:
+            source_path = self.__checkpoint_path(source_subtitle)
+            dest_path = self.__checkpoint_path(dest_subtitle)
             now = datetime.now().isoformat()
             items = {
                 str(index): item.content
@@ -753,9 +763,9 @@ class AutoSubRemoteAsr(_PluginBase):
                 checkpoints = self.__load_translate_checkpoints_unlocked()
                 checkpoints[key] = {
                     "task_id": task.task_id if task else None,
-                    "source_subtitle": source_subtitle,
-                    "dest_subtitle": dest_subtitle,
-                    "source_mtime": self.__file_mtime(source_subtitle),
+                    "source_subtitle": source_path,
+                    "dest_subtitle": dest_path,
+                    "source_mtime": self.__file_mtime(source_path),
                     "total": int(total or 0),
                     "items": items,
                     "updated_at": now,
