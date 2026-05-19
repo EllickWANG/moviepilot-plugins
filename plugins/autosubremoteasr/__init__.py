@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Tuple, Dict, Any, List, Optional
 from threading import Event, RLock
 import iso639
-import psutil
 import srt
 from lxml import etree
 from dataclasses import dataclass
@@ -89,7 +88,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -114,7 +113,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _auto_scan_thread = None
     _auto_scan_lock = None
     _parallel_tasks = 1
-    _cpu_threads = 2
+    _cpu_threads = 1
     _full_integrity_check = False
     _asr_api_model = "whisper-1"
     _asr_chunk_minutes = 10
@@ -137,6 +136,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _clear_history = None
     _listen_transfer_event = None
     _send_notify = None
+    _retry_failed_once = None
     _translate_preference = None
     _run_now = None
     _path_list = None
@@ -172,17 +172,16 @@ class AutoSubRemoteAsr(_PluginBase):
             return 1
 
     @staticmethod
-    def __normalize_cpu_threads(value) -> int:
-        try:
-            max_threads = max(1, min(4, psutil.cpu_count(logical=False) or 1))
-            return max(1, min(max_threads, int(value or 2)))
-        except Exception:
-            return 2
-
-    @staticmethod
     def __normalize_retry_minutes(value) -> int:
         try:
             return max(5, min(1440, int(value or 10)))
+        except Exception:
+            return 10
+
+    @staticmethod
+    def __normalize_batch_size(value) -> int:
+        try:
+            return max(1, min(50, int(value or 10)))
         except Exception:
             return 10
 
@@ -299,10 +298,11 @@ class AutoSubRemoteAsr(_PluginBase):
         self._clear_history = config.get('clear_history', False)
         self._listen_transfer_event = config.get('listen_transfer_event', True)
         self._run_now = config.get('run_now')
+        self._retry_failed_once = config.get('retry_failed_once')
         self._path_list = self.__normalize_path_list(config.get('path_list'))
         self._send_notify = config.get('send_notify', False)
         self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
-        self._cpu_threads = self.__normalize_cpu_threads(config.get('cpu_threads', 2))
+        self._cpu_threads = 1
         self._full_integrity_check = bool(config.get('full_integrity_check', False))
         self._auto_scan_enabled = bool(config.get('auto_scan_enabled', True))
         self._auto_scan_cron = str(config.get('auto_scan_cron') or "*/10 * * * *").strip()
@@ -317,7 +317,7 @@ class AutoSubRemoteAsr(_PluginBase):
         self._auto_detect_language = config.get('auto_detect_language', False)
         self._translate_zh = config.get('translate_zh', False)
         self._enable_batch = config.get('enable_batch', True)
-        self._batch_size = int(config.get('batch_size')) if config.get('batch_size') else 10
+        self._batch_size = self.__normalize_batch_size(config.get('batch_size'))
         self._context_window = int(config.get('context_window')) if config.get('context_window') else 5
         self._max_retries = int(config.get('max_retries')) if config.get('max_retries') else 3
         self._enable_merge = config.get('enable_merge', False)
@@ -359,6 +359,11 @@ class AutoSubRemoteAsr(_PluginBase):
             self.__start_workers()
             if started_now:
                 self.__enqueue_existing_tasks()
+
+            if self._retry_failed_once:
+                config['retry_failed_once'] = False
+                self.update_config(config)
+                self.retry_failed_tasks_once()
 
             if self._run_now:
                 config['run_now'] = False
@@ -600,6 +605,191 @@ class AutoSubRemoteAsr(_PluginBase):
             self.save_data("tasks", tasks_dict)
 
     @staticmethod
+    def __asr_checkpoint_key(task: Optional[TaskItem], video_file: str) -> Optional[str]:
+        if task and task.task_id:
+            return task.task_id
+        return video_file or None
+
+    def __load_asr_checkpoints_unlocked(self) -> Dict[str, dict]:
+        checkpoints = self.get_data("asr_checkpoints") or {}
+        return checkpoints if isinstance(checkpoints, dict) else {}
+
+    def __get_asr_checkpoint(self, task: Optional[TaskItem], video_file: str, expected_chunks: int,
+                             audio_lang: str) -> Optional[dict]:
+        key = self.__asr_checkpoint_key(task, video_file)
+        if not key:
+            return None
+        try:
+            with self._tasks_lock:
+                checkpoint = self.__load_asr_checkpoints_unlocked().get(key)
+            if not isinstance(checkpoint, dict):
+                return None
+            if checkpoint.get("video_file") != video_file:
+                return None
+            if int(checkpoint.get("expected_chunks") or 0) != int(expected_chunks or 0):
+                return None
+            if int(checkpoint.get("asr_chunk_seconds") or 0) != int(self._asr_chunk_seconds or 0):
+                return None
+            if checkpoint.get("asr_api_model") != self._asr_api_model:
+                return None
+            if checkpoint.get("audio_lang") != audio_lang:
+                return None
+            chunks = checkpoint.get("chunks") or {}
+            if chunks:
+                logger.info(f"恢复接口ASR断点：任务 {key} 已完成 {len(chunks)}/{expected_chunks or '?'} 段")
+            return checkpoint
+        except Exception as err:
+            logger.warn(f"读取接口ASR断点失败：{err}")
+            return None
+
+    def __save_asr_chunk_checkpoint(self, task: Optional[TaskItem], video_file: str, expected_chunks: int,
+                                    audio_lang: str, chunk_no: int, response: dict,
+                                    detected_lang: Optional[str]):
+        key = self.__asr_checkpoint_key(task, video_file)
+        if not key:
+            return
+        try:
+            now = datetime.now().isoformat()
+            with self._tasks_lock:
+                checkpoints = self.__load_asr_checkpoints_unlocked()
+                checkpoint = checkpoints.get(key) if isinstance(checkpoints.get(key), dict) else {}
+                checkpoint.update({
+                    "task_id": task.task_id if task else None,
+                    "video_file": video_file,
+                    "expected_chunks": int(expected_chunks or 0),
+                    "asr_chunk_seconds": int(self._asr_chunk_seconds or 0),
+                    "asr_api_model": self._asr_api_model,
+                    "audio_lang": audio_lang,
+                    "detected_lang": detected_lang,
+                    "updated_at": now,
+                })
+                chunks = checkpoint.get("chunks") if isinstance(checkpoint.get("chunks"), dict) else {}
+                chunks[str(chunk_no)] = copy.deepcopy(response or {})
+                checkpoint["chunks"] = chunks
+                checkpoints[key] = checkpoint
+                if len(checkpoints) > 100:
+                    items = sorted(checkpoints.items(), key=lambda item: (item[1] or {}).get("updated_at") or "")
+                    for old_key, _ in items[:len(checkpoints) - 100]:
+                        checkpoints.pop(old_key, None)
+                self.save_data("asr_checkpoints", checkpoints)
+        except Exception as err:
+            logger.warn(f"保存接口ASR断点失败：{err}")
+
+    def __clear_asr_checkpoint(self, task: Optional[TaskItem], video_file: str):
+        key = self.__asr_checkpoint_key(task, video_file)
+        if not key:
+            return
+        try:
+            with self._tasks_lock:
+                checkpoints = self.__load_asr_checkpoints_unlocked()
+                if key in checkpoints:
+                    checkpoints.pop(key, None)
+                    self.save_data("asr_checkpoints", checkpoints)
+        except Exception as err:
+            logger.warn(f"清理接口ASR断点失败：{err}")
+
+    @staticmethod
+    def __translate_checkpoint_key(task: Optional[TaskItem], source_subtitle: str, dest_subtitle: str) -> Optional[str]:
+        if task and task.task_id:
+            return task.task_id
+        if source_subtitle and dest_subtitle:
+            return f"{source_subtitle}->{dest_subtitle}"
+        return None
+
+    @staticmethod
+    def __file_mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except Exception:
+            return 0.0
+
+    def __load_translate_checkpoints_unlocked(self) -> Dict[str, dict]:
+        checkpoints = self.get_data("translate_checkpoints") or {}
+        return checkpoints if isinstance(checkpoints, dict) else {}
+
+    def __get_translate_checkpoint(self, task: Optional[TaskItem], source_subtitle: str, dest_subtitle: str,
+                                   total: int) -> Optional[dict]:
+        key = self.__translate_checkpoint_key(task, source_subtitle, dest_subtitle)
+        if not key:
+            return None
+        try:
+            with self._tasks_lock:
+                checkpoint = self.__load_translate_checkpoints_unlocked().get(key)
+            if not isinstance(checkpoint, dict):
+                return None
+            if checkpoint.get("source_subtitle") != source_subtitle:
+                return None
+            if checkpoint.get("dest_subtitle") != dest_subtitle:
+                return None
+            if int(checkpoint.get("total") or 0) != int(total or 0):
+                return None
+            if float(checkpoint.get("source_mtime") or 0) != float(self.__file_mtime(source_subtitle)):
+                return None
+            items = checkpoint.get("items") or {}
+            if items:
+                logger.info(f"恢复字幕翻译断点：任务 {key} 已完成 {len(items)}/{total or '?'} 行")
+            return checkpoint
+        except Exception as err:
+            logger.warn(f"读取字幕翻译断点失败：{err}")
+            return None
+
+    def __save_translate_checkpoint(self, task: Optional[TaskItem], source_subtitle: str, dest_subtitle: str,
+                                    total: int, processed: List[srt.Subtitle]):
+        key = self.__translate_checkpoint_key(task, source_subtitle, dest_subtitle)
+        if not key:
+            return
+        try:
+            now = datetime.now().isoformat()
+            items = {
+                str(index): item.content
+                for index, item in enumerate(processed or [])
+            }
+            with self._tasks_lock:
+                checkpoints = self.__load_translate_checkpoints_unlocked()
+                checkpoints[key] = {
+                    "task_id": task.task_id if task else None,
+                    "source_subtitle": source_subtitle,
+                    "dest_subtitle": dest_subtitle,
+                    "source_mtime": self.__file_mtime(source_subtitle),
+                    "total": int(total or 0),
+                    "items": items,
+                    "updated_at": now,
+                }
+                if len(checkpoints) > 100:
+                    records = sorted(checkpoints.items(), key=lambda item: (item[1] or {}).get("updated_at") or "")
+                    for old_key, _ in records[:len(checkpoints) - 100]:
+                        checkpoints.pop(old_key, None)
+                self.save_data("translate_checkpoints", checkpoints)
+        except Exception as err:
+            logger.warn(f"保存字幕翻译断点失败：{err}")
+
+    def __clear_translate_checkpoint(self, task: Optional[TaskItem], source_subtitle: str, dest_subtitle: str):
+        key = self.__translate_checkpoint_key(task, source_subtitle, dest_subtitle)
+        if not key:
+            return
+        try:
+            with self._tasks_lock:
+                checkpoints = self.__load_translate_checkpoints_unlocked()
+                if key in checkpoints:
+                    checkpoints.pop(key, None)
+                    self.save_data("translate_checkpoints", checkpoints)
+        except Exception as err:
+            logger.warn(f"清理字幕翻译断点失败：{err}")
+
+    def __clear_task_checkpoints(self, task: Optional[TaskItem]):
+        if not task or not task.task_id:
+            return
+        try:
+            with self._tasks_lock:
+                for data_key in ("asr_checkpoints", "translate_checkpoints"):
+                    checkpoints = self.get_data(data_key) or {}
+                    if isinstance(checkpoints, dict) and task.task_id in checkpoints:
+                        checkpoints.pop(task.task_id, None)
+                        self.save_data(data_key, checkpoints)
+        except Exception as err:
+            logger.warn(f"清理任务断点失败：{err}")
+
+    @staticmethod
     def __clip_progress(progress: float) -> float:
         try:
             return round(max(0.0, min(100.0, float(progress))), 1)
@@ -675,7 +865,37 @@ class AutoSubRemoteAsr(_PluginBase):
                 TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.WAITING_FILE
             ]}
             self.save_tasks()
+            self.save_data("asr_checkpoints", {})
+            self.save_data("translate_checkpoints", {})
         logger.info("插件历史任务已清除")
+
+    def retry_failed_tasks_once(self) -> int:
+        self.__ensure_runtime_state()
+        if not self._running or not self._task_queue:
+            logger.warn("任务队列未启动，无法重试失败任务")
+            return 0
+
+        retry_tasks = []
+        now = datetime.now()
+        with self._tasks_lock:
+            for task in (self._tasks or {}).values():
+                if task.status != TaskStatus.FAILED:
+                    continue
+                task.status = TaskStatus.PENDING
+                task.complete_time = None
+                task.progress = 0.0
+                task.progress_stage = "等待重试"
+                task.progress_detail = "手动触发失败任务重试"
+                task.progress_updated = now
+                self._tasks[task.task_id] = task
+                retry_tasks.append(task)
+            if retry_tasks:
+                self.save_tasks()
+
+        for task in retry_tasks:
+            self._task_queue.put(task)
+        logger.info(f"失败任务已重新加入队列：{len(retry_tasks)}")
+        return len(retry_tasks)
 
     def __find_latest_task_by_video_file(self, video_file: str) -> Optional[TaskItem]:
         self.__ensure_runtime_state()
@@ -733,8 +953,10 @@ class AutoSubRemoteAsr(_PluginBase):
                     TaskStatus.COMPLETED, TaskStatus.IGNORED, TaskStatus.FAILED
                 ] else None
                 if task.status == TaskStatus.COMPLETED:
+                    self.__clear_task_checkpoints(task)
                     self.__update_task_progress(task, 100, "处理完成", "字幕处理完成", force=True)
                 elif task.status == TaskStatus.IGNORED:
+                    self.__clear_task_checkpoints(task)
                     self.__update_task_progress(task, 100, "已忽略", task.progress_detail or "任务已忽略", force=True)
                 elif task.status == TaskStatus.FAILED:
                     self.__update_task_progress(task, task.progress, "处理失败",
@@ -1243,7 +1465,9 @@ class AutoSubRemoteAsr(_PluginBase):
         text = (response.get("text") or "").strip()
         if not text:
             return
-        duration = float(response.get("duration") or 0) or self.__get_audio_file_duration(chunk_file)
+        duration = float(response.get("duration") or 0)
+        if duration <= 0 and chunk_file and os.path.exists(chunk_file):
+            duration = self.__get_audio_file_duration(chunk_file)
         if duration <= 0:
             duration = self._asr_chunk_seconds
         subs.append(srt.Subtitle(
@@ -1265,7 +1489,9 @@ class AutoSubRemoteAsr(_PluginBase):
             self.__update_task_progress(task, 34, "接口语音识别",
                                         f"模型：{self._asr_api_model}，预计 {expected_chunks} 段", force=True)
             subs = []
-            detected_lang = None
+            checkpoint = self.__get_asr_checkpoint(task, video_file, expected_chunks, lang)
+            checkpoint_chunks = (checkpoint or {}).get("chunks") or {}
+            detected_lang = (checkpoint or {}).get("detected_lang")
             processed_chunks = 0
 
             def handle_chunk(chunk_file: str):
@@ -1276,6 +1502,28 @@ class AutoSubRemoteAsr(_PluginBase):
                 chunk_no = self.__get_chunk_no(chunk_file)
                 checked = self.__should_check_asr_chunk(chunk_no, expected_chunks)
                 self.__validate_audio_chunk(chunk_file, chunk_no, expected_chunks, force=checked)
+
+                cached_response = checkpoint_chunks.get(str(chunk_no))
+                if cached_response is not None:
+                    try:
+                        response = copy.deepcopy(cached_response)
+                        self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
+                        detected_lang = detected_lang or response.get("language")
+                        offset = (chunk_no - 1) * self._asr_chunk_seconds
+                        self.__append_asr_response_subs(subs, response, offset, chunk_file)
+                        processed_chunks += 1
+                        try:
+                            os.remove(chunk_file)
+                        except Exception as err:
+                            logger.warn(f"删除临时音频分段失败：{chunk_file} - {err}")
+                        percent = self.__scale_progress(24, 72, processed_chunks, expected_chunks)
+                        self.__update_task_progress(task, percent, "提取并识别音频",
+                                                    f"断点恢复 {processed_chunks}/{expected_chunks or '?'} 段，"
+                                                    f"已识别 {len(subs)} 条")
+                        return
+                    except Exception as err:
+                        logger.warn(f"接口ASR断点第 {chunk_no}/{expected_chunks or '?'} 段不可用，重新识别：{err}")
+
                 percent = self.__scale_progress(24, 72, processed_chunks, expected_chunks)
                 self.__update_task_progress(task, percent, "提取并识别音频",
                                             f"第 {chunk_no}/{expected_chunks or '?'} 段正在上传ASR")
@@ -1293,6 +1541,8 @@ class AutoSubRemoteAsr(_PluginBase):
                     raise
                 self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
                 detected_lang = detected_lang or response.get("language")
+                self.__save_asr_chunk_checkpoint(task, video_file, expected_chunks, lang,
+                                                 chunk_no, response, detected_lang)
                 offset = (chunk_no - 1) * self._asr_chunk_seconds
                 self.__append_asr_response_subs(subs, response, offset, chunk_file)
                 processed_chunks += 1
@@ -1334,6 +1584,7 @@ class AutoSubRemoteAsr(_PluginBase):
             if not subs:
                 logger.info("音频文件中未检测到任何语言内容，生成空字幕文件以避免重复处理")
             self.__update_task_progress(task, 72, "语音识别完成", f"识别到 {len(subs)} 条字幕", force=True)
+            self.__clear_asr_checkpoint(task, video_file)
             logger.info("接口音轨转字幕完成")
             return True, final_lang, subs
         except UserInterruptException:
@@ -1786,15 +2037,29 @@ class AutoSubRemoteAsr(_PluginBase):
 
         stats['total'] = len(valid_subs)
         self.__update_task_progress(task, 76, "翻译字幕", f"共 {len(valid_subs)} 行", force=True)
-        processed = []
+        checkpoint = self.__get_translate_checkpoint(task, source_subtitle, dest_subtitle, len(valid_subs))
+        checkpoint_items = (checkpoint or {}).get("items") or {}
+        cached_count = 0
+        while cached_count < len(valid_subs) and str(cached_count) in checkpoint_items:
+            valid_subs[cached_count].content = checkpoint_items[str(cached_count)]
+            cached_count += 1
+        processed = list(valid_subs[:cached_count])
+        if cached_count:
+            cached_fail = sum(1 for item in processed if (item.content or "").startswith("[翻译失败]"))
+            stats['line_fail'] += cached_fail
+            stats['batch_success'] += cached_count - cached_fail
+            percent = self.__scale_progress(76, 98, len(processed), len(valid_subs))
+            self.__update_task_progress(task, percent, "翻译字幕",
+                                        f"断点恢复 {len(processed)}/{len(valid_subs)} 行", force=True)
         current_batch = []
 
-        for item in valid_subs:
+        for item in valid_subs[cached_count:]:
             current_batch.append(item)
 
             if len(current_batch) >= self._batch_size:
                 processed += self.__process_items(valid_subs, current_batch, stats)
                 current_batch = []
+                self.__save_translate_checkpoint(task, source_subtitle, dest_subtitle, len(valid_subs), processed)
                 logger.info(f"进度: {len(processed)}/{len(valid_subs)}")
                 percent = self.__scale_progress(76, 98, len(processed), len(valid_subs))
                 self.__update_task_progress(task, percent, "翻译字幕",
@@ -1802,6 +2067,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
         if current_batch:
             processed += self.__process_items(valid_subs, current_batch, stats)
+            self.__save_translate_checkpoint(task, source_subtitle, dest_subtitle, len(valid_subs), processed)
             percent = self.__scale_progress(76, 98, len(processed), len(valid_subs))
             self.__update_task_progress(task, percent, "翻译字幕",
                                         f"{len(processed)}/{len(valid_subs)} 行", force=True)
@@ -1811,9 +2077,11 @@ class AutoSubRemoteAsr(_PluginBase):
             logger.error("字幕翻译全部失败，不生成中文字幕文件")
             self.__update_task_progress(task, task.progress if task else 76, "翻译失败",
                                         f"全部 {stats['total']} 行翻译失败", force=True)
+            self.__clear_translate_checkpoint(task, source_subtitle, dest_subtitle)
             return False
 
         self.__save_srt(dest_subtitle, processed)
+        self.__clear_translate_checkpoint(task, source_subtitle, dest_subtitle)
         detail = f"已翻译 {translated_count}/{stats['total']} 行"
         if stats['line_fail']:
             detail += f"，失败 {stats['line_fail']} 行"
@@ -2024,12 +2292,12 @@ class AutoSubRemoteAsr(_PluginBase):
                                 'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSwitch',
                                         'props': {
-                                            'model': 'cpu_threads',
-                                            'label': 'CPU线程上限',
-                                            'placeholder': '2',
-                                            'hint': '限制ffmpeg音频提取线程，建议1-2'
+                                            'model': 'retry_failed_once',
+                                            'label': '失败任务重试一次',
+                                            'color': 'secondary',
+                                            'hint': '将失败状态任务重新加入队列，执行后自动关闭'
                                         }
                                     }
                                 ]
@@ -2497,7 +2765,8 @@ class AutoSubRemoteAsr(_PluginBase):
                                                                 'props': {
                                                                     'model': 'batch_size',
                                                                     'label': '每批翻译行数',
-                                                                    'placeholder': '10'
+                                                                    'placeholder': '10',
+                                                                    'hint': '批量翻译时每次提交的字幕行数，范围1-50'
                                                                 }
                                                             }
                                                         ]
@@ -2553,6 +2822,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "enabled": False,
             "clear_history": False,
             "send_notify": False,
+            "retry_failed_once": False,
             "listen_transfer_event": True,
             "run_now": False,
             "path_list": "",
@@ -2560,7 +2830,6 @@ class AutoSubRemoteAsr(_PluginBase):
             "auto_scan_cron": "*/10 * * * *",
             "integrity_retry_minutes": 10,
             "parallel_tasks": 1,
-            "cpu_threads": 2,
             "full_integrity_check": False,
             "translate_preference": "english_first",
             "translate_zh": True,
