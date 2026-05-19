@@ -42,7 +42,7 @@
   "AutoSubv2Plus": {
     "name": "AI字幕自动生成(v2) 私有版",
     "description": "复刻 AI 字幕自动生成，支持定时扫描媒体路径；不完整视频等待重试，不计失败。",
-    "version": "2.5.10",
+    "version": "2.5.11",
     "icon": "mdi-subtitles-outline",
     "author": "Ellick",
     "level": 2

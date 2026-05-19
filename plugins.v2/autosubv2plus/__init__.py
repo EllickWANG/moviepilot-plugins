@@ -75,7 +75,7 @@ class AutoSubv2Plus(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.5.10"
+    plugin_version = "2.5.11"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -100,6 +100,8 @@ class AutoSubv2Plus(_PluginBase):
     _auto_scan_thread = None
     _auto_scan_lock = None
     _parallel_tasks = 1
+    _cpu_threads = 2
+    _full_integrity_check = False
     _integrity_retry_interval = 10 * 60
     _auto_scan_enabled = True
     _auto_scan_cron = "*/10 * * * *"
@@ -147,6 +149,14 @@ class AutoSubv2Plus(_PluginBase):
             return 1
 
     @staticmethod
+    def __normalize_cpu_threads(value) -> int:
+        try:
+            max_threads = max(1, min(4, psutil.cpu_count(logical=False) or 1))
+            return max(1, min(max_threads, int(value or 2)))
+        except Exception:
+            return 2
+
+    @staticmethod
     def __normalize_retry_minutes(value) -> int:
         try:
             return max(5, min(1440, int(value or 10)))
@@ -177,6 +187,8 @@ class AutoSubv2Plus(_PluginBase):
         self._path_list = self.__normalize_path_list(config.get('path_list'))
         self._send_notify = config.get('send_notify', False)
         self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
+        self._cpu_threads = self.__normalize_cpu_threads(config.get('cpu_threads', 2))
+        self._full_integrity_check = bool(config.get('full_integrity_check', False))
         self._auto_scan_enabled = bool(config.get('auto_scan_enabled', True))
         self._auto_scan_cron = str(config.get('auto_scan_cron') or "*/10 * * * *").strip()
         self._integrity_retry_interval = self.__normalize_retry_minutes(config.get('integrity_retry_minutes')) * 60
@@ -235,6 +247,9 @@ class AutoSubv2Plus(_PluginBase):
             self._enable_merge = config.get('enable_merge', False)
 
         if self._enabled:
+            alive_threads = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
+            if not alive_threads:
+                self._event.clear()
             logger.info("AI生成字幕服务已启动")
             # asr 配置检查
             if self._enable_asr and not self.__check_asr():
@@ -788,20 +803,46 @@ class AutoSubv2Plus(_PluginBase):
             return 0.0
 
     def __check_video_integrity(self, video_file: str, task: Optional[TaskItem] = None) -> bool:
-        video_meta = Ffmpeg().get_video_metadata(video_file)
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+
+        self.__update_task_progress(task, 5, "校验视频完整性", "正在读取视频元数据", force=True)
+        video_meta = Ffmpeg().get_video_metadata(video_file, stop_event=self._event)
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+        if not video_meta:
+            self.__mark_waiting_file(task, "读取视频元数据失败，可能文件仍未完整")
+            return False
+
         duration = self.__get_video_duration(video_meta)
+        streams = video_meta.get("streams") or []
+        video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
+        if not video_streams:
+            self.__mark_waiting_file(task, "未读取到视频流，可能文件仍未完整")
+            return False
+        if duration <= 0:
+            self.__mark_waiting_file(task, "未读取到有效时长，可能文件仍未完整")
+            return False
+
+        if not self._full_integrity_check:
+            self.__update_task_progress(task, 24, "视频完整性通过", "元数据校验通过", force=True)
+            return True
 
         def update_progress(out_time: float, total_duration: float):
             percent = self.__scale_progress(5, 24, out_time, total_duration)
             detail = f"{out_time:.1f}/{total_duration:.1f} 秒" if total_duration else "正在完整扫描视频"
             self.__update_task_progress(task, percent, "校验视频完整性", detail)
 
-        self.__update_task_progress(task, 5, "校验视频完整性", "正在完整扫描视频", force=True)
+        self.__update_task_progress(task, 5, "校验视频完整性", "正在完整解码扫描视频", force=True)
         ok, error = Ffmpeg().check_video_integrity(
             video_file,
             duration=duration,
-            progress_callback=update_progress if duration else None
+            progress_callback=update_progress if duration else None,
+            stop_event=self._event,
+            threads=self._cpu_threads
         )
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
         if ok:
             self.__update_task_progress(task, 24, "视频完整性通过", "视频可完整解码", force=True)
             return True
@@ -831,6 +872,8 @@ class AutoSubv2Plus(_PluginBase):
             # 生成字幕
             ret, lang, gen_sub_path = self.__generate_subtitle(video_file, file_path, self._enable_asr, task)
             if not ret:
+                if task and task.status == TaskStatus.WAITING_FILE:
+                    return TaskStatus.WAITING_FILE
                 message = f" 媒体: {file_name}\n 生成字幕失败，跳过后续处理"
                 if self._send_notify:
                     self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
@@ -842,7 +885,13 @@ class AutoSubv2Plus(_PluginBase):
             if self._translate_zh:
                 # 翻译字幕
                 logger.info(f"开始翻译字幕为中文 ...")
-                self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt", task)
+                if not self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt", task):
+                    message = f" 媒体: {file_name}\n 翻译字幕失败，跳过完成标记"
+                    if self._send_notify:
+                        self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
+                    self.__update_task_progress(task, task.progress if task else 0, "处理失败",
+                                                "中文字幕翻译失败", force=True)
+                    return TaskStatus.FAILED
                 logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
                 self.__update_task_progress(task, 98, "翻译完成", "中文字幕已生成", force=True)
 
@@ -857,8 +906,9 @@ class AutoSubv2Plus(_PluginBase):
             return TaskStatus.COMPLETED
         except UserInterruptException:
             logger.info(f"用户中断当前任务：{video_file}")
-            self.__update_task_progress(task, task.progress if task else 0, "已中断", "用户中断当前任务", force=True)
-            return TaskStatus.FAILED
+            self.__update_task_progress(task, task.progress if task else 0, "等待重新处理",
+                                        "用户中断当前任务", force=True)
+            return TaskStatus.PENDING
         except Exception as e:
             logger.error(f"自动字幕生成 处理异常：{e}")
             end_time = time.time()
@@ -891,7 +941,7 @@ class AutoSubv2Plus(_PluginBase):
                 os.environ["HTTPS_PROXY"] = settings.PROXY['https']
             model = WhisperModel(
                 download_model(self._faster_whisper_model, local_files_only=False, cache_dir=cache_dir),
-                device="cpu", compute_type="int8", cpu_threads=psutil.cpu_count(logical=False))
+                device="cpu", compute_type="int8", cpu_threads=self._cpu_threads, num_workers=1)
             
             try:
                 self.__update_task_progress(task, 38, "语音识别", "开始转录音频", force=True)
@@ -970,10 +1020,12 @@ class AutoSubv2Plus(_PluginBase):
         """
         # 获取文件元数据
         self.__update_task_progress(task, 6, "读取媒体信息", "正在读取视频元数据", force=True)
-        video_meta = Ffmpeg().get_video_metadata(video_file)
+        video_meta = Ffmpeg().get_video_metadata(video_file, stop_event=self._event)
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
         if not video_meta:
             logger.error(f"获取视频文件元数据失败，跳过后续处理")
-            self.__update_task_progress(task, 6, "处理失败", "获取视频文件元数据失败", force=True)
+            self.__mark_waiting_file(task, "获取视频文件元数据失败，可能文件仍未完整")
             return False, None, None
         # 获取字幕语言偏好
         if self._translate_preference == "english_only":
@@ -1058,7 +1110,12 @@ class AutoSubv2Plus(_PluginBase):
                 if (inner_sub_lang and iso639.find(inner_sub_lang) and iso639.to_iso639_1(inner_sub_lang)) else 'und'
             extracted_sub_path = f"{subtitle_file}.{inner_sub_lang}.srt"
             self.__update_task_progress(task, 28, "提取内嵌字幕", f"字幕语言：{inner_sub_lang}", force=True)
-            Ffmpeg().extract_subtitle_from_video(video_file, extracted_sub_path, subtitle_index)
+            if not Ffmpeg().extract_subtitle_from_video(video_file, extracted_sub_path, subtitle_index,
+                                                        stop_event=self._event, threads=self._cpu_threads):
+                if self._event.is_set():
+                    raise UserInterruptException("用户中断当前任务")
+                self.__mark_waiting_file(task, "提取内嵌字幕失败，可能文件仍未完整")
+                return False, None, None
             logger.info(f"提取字幕完成：{extracted_sub_path}")
             self.__update_task_progress(task, 65, "提取内嵌字幕完成", f"字幕语言：{inner_sub_lang}", force=True)
             return True, inner_sub_lang, extracted_sub_path
@@ -1081,7 +1138,12 @@ class AutoSubv2Plus(_PluginBase):
             # 提取音频
             logger.info(f"正在提取音频：{audio_file.name} ...")
             self.__update_task_progress(task, 24, "提取音频", "正在从视频提取音轨", force=True)
-            Ffmpeg().extract_wav_from_video(video_file, audio_file.name, audio_index)
+            if not Ffmpeg().extract_wav_from_video(video_file, audio_file.name, audio_index,
+                                                   stop_event=self._event, threads=self._cpu_threads):
+                if self._event.is_set():
+                    raise UserInterruptException("用户中断当前任务")
+                self.__mark_waiting_file(task, "提取音频失败，可能文件仍未完整")
+                return False, None, None
             logger.info(f"提取音频完成：{audio_file.name}")
             self.__update_task_progress(task, 30, "提取音频完成", "音频已提取，准备识别", force=True)
 
@@ -1377,11 +1439,12 @@ class AutoSubv2Plus(_PluginBase):
             return item
         else:
             item.content = f"[翻译失败]\n{item.content}"
+            stats['line_fail'] += 1
             return item
 
     def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str,
                                 task: Optional[TaskItem] = None):
-        stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0}
+        stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0, 'line_fail': 0}
         subs = self.__load_srt(source_subtitle)
         if source_lang in ["en", "eng"] and self._enable_merge:
             valid_subs = self.__merge_srt(subs)
@@ -1394,7 +1457,7 @@ class AutoSubv2Plus(_PluginBase):
             # 创建一个空的字幕文件
             self.__save_srt(dest_subtitle, [])
             self.__update_task_progress(task, 98, "翻译完成", "字幕为空，已生成空中文字幕", force=True)
-            return
+            return True
             
         stats['total'] = len(valid_subs)
         self.__update_task_progress(task, 76, "翻译字幕", f"共 {len(valid_subs)} 行", force=True)
@@ -1418,10 +1481,20 @@ class AutoSubv2Plus(_PluginBase):
             self.__update_task_progress(task, percent, "翻译字幕",
                                         f"{len(processed)}/{len(valid_subs)} 行", force=True)
 
+        translated_count = stats['batch_success'] + stats['line_fallback']
+        if stats['total'] > 0 and translated_count <= 0:
+            logger.error("字幕翻译全部失败，不生成中文字幕文件")
+            self.__update_task_progress(task, task.progress if task else 76, "翻译失败",
+                                        f"全部 {stats['total']} 行翻译失败", force=True)
+            return False
+
         self.__save_srt(dest_subtitle, processed)
-        self.__update_task_progress(task, 98, "翻译完成", f"已翻译 {len(processed)} 行", force=True)
-        
-        success_rate = (stats['batch_success'] / stats['total'] * 100) if stats['total'] > 0 else 0.0
+        detail = f"已翻译 {translated_count}/{stats['total']} 行"
+        if stats['line_fail']:
+            detail += f"，失败 {stats['line_fail']} 行"
+        self.__update_task_progress(task, 98, "翻译完成", detail, force=True)
+
+        success_rate = (translated_count / stats['total'] * 100) if stats['total'] > 0 else 0.0
         
         logger.info(f"""
     翻译完成！
@@ -1429,7 +1502,20 @@ class AutoSubv2Plus(_PluginBase):
     批次成功: {stats['batch_success']} ({success_rate:.1f}%)
     批次失败: {stats['batch_fail']}
     行补偿翻译: {stats['line_fallback']}
+    行翻译失败: {stats['line_fail']}
             """)
+        return True
+
+    @staticmethod
+    def __is_failed_machine_subtitle(subtitle_path: str) -> bool:
+        try:
+            subs = AutoSubv2Plus.__load_srt(subtitle_path)
+        except Exception:
+            return False
+        if not subs:
+            return False
+        failed = sum(1 for item in subs if "[翻译失败]" in (item.content or ""))
+        return failed == len(subs) or failed / len(subs) >= 0.8
 
     @staticmethod
     def __external_subtitle_exists(video_file, prefer_langs=None, only_srt=False, strict=True):
@@ -1499,6 +1585,9 @@ class AutoSubv2Plus(_PluginBase):
 
             # 如果没有语言标记，跳过
             if not subtitle_lang:
+                continue
+            if "机翻" in metadata and AutoSubv2Plus.__is_failed_machine_subtitle(os.path.join(video_dir, file)):
+                logger.warn(f"跳过无效机翻字幕：{file}")
                 continue
 
             # 如果指定了偏好语言
@@ -1596,6 +1685,40 @@ class AutoSubv2Plus(_PluginBase):
                                         'props': {
                                             'model': 'send_notify',
                                             'label': '发送通知'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cpu_threads',
+                                            'label': 'CPU线程上限',
+                                            'placeholder': '2',
+                                            'hint': '限制ffmpeg和whisper单任务CPU线程，建议1-2'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'full_integrity_check',
+                                            'label': '完整解码校验',
+                                            'hint': '高CPU。关闭时仅用ffprobe元数据判断视频是否可处理'
                                         }
                                     }
                                 ]
@@ -2107,6 +2230,8 @@ class AutoSubv2Plus(_PluginBase):
             "auto_scan_cron": "*/10 * * * *",
             "integrity_retry_minutes": 10,
             "parallel_tasks": 1,
+            "cpu_threads": 2,
+            "full_integrity_check": False,
             "translate_preference": "english_first",
             "translate_zh": False,
             "enable_asr": True,
@@ -2484,7 +2609,10 @@ class AutoSubv2Plus(_PluginBase):
         if alive_threads:
             logger.info("正在停止当前任务...")
             for thread in alive_threads:
-                thread.join()
+                thread.join(timeout=15)
+            alive_threads = [thread for thread in alive_threads if thread.is_alive()]
+            if alive_threads:
+                logger.warn(f"仍有 {len(alive_threads)} 个任务线程未退出，将在后台继续等待中断")
 
         if self._task_queue:
             while not self._task_queue.empty():
@@ -2510,5 +2638,6 @@ class AutoSubv2Plus(_PluginBase):
         self._current_processing_tasks = {}
         self._scheduled_retry_tasks = {}
         self._auto_scan_thread = None
-        self._event.clear()
+        if not alive_threads:
+            self._event.clear()
         logger.info(f"自动字幕生成服务已停止")
