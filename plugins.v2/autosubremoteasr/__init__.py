@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.13"
+    plugin_version = "1.0.14"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -110,6 +110,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _consumer_threads: Dict[int, threading.Thread] = None
     _current_processing_task = None
     _current_processing_tasks: Dict[str, TaskItem] = None
+    _queued_task_ids = None
     _tasks_lock = None
     _progress_save_at: Dict[str, float] = None
     _scheduled_retry_tasks: Dict[str, float] = None
@@ -162,6 +163,8 @@ class AutoSubRemoteAsr(_PluginBase):
             self._consumer_threads = {}
         if self._current_processing_tasks is None:
             self._current_processing_tasks = {}
+        if self._queued_task_ids is None:
+            self._queued_task_ids = set()
         if self._progress_save_at is None:
             self._progress_save_at = {}
         if self._scheduled_retry_tasks is None:
@@ -174,7 +177,7 @@ class AutoSubRemoteAsr(_PluginBase):
     @staticmethod
     def __normalize_parallel_tasks(value) -> int:
         try:
-            return max(1, min(3, int(value or 1)))
+            return max(1, int(value or 1))
         except Exception:
             return 1
 
@@ -429,6 +432,17 @@ class AutoSubRemoteAsr(_PluginBase):
         self._consumer_thread = self._consumer_threads.get(1)
         logger.info(f"任务队列和消费者线程已启动，并行任务数：{self._parallel_tasks}")
 
+    def __enqueue_task(self, task: Optional[TaskItem]) -> bool:
+        self.__ensure_runtime_state()
+        if not self._running or not self._task_queue or not task:
+            return False
+        with self._tasks_lock:
+            if task.task_id in self._queued_task_ids or task.task_id in self._current_processing_tasks:
+                return False
+            self._queued_task_ids.add(task.task_id)
+        self._task_queue.put(task)
+        return True
+
     def __enqueue_existing_tasks(self):
         now = datetime.now()
         changed = False
@@ -443,12 +457,12 @@ class AutoSubRemoteAsr(_PluginBase):
                 task.progress_updated = now
                 changed = True
             if task.status == TaskStatus.PENDING:
-                self._task_queue.put(task)
+                self.__enqueue_task(task)
             elif task.status == TaskStatus.WAITING_FILE:
                 if task.next_retry_time and task.next_retry_time > now:
                     self.__schedule_waiting_file_retry(task)
                 else:
-                    self._task_queue.put(task)
+                    self.__enqueue_task(task)
         if changed:
             self.save_tasks()
 
@@ -497,7 +511,7 @@ class AutoSubRemoteAsr(_PluginBase):
             task.progress_updated = datetime.now()
             self._tasks[task_id] = task
             self.save_tasks()
-        self._task_queue.put(task)
+        self.__enqueue_task(task)
         logger.info(f"等待完整的视频已重新加入队列：{task.video_file}")
         return True
 
@@ -877,7 +891,9 @@ class AutoSubRemoteAsr(_PluginBase):
             logger.warn(f"任务队列未启动，跳过添加：{video_file}")
             return False
 
-        self._task_queue.put(task)
+        if not self.__enqueue_task(task):
+            logger.info(f"任务已在队列或处理中，跳过重复添加：{video_file}")
+            return False
         with self._tasks_lock:
             self._tasks[task.task_id] = task
             self.save_tasks()
@@ -919,7 +935,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 self.save_tasks()
 
         for task in retry_tasks:
-            self._task_queue.put(task)
+            self.__enqueue_task(task)
         logger.info(f"失败任务已重新加入队列：{len(retry_tasks)}")
         return len(retry_tasks)
 
@@ -963,6 +979,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__safe_task_done()
                     continue
                 with self._tasks_lock:
+                    self._queued_task_ids.discard(task.task_id)
                     self._current_processing_task = task if worker_index == 1 else self._current_processing_task
                     self._current_processing_tasks[task.task_id] = task
                 logger.info(f"工作线程 {worker_index} 开始处理任务 {task.task_id}: {task.video_file}")
@@ -1105,7 +1122,18 @@ class AutoSubRemoteAsr(_PluginBase):
         now = datetime.now()
         latest_task = self.__find_latest_task_by_video_file(video_file)
         if latest_task:
-            if latest_task.status in [TaskStatus.PENDING, TaskStatus.IN_PROGRESS]:
+            if latest_task.status == TaskStatus.PENDING:
+                if self.__enqueue_task(latest_task):
+                    latest_task.complete_time = None
+                    latest_task.progress_stage = "等待重新处理"
+                    latest_task.progress_detail = "扫描发现等待任务未在队列，已重新排队"
+                    latest_task.progress_updated = now
+                    with self._tasks_lock:
+                        self._tasks[latest_task.task_id] = latest_task
+                        self.save_tasks()
+                    return "requeued"
+                return "active"
+            if latest_task.status == TaskStatus.IN_PROGRESS:
                 return "active"
             if latest_task.status == TaskStatus.WAITING_FILE:
                 if latest_task.next_retry_time and latest_task.next_retry_time > now:
@@ -2553,7 +2581,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "parallel_tasks",
                             "并行任务数",
                             "1",
-                            "同一时间处理的视频数量，范围1-3",
+                            "同一时间处理的视频数量，接口不稳定时建议谨慎调高",
                         ),
                         md=4,
                     ),
@@ -2942,7 +2970,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                             'model': 'parallel_tasks',
                                             'label': '并行任务数',
                                             'placeholder': '默认1，建议1-2',
-                                            'hint': '同一时间处理的字幕任务数量，范围1-3'
+                                            'hint': '同一时间处理的字幕任务数量'
                                         }
                                     }
                                 ]
@@ -4141,6 +4169,8 @@ class AutoSubRemoteAsr(_PluginBase):
                     break
                 self.__safe_task_done()
             logger.info("任务队列已清空")
+        with self._tasks_lock:
+            self._queued_task_ids = set()
         if self._tasks is not None:
             for task_id in list(self._tasks.keys()):
                 task = self._tasks[task_id]
