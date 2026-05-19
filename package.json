@@ -44,9 +44,9 @@
     "level": 2,
     "v2": true
   },
-  "AutoSubv2": {
-    "name": "AI字幕自动生成(v2)",
-    "description": "使用 whisper 自动生成视频文件字幕，并使用大模型翻译字幕成中文；私有修复 OpenAI/httpx 代理兼容。",
+  "AutoSubv2Plus": {
+    "name": "AI字幕自动生成(v2) 私有版",
+    "description": "复刻 AI 字幕自动生成，使用 whisper 生成字幕并支持大模型翻译；修复 OpenAI/httpx 代理兼容。",
     "version": "2.5.6",
     "icon": "mdi-subtitles-outline",
     "author": "Ellick",

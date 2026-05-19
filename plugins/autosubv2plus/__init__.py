@@ -56,9 +56,9 @@ class TaskItem:
     complete_time: datetime = None
 
 
-class AutoSubv2(_PluginBase):
+class AutoSubv2Plus(_PluginBase):
     # 插件名称
-    plugin_name = "AI字幕自动生成(v2)"
+    plugin_name = "AI字幕自动生成(v2) 私有版"
     # 插件描述
     plugin_desc = "使用 whisper 自动生成视频文件字幕，并使用大模型翻译字幕成中文。"
     # 插件图标
@@ -72,7 +72,7 @@ class AutoSubv2(_PluginBase):
     # 作者主页
     author_url = "https://github.com/EllickWANG"
     # 插件配置项ID前缀
-    plugin_config_prefix = "autosubv2"
+    plugin_config_prefix = "autosubv2plus"
     # 加载顺序
     plugin_order = 14
     # 可使用的用户级别
@@ -1521,7 +1521,7 @@ class AutoSubv2(_PluginBase):
                                             {
                                                 'component': 'a',
                                                 'props': {
-                                                    'href': 'https://github.com/EllickWANG/moviepilot-plugins/blob/main/plugins.v2/autosubv2/README.md',
+                                                    'href': 'https://github.com/EllickWANG/moviepilot-plugins/blob/main/plugins.v2/autosubv2plus/README.md',
                                                     'target': '_blank'
                                                 },
                                                 'content': [
