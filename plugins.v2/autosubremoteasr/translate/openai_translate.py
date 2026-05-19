@@ -7,8 +7,22 @@ from typing import List, Union
 
 import httpx
 from cacheout import Cache
+from app.log import logger
 
 OpenAISessionCache = Cache(maxsize=100, ttl=3600, timer=time.time, default=None)
+LOG_PREVIEW_LIMIT = 6000
+
+
+def _preview(value, limit: int = LOG_PREVIEW_LIMIT) -> str:
+    try:
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        value = str(value)
+    value = value.replace("\r", "\\r")
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
 
 
 def _to_namespace(value):
@@ -130,13 +144,30 @@ class OpenAi:
             "messages": message,
         }
         payload.update(kwargs)
-        response = self.client.post(
-            f"{self._base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
+        url = f"{self._base_url}/chat/completions"
+        logger.info(
+            f"接口翻译请求：url={url} model={self._model} timeout={self._timeout}s "
+            f"messages={len(payload.get('messages') or [])} payload={_preview(payload)}"
+        )
+        started_at = time.time()
+        try:
+            response = self.client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        except Exception as err:
+            logger.error(
+                f"接口翻译请求异常：url={url} model={self._model} "
+                f"elapsed={time.time() - started_at:.2f}s error={err}"
+            )
+            raise
+        logger.info(
+            f"接口翻译响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
+            f"body={_preview(response.text)}"
         )
         try:
             response.raise_for_status()
@@ -190,10 +221,10 @@ class OpenAi:
                     base_delay = 2 ** attempt  # 指数退避: 1s, 2s, 4s...
                     jitter = random.uniform(0.1, 0.9)  # 随机抖动: 0.1-0.9秒
                     sleep_time = base_delay + jitter
-                    print(f"翻译请求失败 (第{attempt + 1}次尝试)：{last_error}，{sleep_time:.1f}秒后重试...")
+                    logger.warn(f"翻译请求失败 (第{attempt + 1}次尝试)：{last_error}，{sleep_time:.1f}秒后重试...")
                     time.sleep(sleep_time)
                 else:
-                    print(f"翻译请求失败 (已重试{max_retries}次)：{last_error}")
+                    logger.warn(f"翻译请求失败 (已重试{max_retries}次)：{last_error}")
                     return False, f"{last_error}"
 
     def translate_subtitle_items_to_zh(self, items: List[dict], context: str = None, max_retries: int = 3):
@@ -234,8 +265,8 @@ class OpenAi:
                     base_delay = 2 ** attempt
                     jitter = random.uniform(0.1, 0.9)
                     sleep_time = base_delay + jitter
-                    print(f"批量字幕翻译请求失败 (第{attempt + 1}次尝试)：{last_error}，{sleep_time:.1f}秒后重试...")
+                    logger.warn(f"批量字幕翻译请求失败 (第{attempt + 1}次尝试)：{last_error}，{sleep_time:.1f}秒后重试...")
                     time.sleep(sleep_time)
                 else:
-                    print(f"批量字幕翻译请求失败 (已重试{max_retries}次)：{last_error}")
+                    logger.warn(f"批量字幕翻译请求失败 (已重试{max_retries}次)：{last_error}")
                     return False, f"{last_error}"

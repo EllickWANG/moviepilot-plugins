@@ -50,6 +50,18 @@ class AsrRequestError(RuntimeError):
         self.retryable = retryable
 
 
+def _log_preview(value: Any, limit: int = 6000) -> str:
+    try:
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        value = str(value)
+    value = value.replace("\r", "\\r")
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+
+
 class TaskSource(Enum):
     MANUAL = "manual"
     EVENT = "event"
@@ -91,7 +103,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.25"
+    plugin_version = "1.0.26"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1444,14 +1456,35 @@ class AutoSubRemoteAsr(_PluginBase):
         if request_lang:
             data["language"] = request_lang
 
+        url = f"{self.__get_openai_base_url()}/audio/transcriptions"
+        try:
+            audio_size = os.path.getsize(audio_file)
+        except Exception:
+            audio_size = -1
+        logger.info(
+            f"接口ASR请求：url={url} model={self._asr_api_model} timeout={self._asr_request_timeout}s "
+            f"file={os.path.basename(audio_file)} size={audio_size} data={_log_preview(data)}"
+        )
+        started_at = time.time()
         with self.__create_openai_http_client(timeout=self._asr_request_timeout) as client:
             with open(audio_file, "rb") as file_obj:
-                response = client.post(
-                    f"{self.__get_openai_base_url()}/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {self._openai_api_key}"},
-                    data=data,
-                    files={"file": (os.path.basename(audio_file), file_obj, "audio/mpeg")},
-                )
+                try:
+                    response = client.post(
+                        url,
+                        headers={"Authorization": f"Bearer {self._openai_api_key}"},
+                        data=data,
+                        files={"file": (os.path.basename(audio_file), file_obj, "audio/mpeg")},
+                    )
+                except Exception as err:
+                    logger.error(
+                        f"接口ASR请求异常：url={url} model={self._asr_api_model} "
+                        f"elapsed={time.time() - started_at:.2f}s error={err}"
+                    )
+                    raise
+        logger.info(
+            f"接口ASR响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
+            f"body={_log_preview(response.text)}"
+        )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as err:
