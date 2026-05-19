@@ -66,7 +66,7 @@ class AutoSubv2(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.5.4"
+    plugin_version = "2.5.5"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -129,6 +129,16 @@ class AutoSubv2(_PluginBase):
             self._huggingface_proxy = config.get('proxy', True)
             self._auto_detect_language = config.get('auto_detect_language', False)
         self._translate_zh = config.get('translate_zh', False)
+
+        if self._clear_history:
+            config['clear_history'] = False
+            self.update_config(config)
+            self.clear_tasks()
+
+        if not self._enabled and not self._run_now:
+            self.stop_service()
+            return
+
         if self._translate_zh:
             use_chatgpt = config.get('use_chatgpt', True)
             if use_chatgpt:
@@ -163,10 +173,6 @@ class AutoSubv2(_PluginBase):
             self._max_retries = int(config.get('max_retries')) if config.get('max_retries') else 3
             self._enable_merge = config.get('enable_merge', False)
 
-        if self._clear_history:
-            config['clear_history'] = False
-            self.update_config(config)
-            self.clear_tasks()
         if self._enabled:
             logger.info("AI生成字幕服务已启动")
             # asr 配置检查
