@@ -58,7 +58,7 @@
   "IYUUAutoSeedPlus": {
     "name": "IYUU自动辅种增强",
     "description": "复刻官方IYUU自动辅种，增加IYUU/下载器请求超时、每批Hash数量和站点域名匹配配置。",
-    "version": "2.15.12",
+    "version": "2.15.13",
     "icon": "mdi-seed-plus",
     "author": "Ellick",
     "level": 2

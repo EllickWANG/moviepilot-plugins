@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.12"
+    plugin_version = "2.15.13"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -217,6 +217,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     exist = 0
     fail = 0
     cached = 0
+    _missing_site_counts = {}
 
     def init_plugin(self, config: dict = None):
 
@@ -976,6 +977,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             self.exist = 0
             self.fail = 0
             self.cached = 0
+            self._missing_site_counts = {}
             # 扫描下载器辅种
             for service in services.values():
                 if stop_event.is_set():
@@ -1060,6 +1062,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                     logger.info(f"没有需要辅种的种子")
 
             # 保存缓存
+            self.__log_missing_site_summary()
             self.__update_config()
             # 发送消息
             if self._notify:
@@ -1182,6 +1185,9 @@ class IYUUAutoSeedPlus(_PluginBase):
             return
         else:
             logger.info(f"IYUU返回可辅种数：{len(seed_list)}")
+        skipped_existing = 0
+        skipped_success_cache = 0
+        skipped_error_cache = 0
         # 遍历
         for current_hash, seed_info in seed_list.items():
             if stop_event and stop_event.is_set():
@@ -1207,13 +1213,16 @@ class IYUUAutoSeedPlus(_PluginBase):
                 if not seed.get("sid") or not seed.get("info_hash"):
                     continue
                 if seed.get("info_hash") in hashs:
-                    logger.info(f"{seed.get('info_hash')} 已在下载器中，跳过 ...")
+                    skipped_existing += 1
+                    logger.debug(f"{seed.get('info_hash')} 已在下载器中，跳过 ...")
                     continue
                 if seed.get("info_hash") in self._success_caches:
-                    logger.info(f"{seed.get('info_hash')} 已处理过辅种，跳过 ...")
+                    skipped_success_cache += 1
+                    logger.debug(f"{seed.get('info_hash')} 已处理过辅种，跳过 ...")
                     continue
                 if seed.get("info_hash") in self._error_caches or seed.get("info_hash") in self._permanent_error_caches:
-                    logger.info(f"种子 {seed.get('info_hash')} 辅种失败且已缓存，跳过 ...")
+                    skipped_error_cache += 1
+                    logger.debug(f"种子 {seed.get('info_hash')} 辅种失败且已缓存，跳过 ...")
                     continue
                 # 添加任务 如果配置了主辅分离使用辅种下载器
                 if self._auto_downloader:
@@ -1235,7 +1244,38 @@ class IYUUAutoSeedPlus(_PluginBase):
                                     downloader=service.name,
                                     success_torrents=success_torrents)
 
+        skipped_total = skipped_existing + skipped_success_cache + skipped_error_cache
+        if skipped_total:
+            logger.info(
+                f"下载器 {service.name} 本批跳过 {skipped_total} 个辅种："
+                f"已在下载器 {skipped_existing}，已处理 {skipped_success_cache}，失败缓存 {skipped_error_cache}"
+            )
+
         logger.info(f"下载器 {service.name} 辅种完成")
+
+    def __record_missing_site(self, site_url: str):
+        """
+        记录 IYUU 返回但 MoviePilot 未维护的站点，避免逐条刷屏。
+        """
+        site_domain = _normalize_domain(site_url)
+        if not site_domain:
+            return
+        self._missing_site_counts[site_domain] = self._missing_site_counts.get(site_domain, 0) + 1
+        if self._missing_site_counts[site_domain] == 1:
+            logger.debug(f"没有维护种子对应的站点：{site_domain}")
+
+    def __log_missing_site_summary(self):
+        """
+        汇总未维护站点跳过情况。
+        """
+        if not self._missing_site_counts:
+            return
+        total = sum(self._missing_site_counts.values())
+        top_sites = sorted(self._missing_site_counts.items(), key=lambda item: item[1], reverse=True)[:20]
+        detail = "，".join(f"{domain}({count})" for domain, count in top_sites)
+        more_count = len(self._missing_site_counts) - len(top_sites)
+        more_text = f"，另有 {more_count} 个站点" if more_count > 0 else ""
+        logger.info(f"未维护站点跳过 {total} 次：{detail}{more_text}")
 
     def __save_history(self, current_hash: str, downloader: str, success_torrents: []):
         """
@@ -1482,7 +1522,7 @@ class IYUUAutoSeedPlus(_PluginBase):
         sites_helper = SitesHelper()
         site_info, site_domain = self.__get_site_info(sites_helper, site_url)
         if not site_info or not site_info.get('url'):
-            logger.debug(f"没有维护种子对应的站点：{site_url}")
+            self.__record_missing_site(site_url)
             return False
         if self._sites and site_info.get('id') not in self._sites:
             logger.info("当前站点不在选择的辅种站点范围，跳过 ...")
