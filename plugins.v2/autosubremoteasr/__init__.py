@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.14"
+    plugin_version = "1.0.16"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -124,6 +124,8 @@ class AutoSubRemoteAsr(_PluginBase):
     _asr_api_model = "whisper-1"
     _asr_chunk_minutes = 10
     _asr_chunk_seconds = 600
+    _asr_request_timeout = 300
+    _translate_request_timeout = 120
     _asr_random_check_rate = 0.2
     _asr_request_retries = 3
     _asr_retry_delays = (10, 30, 60)
@@ -210,6 +212,13 @@ class AutoSubRemoteAsr(_PluginBase):
             return 10
 
     @staticmethod
+    def __normalize_request_timeout(value, default: int) -> int:
+        try:
+            return max(10, min(1800, int(value or default)))
+        except Exception:
+            return default
+
+    @staticmethod
     def __normalize_path_list(value) -> List[str]:
         if not value:
             return []
@@ -290,12 +299,12 @@ class AutoSubRemoteAsr(_PluginBase):
             base_url = f"{base_url}/v1"
         return base_url
 
-    def __create_openai_http_client(self, timeout: int = 300) -> httpx.Client:
+    def __create_openai_http_client(self, timeout: Optional[int] = None) -> httpx.Client:
         proxy_url = None
         if self._openai_api_proxy:
             proxy_config = settings.PROXY or {}
             proxy_url = proxy_config.get("https") or proxy_config.get("http")
-        client_kwargs = {"timeout": timeout}
+        client_kwargs = {"timeout": timeout or self._asr_request_timeout}
         if proxy_url:
             httpx_client_params = inspect.signature(httpx.Client).parameters
             if "proxy" in httpx_client_params:
@@ -332,6 +341,8 @@ class AutoSubRemoteAsr(_PluginBase):
         self._asr_api_model = config.get('asr_api_model') or "whisper-1"
         self._asr_chunk_minutes = self.__normalize_asr_chunk_minutes(config.get('asr_chunk_minutes'))
         self._asr_chunk_seconds = self._asr_chunk_minutes * 60
+        self._asr_request_timeout = self.__normalize_request_timeout(config.get('asr_request_timeout'), 300)
+        self._translate_request_timeout = self.__normalize_request_timeout(config.get('translate_request_timeout'), 120)
         self._reuse_autosub_config = bool(config.get('reuse_autosub_config', True))
         self._auto_detect_language = config.get('auto_detect_language', False)
         self._translate_zh = config.get('translate_zh', False)
@@ -359,7 +370,8 @@ class AutoSubRemoteAsr(_PluginBase):
         if self._translate_zh:
             self._openai = OpenAi(api_key=self._openai_api_key, api_url=self._openai_api_url,
                                   proxy=settings.PROXY if self._openai_api_proxy else None,
-                                  model=self._openai_model, compatible=bool(self._openai_api_compatible))
+                                  model=self._openai_model, compatible=bool(self._openai_api_compatible),
+                                  timeout=self._translate_request_timeout)
 
         if self._enabled:
             alive_threads = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
@@ -1342,7 +1354,7 @@ class AutoSubRemoteAsr(_PluginBase):
         if request_lang:
             data["language"] = request_lang
 
-        with self.__create_openai_http_client(timeout=300) as client:
+        with self.__create_openai_http_client(timeout=self._asr_request_timeout) as client:
             with open(audio_file, "rb") as file_obj:
                 response = client.post(
                     f"{self.__get_openai_base_url()}/audio/transcriptions",
@@ -1410,11 +1422,22 @@ class AutoSubRemoteAsr(_PluginBase):
                 daemon=True
             )
             started_at = time.time()
+            forced_timeout = max(15, int(self._asr_request_timeout or 300) + 5)
             thread.start()
             while thread.is_alive():
                 if self._event.is_set():
                     raise UserInterruptException("用户中断当前任务")
                 elapsed = int(time.time() - started_at)
+                if elapsed >= forced_timeout:
+                    result["error"] = httpx.TimeoutException(
+                        f"接口ASR请求超过 {self._asr_request_timeout} 秒，已放弃本次请求"
+                    )
+                    result["traceback"] = ""
+                    logger.warn(
+                        f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段第 {attempt}/{max_attempts} 次"
+                        f"等待超过 {self._asr_request_timeout} 秒，强制进入重试"
+                    )
+                    break
                 self.__update_task_progress(
                     task,
                     base_progress,
@@ -2677,6 +2700,29 @@ class AutoSubRemoteAsr(_PluginBase):
                                             md=4,
                                         ),
                                         self.__form_col(
+                                            self.__form_text(
+                                                "asr_request_timeout",
+                                                "ASR超时秒",
+                                                "300",
+                                                "单段ASR请求超过此时间会放弃并重试",
+                                            ),
+                                            md=4,
+                                        ),
+                                        self.__form_col(
+                                            self.__form_text(
+                                                "translate_request_timeout",
+                                                "翻译超时秒",
+                                                "120",
+                                                "单次翻译请求超过此时间会放弃并重试",
+                                            ),
+                                            md=4,
+                                        ),
+                                    ],
+                                },
+                                {
+                                    "component": "VRow",
+                                    "content": [
+                                        self.__form_col(
                                             self.__form_text("context_window", "上下文窗口", "5"),
                                             md=4,
                                         ),
@@ -2740,6 +2786,8 @@ class AutoSubRemoteAsr(_PluginBase):
             "reuse_autosub_config": True,
             "asr_api_model": "whisper-1",
             "asr_chunk_minutes": 10,
+            "asr_request_timeout": 300,
+            "translate_request_timeout": 120,
             "use_chatgpt": False,
             "openai_proxy": False,
             "compatible": False,
@@ -3407,6 +3455,14 @@ class AutoSubRemoteAsr(_PluginBase):
                 "summary": "清理历史任务",
                 "description": "清理已完成、已忽略和失败任务记录，保留等待中和处理中任务。",
             },
+            {
+                "path": "/page_tab",
+                "endpoint": self.api_page_tab,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "切换任务页签",
+                "description": "切换任务记录页签。",
+            },
         ]
 
     def __start_manual_scan(self) -> bool:
@@ -3468,6 +3524,13 @@ class AutoSubRemoteAsr(_PluginBase):
         self.clear_tasks()
         after = len(self._tasks or {})
         return schemas.Response(success=True, message=f"已清理 {max(0, before - after)} 条历史记录")
+
+    def api_page_tab(self, payload: Optional[Dict[str, Any]] = None) -> schemas.Response:
+        tab = (payload or {}).get("tab") or "queue"
+        if tab not in {"queue", "waiting_file"}:
+            tab = "queue"
+        self.save_data("page_tab", tab)
+        return schemas.Response(success=True, message="已切换任务页签")
 
     @staticmethod
     def get_dashboard_meta() -> Optional[List[Dict[str, str]]]:
@@ -3794,6 +3857,148 @@ class AutoSubRemoteAsr(_PluginBase):
             ],
         }
 
+    def __task_table_rows(self, task_list: List[TaskItem]) -> List[dict]:
+        rows = []
+        for task in task_list[:200]:
+            filename = os.path.basename(task.video_file) or task.video_file
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {
+                        "component": "td",
+                        "content": [
+                            {"component": "div", "props": {"class": "text-body-2 font-weight-medium"}, "text": filename},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": "text-caption text-medium-emphasis",
+                                    "style": "max-width:520px;white-space:normal"
+                                },
+                                "text": task.video_file,
+                            },
+                        ],
+                    },
+                    {"component": "td", "text": self.__task_source_label(task.source)},
+                    {
+                        "component": "td",
+                        "content": [
+                            {
+                                "component": "VChip",
+                                "props": {
+                                    "size": "small",
+                                    "variant": "tonal",
+                                    "color": self.__status_color(task.status),
+                                },
+                                "text": self.__status_label(task.status),
+                            }
+                        ],
+                    },
+                    {"component": "td", "content": self.__progress_block(task)},
+                    {
+                        "component": "td",
+                        "content": [
+                            {"component": "div", "props": {"class": "text-caption"}, "text": f"添加 {self.__format_time(task.add_time)}"},
+                            {"component": "div", "props": {"class": "text-caption"}, "text": f"完成 {self.__format_time(task.complete_time)}"},
+                        ],
+                    },
+                ],
+            })
+        return rows
+
+    def __task_table_content(self, task_list: List[TaskItem], empty_text: str) -> List[dict]:
+        rows = self.__task_table_rows(task_list)
+        if not rows:
+            return [
+                {
+                    "component": "VAlert",
+                    "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "ma-3"},
+                    "text": empty_text,
+                }
+            ]
+        return [
+            {
+                "component": "VTable",
+                "props": {"hover": True, "density": "comfortable"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [
+                            {
+                                "component": "tr",
+                                "content": [
+                                    {"component": "th", "props": {"class": "text-start ps-4"}, "text": "文件"},
+                                    {"component": "th", "props": {"class": "text-start ps-4"}, "text": "来源"},
+                                    {"component": "th", "props": {"class": "text-start ps-4"}, "text": "状态"},
+                                    {"component": "th", "props": {"class": "text-start ps-4"}, "text": "进度"},
+                                    {"component": "th", "props": {"class": "text-start ps-4"}, "text": "时间"},
+                                ],
+                            }
+                        ],
+                    },
+                    {"component": "tbody", "content": rows},
+                ],
+            }
+        ]
+
+    def __task_tabs(self, queue_tasks: List[TaskItem], waiting_file_tasks: List[TaskItem], selected_tab: str) -> dict:
+        selected_tab = selected_tab if selected_tab in {"queue", "waiting_file"} else "queue"
+        active_tasks = waiting_file_tasks if selected_tab == "waiting_file" else queue_tasks
+        empty_text = "暂无等待文件完整任务" if selected_tab == "waiting_file" else "暂无处理队列任务"
+        return {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium mb-2"}, "text": "任务记录"},
+                        {
+                            "component": "VSheet",
+                            "props": {"class": "rounded border overflow-hidden", "color": "transparent"},
+                            "content": [
+                                {
+                                    "component": "VTabs",
+                                    "props": {
+                                        "model-value": selected_tab,
+                                        "color": "primary",
+                                        "density": "comfortable",
+                                    },
+                                    "content": [
+                                        {
+                                            "component": "VTab",
+                                            "props": {"value": "queue"},
+                                            "text": f"处理队列 ({len(queue_tasks)})",
+                                            "events": {
+                                                "click": {
+                                                    "api": "plugin/AutoSubRemoteAsr/page_tab",
+                                                    "method": "post",
+                                                    "params": {"tab": "queue"},
+                                                }
+                                            },
+                                        },
+                                        {
+                                            "component": "VTab",
+                                            "props": {"value": "waiting_file"},
+                                            "text": f"等待文件完整 ({len(waiting_file_tasks)})",
+                                            "events": {
+                                                "click": {
+                                                    "api": "plugin/AutoSubRemoteAsr/page_tab",
+                                                    "method": "post",
+                                                    "params": {"tab": "waiting_file"},
+                                                }
+                                            },
+                                        },
+                                    ],
+                                },
+                                {"component": "VDivider"},
+                                {"component": "div", "content": self.__task_table_content(active_tasks, empty_text)},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
     def get_page(self) -> List[dict]:
         tasks = sorted(
             self.load_tasks().values(),
@@ -3805,6 +4010,9 @@ class AutoSubRemoteAsr(_PluginBase):
             counts[task.status] = counts.get(task.status, 0) + 1
 
         processing_tasks = [task for task in tasks if task.status == TaskStatus.IN_PROGRESS]
+        queue_tasks = [task for task in tasks if task.status != TaskStatus.WAITING_FILE]
+        waiting_file_tasks = [task for task in tasks if task.status == TaskStatus.WAITING_FILE]
+        selected_tab = self.get_data("page_tab") or "queue"
         latest_update = None
         for task in tasks:
             for value in (task.progress_updated, task.complete_time, task.add_time):
@@ -3882,83 +4090,7 @@ class AutoSubRemoteAsr(_PluginBase):
             ],
         }
 
-        rows = []
-        for task in tasks[:200]:
-            filename = os.path.basename(task.video_file) or task.video_file
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {
-                        "component": "td",
-                        "content": [
-                            {"component": "div", "props": {"class": "text-body-2 font-weight-medium"}, "text": filename},
-                            {
-                                "component": "div",
-                                "props": {"class": "text-caption text-medium-emphasis", "style": "max-width:520px;white-space:normal"},
-                                "text": task.video_file,
-                            },
-                        ],
-                    },
-                    {"component": "td", "text": self.__task_source_label(task.source)},
-                    {
-                        "component": "td",
-                        "content": [
-                            {
-                                "component": "VChip",
-                                "props": {
-                                    "size": "small",
-                                    "variant": "tonal",
-                                    "color": self.__status_color(task.status),
-                                },
-                                "text": self.__status_label(task.status),
-                            }
-                        ],
-                    },
-                    {"component": "td", "content": self.__progress_block(task)},
-                    {
-                        "component": "td",
-                        "content": [
-                            {"component": "div", "props": {"class": "text-caption"}, "text": f"添加 {self.__format_time(task.add_time)}"},
-                            {"component": "div", "props": {"class": "text-caption"}, "text": f"完成 {self.__format_time(task.complete_time)}"},
-                        ],
-                    },
-                ],
-            })
-
-        task_table = {
-            "component": "VRow",
-            "content": [
-                {
-                    "component": "VCol",
-                    "props": {"cols": 12},
-                    "content": [
-                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium mb-2"}, "text": "任务记录"},
-                        {
-                            "component": "VTable",
-                            "props": {"hover": True, "density": "comfortable"},
-                            "content": [
-                                {
-                                    "component": "thead",
-                                    "content": [
-                                        {
-                                            "component": "tr",
-                                            "content": [
-                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "文件"},
-                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "来源"},
-                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "状态"},
-                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "进度"},
-                                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "时间"},
-                                            ],
-                                        }
-                                    ],
-                                },
-                                {"component": "tbody", "content": rows},
-                            ],
-                        },
-                    ],
-                }
-            ],
-        }
+        task_table = self.__task_tabs(queue_tasks, waiting_file_tasks, selected_tab)
 
         return [action_row, summary, processing_section, task_table]
 

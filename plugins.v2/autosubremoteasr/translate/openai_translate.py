@@ -23,11 +23,16 @@ class OpenAi:
     _api_key: str = None
     _api_url: str = None
     _model: str = "gpt-3.5-turbo"
+    _timeout: int = 120
 
     def __init__(self, api_key: str = None, api_url: str = None, proxy: dict = None, model: str = None,
-                 compatible: bool = False):
+                 compatible: bool = False, timeout: int = 120):
         self._api_key = api_key
         self._api_url = api_url
+        try:
+            self._timeout = max(5, int(timeout or 120))
+        except Exception:
+            self._timeout = 120
         base_url = self._api_url.rstrip("/") if self._api_url else "https://api.openai.com"
         if not compatible and not base_url.endswith("/v1"):
             base_url = f"{base_url}/v1"
@@ -39,7 +44,7 @@ class OpenAi:
             proxy_url = proxy.get("https") or proxy.get("http")
         elif proxy:
             proxy_url = proxy
-        client_kwargs = {"timeout": 120}
+        client_kwargs = {"timeout": self._timeout}
         if proxy_url:
             httpx_client_params = inspect.signature(httpx.Client).parameters
             if "proxy" in httpx_client_params:
