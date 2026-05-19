@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.20"
+    plugin_version = "1.0.21"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2149,6 +2149,7 @@ class AutoSubRemoteAsr(_PluginBase):
         return [self.__process_single(all_subs, item, stats) for item in items]
 
     def __run_translate_request(self, request_func):
+        """执行一次翻译接口请求，超时只约束本次 HTTP 请求。"""
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
 
@@ -2187,14 +2188,45 @@ class AutoSubRemoteAsr(_PluginBase):
             raise UserInterruptException("用户中断当前任务")
         return result.get("value")
 
+    def __sleep_for_translate_retry(self, seconds: float):
+        end_time = time.time() + max(0.0, seconds)
+        while time.time() < end_time:
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            time.sleep(min(0.5, max(0.05, end_time - time.time())))
+
+    def __run_translate_with_retries(self, request_func, label: str):
+        max_attempts = max(1, int(self._max_retries or 0) + 1)
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self.__run_translate_request(request_func)
+            except UserInterruptException:
+                raise
+            except Exception as err:
+                last_error = err
+                if attempt >= max_attempts:
+                    raise
+                sleep_time = (2 ** (attempt - 1)) + random.uniform(0.1, 0.9)
+                logger.warn(
+                    f"{label}请求失败（第 {attempt}/{max_attempts} 次）：{err}，"
+                    f"{sleep_time:.1f} 秒后重试"
+                )
+                self.__sleep_for_translate_retry(sleep_time)
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"{label}请求失败")
+
     def __translate_to_zh(self, text: str, context: str = None) -> str:
-        return self.__run_translate_request(
-            lambda: self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
+        return self.__run_translate_with_retries(
+            lambda: self._openai.translate_to_zh(text, context, max_retries=0),
+            "单行翻译"
         )
 
     def __translate_subtitle_items_to_zh(self, items: List[dict], context: str = None):
-        return self.__run_translate_request(
-            lambda: self._openai.translate_subtitle_items_to_zh(items, context, max_retries=self._max_retries)
+        return self.__run_translate_with_retries(
+            lambda: self._openai.translate_subtitle_items_to_zh(items, context, max_retries=0),
+            "批量字幕翻译"
         )
 
     @staticmethod

@@ -183,6 +183,8 @@ class OpenAi:
                 return True, result
             except Exception as e:
                 last_error = str(e)
+                if max_retries <= 0:
+                    raise
                 if attempt < max_retries:
                     # 使用指数退避和随机抖动，避免多个请求同时重试
                     base_delay = 2 ** attempt  # 指数退避: 1s, 2s, 4s...
@@ -226,6 +228,8 @@ class OpenAi:
                 return True, result
             except Exception as e:
                 last_error = str(e)
+                if max_retries <= 0:
+                    raise
                 if attempt < max_retries:
                     base_delay = 2 ** attempt
                     jitter = random.uniform(0.1, 0.9)
