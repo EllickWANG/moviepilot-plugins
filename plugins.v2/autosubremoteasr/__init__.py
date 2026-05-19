@@ -91,7 +91,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.9"
+    plugin_version = "1.0.10"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -373,7 +373,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 self._running = True
                 started_now = True
             self.__start_workers()
-            if started_now:
+            if started_now or not alive_threads:
                 self.__enqueue_existing_tasks()
 
             if self._retry_failed_once:
