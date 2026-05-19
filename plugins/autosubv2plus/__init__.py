@@ -16,6 +16,7 @@ from enum import Enum
 import queue
 import threading
 from uuid import uuid4
+from apscheduler.triggers.cron import CronTrigger
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event as MPEvent
@@ -36,11 +37,13 @@ class UserInterruptException(Exception):
 class TaskSource(Enum):
     MANUAL = "manual"
     EVENT = "event"
+    AUTO_SCAN = "auto_scan"
 
 
 class TaskStatus(Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
+    WAITING_FILE = "waiting_file"
     COMPLETED = "completed"
     IGNORED = "ignored"
     FAILED = "failed"
@@ -58,6 +61,8 @@ class TaskItem:
     progress_stage: str = "等待中"
     progress_detail: str = ""
     progress_updated: datetime = None
+    integrity_retry_count: int = 0
+    next_retry_time: datetime = None
 
 
 class AutoSubv2Plus(_PluginBase):
@@ -70,7 +75,7 @@ class AutoSubv2Plus(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.5.9"
+    plugin_version = "2.5.10"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -91,7 +96,13 @@ class AutoSubv2Plus(_PluginBase):
     _current_processing_tasks: Dict[str, TaskItem] = None
     _tasks_lock = None
     _progress_save_at: Dict[str, float] = None
+    _scheduled_retry_tasks: Dict[str, float] = None
+    _auto_scan_thread = None
+    _auto_scan_lock = None
     _parallel_tasks = 1
+    _integrity_retry_interval = 10 * 60
+    _auto_scan_enabled = True
+    _auto_scan_cron = "*/10 * * * *"
     _running = False
     _event = Event()
     _enabled = None
@@ -123,6 +134,10 @@ class AutoSubv2Plus(_PluginBase):
             self._current_processing_tasks = {}
         if self._progress_save_at is None:
             self._progress_save_at = {}
+        if self._scheduled_retry_tasks is None:
+            self._scheduled_retry_tasks = {}
+        if self._auto_scan_lock is None:
+            self._auto_scan_lock = threading.Lock()
 
     @staticmethod
     def __normalize_parallel_tasks(value) -> int:
@@ -130,6 +145,23 @@ class AutoSubv2Plus(_PluginBase):
             return max(1, min(3, int(value or 1)))
         except Exception:
             return 1
+
+    @staticmethod
+    def __normalize_retry_minutes(value) -> int:
+        try:
+            return max(5, min(1440, int(value or 10)))
+        except Exception:
+            return 10
+
+    @staticmethod
+    def __normalize_path_list(value) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            paths = value
+        else:
+            paths = str(value).split("\n")
+        return list(dict.fromkeys([path.strip() for path in paths if path and str(path).strip()]))
 
     def init_plugin(self, config=None):
         # 如果没有配置信息， 则不处理
@@ -142,10 +174,12 @@ class AutoSubv2Plus(_PluginBase):
         self._clear_history = config.get('clear_history', False)
         self._listen_transfer_event = config.get('listen_transfer_event', True)
         self._run_now = config.get('run_now')
-        if self._run_now:
-            self._path_list = list(set(config.get('path_list').split('\n')))
+        self._path_list = self.__normalize_path_list(config.get('path_list'))
         self._send_notify = config.get('send_notify', False)
         self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
+        self._auto_scan_enabled = bool(config.get('auto_scan_enabled', True))
+        self._auto_scan_cron = str(config.get('auto_scan_cron') or "*/10 * * * *").strip()
+        self._integrity_retry_interval = self.__normalize_retry_minutes(config.get('integrity_retry_minutes')) * 60
         # 字幕生成设置
         self._translate_preference = config.get('translate_preference', 'english_first')
         self._enable_asr = config.get('enable_asr', True)
@@ -206,18 +240,40 @@ class AutoSubv2Plus(_PluginBase):
             if self._enable_asr and not self.__check_asr():
                 return
 
+            started_now = False
             if not self._running:
                 self._task_queue = queue.Queue()
                 self._running = True
+                started_now = True
             self.__start_workers()
+            if started_now:
+                self.__enqueue_existing_tasks()
 
             if self._run_now:
                 config['run_now'] = False
                 self.update_config(config)
                 logger.info("立即运行一次")
                 self._run_at_once(path_list=self._path_list)
+            elif self._auto_scan_enabled and self._path_list:
+                self.auto_scan_media_files(reason="插件启动扫描")
         else:
             self.stop_service()
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if not self._enabled or not self._auto_scan_enabled or not self._path_list:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._auto_scan_cron or "*/10 * * * *")
+        except Exception as err:
+            logger.error(f"AI字幕自动生成定时扫描 cron 无效：{self._auto_scan_cron} - {err}")
+            return []
+        return [{
+            "id": "AutoSubv2PlusAutoScan",
+            "name": "AI字幕自动生成定时扫描",
+            "trigger": trigger,
+            "func": self.auto_scan_media_files,
+            "kwargs": {}
+        }]
 
     def __start_workers(self):
         self.__ensure_runtime_state()
@@ -241,6 +297,97 @@ class AutoSubv2Plus(_PluginBase):
         self._consumer_thread = self._consumer_threads.get(1)
         logger.info(f"任务队列和消费者线程已启动，并行任务数：{self._parallel_tasks}")
 
+    def __enqueue_existing_tasks(self):
+        now = datetime.now()
+        changed = False
+        with self._tasks_lock:
+            tasks = list((self._tasks or {}).values())
+        for task in tasks:
+            if task.status == TaskStatus.IN_PROGRESS:
+                task.status = TaskStatus.PENDING
+                task.complete_time = None
+                task.progress_stage = "等待重新处理"
+                task.progress_detail = "服务重载后重新排队"
+                task.progress_updated = now
+                changed = True
+            if task.status == TaskStatus.PENDING:
+                self._task_queue.put(task)
+            elif task.status == TaskStatus.WAITING_FILE:
+                if task.next_retry_time and task.next_retry_time > now:
+                    self.__schedule_waiting_file_retry(task)
+                else:
+                    self._task_queue.put(task)
+        if changed:
+            self.save_tasks()
+
+    def __schedule_waiting_file_retry(self, task: TaskItem):
+        self.__ensure_runtime_state()
+        if not task:
+            return
+        if not task.next_retry_time:
+            task.next_retry_time = datetime.now() + timedelta(seconds=self._integrity_retry_interval)
+        target_ts = task.next_retry_time.timestamp()
+        with self._tasks_lock:
+            existing_ts = self._scheduled_retry_tasks.get(task.task_id)
+            if existing_ts and existing_ts >= target_ts - 1:
+                return
+            self._scheduled_retry_tasks[task.task_id] = target_ts
+        delay = max(0.0, target_ts - time.time())
+        thread = threading.Thread(
+            target=self.__retry_waiting_file_later,
+            args=(task.task_id, delay),
+            name=f"autosubv2plus-retry-{task.task_id[:8]}",
+            daemon=True
+        )
+        thread.start()
+
+    def __retry_waiting_file_later(self, task_id: str, delay: float):
+        end_time = time.time() + delay
+        while not self._event.is_set() and time.time() < end_time:
+            time.sleep(min(5, max(0.2, end_time - time.time())))
+        with self._tasks_lock:
+            self._scheduled_retry_tasks.pop(task_id, None)
+        if self._event.is_set():
+            return
+        self.__requeue_waiting_file_task(task_id, "到达文件完整性重试时间")
+
+    def __requeue_waiting_file_task(self, task_id: str, detail: str) -> bool:
+        self.__ensure_runtime_state()
+        with self._tasks_lock:
+            task = (self._tasks or {}).get(task_id)
+            if not self._running or not self._task_queue or not task or task.status != TaskStatus.WAITING_FILE:
+                return False
+            task.status = TaskStatus.PENDING
+            task.complete_time = None
+            task.next_retry_time = None
+            task.progress_stage = "等待重新检查"
+            task.progress_detail = detail
+            task.progress_updated = datetime.now()
+            self._tasks[task_id] = task
+            self.save_tasks()
+        self._task_queue.put(task)
+        logger.info(f"等待完整的视频已重新加入队列：{task.video_file}")
+        return True
+
+    def __mark_waiting_file(self, task: Optional[TaskItem], error: str):
+        if not task:
+            return
+        next_retry_time = datetime.now() + timedelta(seconds=self._integrity_retry_interval)
+        task.status = TaskStatus.WAITING_FILE
+        task.complete_time = None
+        task.integrity_retry_count = int(task.integrity_retry_count or 0) + 1
+        task.next_retry_time = next_retry_time
+        detail = (error or "视频还未完整，等待后重试")[:500]
+        detail = f"{detail}；下次检查：{next_retry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        self.__update_task_progress(
+            task,
+            task.progress if task.progress else 5,
+            "等待文件完整",
+            detail,
+            force=True
+        )
+        self.__schedule_waiting_file_retry(task)
+
     @staticmethod
     def __default_task_progress(status: TaskStatus) -> Tuple[float, str]:
         if status == TaskStatus.COMPLETED:
@@ -251,6 +398,8 @@ class AutoSubv2Plus(_PluginBase):
             return 0.0, "处理失败"
         if status == TaskStatus.IN_PROGRESS:
             return 1.0, "处理中"
+        if status == TaskStatus.WAITING_FILE:
+            return 5.0, "等待文件完整"
         return 0.0, "等待中"
 
     @staticmethod
@@ -262,12 +411,36 @@ class AutoSubv2Plus(_PluginBase):
         except Exception:
             return None
 
+    @staticmethod
+    def __is_incomplete_video_error(error: str) -> bool:
+        error = (error or "").lower()
+        markers = [
+            "moov atom not found",
+            "ebml header parsing failed",
+            "invalid data found when processing input",
+            "error opening input",
+            "end of file",
+            "partial file",
+            "truncated",
+            "corrupt",
+        ]
+        return any(marker in error for marker in markers)
+
     def load_tasks(self) -> Dict[str, TaskItem]:
         raw_tasks = self.get_data("tasks") or {}
         tasks = {}
         for task_id, task_dict in raw_tasks.items():
             try:
                 status = TaskStatus(task_dict["status"])
+                progress_stage = task_dict.get("progress_stage") or ""
+                progress_detail = task_dict.get("progress_detail") or ""
+                if status == TaskStatus.FAILED and (
+                        self.__is_incomplete_video_error(progress_detail)
+                        or progress_stage == "视频不完整"
+                        or progress_stage == "服务已停止"
+                        or "插件停止时任务未完成" in progress_detail
+                ):
+                    status = TaskStatus.WAITING_FILE if self.__is_incomplete_video_error(progress_detail) else TaskStatus.PENDING
                 default_progress, default_stage = self.__default_task_progress(status)
                 task = TaskItem(
                     task_id=task_dict["task_id"],
@@ -275,12 +448,18 @@ class AutoSubv2Plus(_PluginBase):
                     source=TaskSource(task_dict["source"]),
                     add_time=datetime.fromisoformat(task_dict["add_time"]),
                     status=status,
-                    complete_time=self.__parse_datetime(task_dict.get("complete_time")),
+                    complete_time=None if status in [TaskStatus.PENDING, TaskStatus.WAITING_FILE]
+                    else self.__parse_datetime(task_dict.get("complete_time")),
                     progress=float(task_dict.get("progress", default_progress) or 0.0),
-                    progress_stage=task_dict.get("progress_stage") or default_stage,
-                    progress_detail=task_dict.get("progress_detail") or "",
+                    progress_stage=progress_stage or default_stage,
+                    progress_detail=progress_detail,
                     progress_updated=self.__parse_datetime(task_dict.get("progress_updated")),
+                    integrity_retry_count=int(task_dict.get("integrity_retry_count") or 0),
+                    next_retry_time=self.__parse_datetime(task_dict.get("next_retry_time")),
                 )
+                if status == TaskStatus.WAITING_FILE and not task.next_retry_time:
+                    task.next_retry_time = datetime.now()
+                    task.progress_stage = "等待文件完整"
                 tasks[task_id] = task
             except Exception as e:
                 logger.error(f"恢复任务失败：{e}")
@@ -299,6 +478,8 @@ class AutoSubv2Plus(_PluginBase):
             "progress_stage": task.progress_stage or "",
             "progress_detail": task.progress_detail or "",
             "progress_updated": task.progress_updated.isoformat() if task.progress_updated else None,
+            "integrity_retry_count": int(task.integrity_retry_count or 0),
+            "next_retry_time": task.next_retry_time.isoformat() if task.next_retry_time else None,
         }
 
     def save_tasks(self):
@@ -380,16 +561,29 @@ class AutoSubv2Plus(_PluginBase):
         self.__ensure_runtime_state()
         with self._tasks_lock:
             self._tasks = {task_id: task for task_id, task in self._tasks.items() if task.status in [
-                TaskStatus.PENDING, TaskStatus.IN_PROGRESS
+                TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.WAITING_FILE
             ]}
             self.save_tasks()
         logger.info("插件历史任务已清除")
+
+    def __find_latest_task_by_video_file(self, video_file: str) -> Optional[TaskItem]:
+        self.__ensure_runtime_state()
+        with self._tasks_lock:
+            matched = [
+                task for task in (self._tasks or {}).values()
+                if task.video_file == video_file
+            ]
+        if not matched:
+            return None
+        return max(matched, key=lambda item: item.add_time or datetime.min)
 
     def __is_duplicate_task(self, video_file: str) -> bool:
         self.__ensure_runtime_state()
         with self._tasks_lock:
             for task in (self._tasks or {}).values():
-                if task.video_file == video_file and task.status in [TaskStatus.PENDING, TaskStatus.IN_PROGRESS]:
+                if task.video_file == video_file and task.status in [
+                    TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.WAITING_FILE
+                ]:
                     return True
         return False
 
@@ -416,7 +610,9 @@ class AutoSubv2Plus(_PluginBase):
                     self._tasks[task.task_id] = task
                     self.save_tasks()
                 task.status = self.__process_autosub(task.video_file, task)
-                task.complete_time = datetime.now()
+                task.complete_time = datetime.now() if task.status in [
+                    TaskStatus.COMPLETED, TaskStatus.IGNORED, TaskStatus.FAILED
+                ] else None
                 if task.status == TaskStatus.COMPLETED:
                     self.__update_task_progress(task, 100, "处理完成", "字幕处理完成", force=True)
                 elif task.status == TaskStatus.IGNORED:
@@ -424,6 +620,8 @@ class AutoSubv2Plus(_PluginBase):
                 elif task.status == TaskStatus.FAILED:
                     self.__update_task_progress(task, task.progress, "处理失败",
                                                 task.progress_detail or "任务处理失败", force=True)
+                elif task.status == TaskStatus.WAITING_FILE:
+                    self.__schedule_waiting_file_retry(task)
                 with self._tasks_lock:
                     self._tasks[task.task_id] = task
                     self.save_tasks()
@@ -471,6 +669,89 @@ class AutoSubv2Plus(_PluginBase):
         for file_path in item_file_list:
             if os.path.splitext(file_path)[-1].lower() in settings.RMT_MEDIAEXT:
                 self.add_task(file_path, TaskSource.EVENT)
+
+    def auto_scan_media_files(self, reason: str = "定时扫描"):
+        self.__ensure_runtime_state()
+        if not self._auto_scan_enabled or not self._path_list:
+            logger.info("AI字幕定时扫描跳过：未启用或未配置媒体路径")
+            return
+        if not self._running or not self._task_queue:
+            logger.info("AI字幕定时扫描跳过：任务队列未启动")
+            return
+        with self._auto_scan_lock:
+            if self._auto_scan_thread and self._auto_scan_thread.is_alive():
+                logger.info("AI字幕定时扫描仍在运行，跳过本次触发")
+                return
+            thread = threading.Thread(
+                target=self.__auto_scan_media_files,
+                args=(reason,),
+                name="autosubv2plus-auto-scan",
+                daemon=True
+            )
+            self._auto_scan_thread = thread
+            thread.start()
+
+    def __auto_scan_media_files(self, reason: str):
+        start_time = time.time()
+        stats = {
+            "added": 0,
+            "requeued": 0,
+            "waiting": 0,
+            "active": 0,
+            "done": 0,
+            "subtitle_exists": 0,
+            "failed": 0,
+            "invalid": 0,
+            "skipped": 0,
+        }
+        logger.info(f"AI字幕{reason}开始，路径数：{len(self._path_list)}")
+        try:
+            for path in self._path_list:
+                if self._event.is_set():
+                    break
+                if not os.path.exists(path) or not os.path.isabs(path):
+                    stats["invalid"] += 1
+                    logger.warn(f"AI字幕扫描路径无效，跳过：{path}")
+                    continue
+                for video_file in self.__get_library_files(path):
+                    if self._event.is_set():
+                        break
+                    result = self.__scan_video_file_for_task(video_file)
+                    stats[result] = stats.get(result, 0) + 1
+        except Exception as e:
+            logger.error(f"AI字幕{reason}异常：{e}")
+            logger.error(traceback.format_exc())
+        finally:
+            seconds = round(time.time() - start_time, 2)
+            logger.info(
+                f"AI字幕{reason}完成：新增 {stats['added']}，重新排队 {stats['requeued']}，"
+                f"等待完整 {stats['waiting']}，已在队列 {stats['active']}，已处理 {stats['done']}，"
+                f"已有字幕 {stats['subtitle_exists']}，失败跳过 {stats['failed']}，"
+                f"无效路径 {stats['invalid']}，其他跳过 {stats['skipped']}，耗时 {seconds} 秒"
+            )
+
+    def __scan_video_file_for_task(self, video_file: str) -> str:
+        now = datetime.now()
+        latest_task = self.__find_latest_task_by_video_file(video_file)
+        if latest_task:
+            if latest_task.status in [TaskStatus.PENDING, TaskStatus.IN_PROGRESS]:
+                return "active"
+            if latest_task.status == TaskStatus.WAITING_FILE:
+                if latest_task.next_retry_time and latest_task.next_retry_time > now:
+                    self.__schedule_waiting_file_retry(latest_task)
+                    return "waiting"
+                if self.__requeue_waiting_file_task(latest_task.task_id, "定时扫描发现已到重试时间"):
+                    return "requeued"
+                return "waiting"
+            if latest_task.status in [TaskStatus.COMPLETED, TaskStatus.IGNORED]:
+                return "done"
+            if latest_task.status == TaskStatus.FAILED:
+                return "failed"
+
+        if self.__target_subtitle_exists(video_file):
+            return "subtitle_exists"
+
+        return "added" if self.add_task(video_file, TaskSource.AUTO_SCAN) else "skipped"
 
     def _run_at_once(self, path_list: List[str]):
         # 依次处理每个目录
@@ -526,7 +807,7 @@ class AutoSubv2Plus(_PluginBase):
             return True
 
         logger.warn(f"视频完整性校验失败：{video_file} - {error}")
-        self.__update_task_progress(task, task.progress if task else 0, "视频不完整", error or "视频完整性校验失败", force=True)
+        self.__mark_waiting_file(task, error or "视频完整性校验失败")
         return False
 
     def __process_autosub(self, video_file, task: Optional[TaskItem] = None) -> TaskStatus:
@@ -546,7 +827,7 @@ class AutoSubv2Plus(_PluginBase):
                 self.__update_task_progress(task, 100, "已忽略", "目标字幕已存在", force=True)
                 return TaskStatus.IGNORED
             if not self.__check_video_integrity(video_file, task):
-                return TaskStatus.FAILED
+                return TaskStatus.WAITING_FILE if task and task.status == TaskStatus.WAITING_FILE else TaskStatus.FAILED
             # 生成字幕
             ret, lang, gen_sub_path = self.__generate_subtitle(video_file, file_path, self._enable_asr, task)
             if not ret:
@@ -1351,16 +1632,30 @@ class AutoSubv2Plus(_PluginBase):
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'auto_scan_enabled',
+                                            'label': '定时扫描媒体路径',
+                                            'hint': '按周期扫描媒体路径，新完整视频自动加入队列'
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     },
                     {
                         'component': 'VRow',
-                        'props': {'v-show': 'run_now'},
+                        'props': {'v-show': 'run_now || auto_scan_enabled'},
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 12},
+                                'props': {'cols': 12, 'md': 8},
                                 'content': [
                                     {
                                         'component': 'VTextarea',
@@ -1368,7 +1663,37 @@ class AutoSubv2Plus(_PluginBase):
                                             'model': 'path_list',
                                             'label': '媒体路径',
                                             'rows': 3,
-                                            'placeholder': '绝对路径，每行一个。支持文件和文件夹'
+                                            'placeholder': '绝对路径，每行一个。支持文件和文件夹',
+                                            'hint': '手动执行和定时扫描共用'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2, 'v-show': 'auto_scan_enabled'},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'auto_scan_cron',
+                                            'label': '扫描周期(cron)',
+                                            'placeholder': '*/10 * * * *'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'integrity_retry_minutes',
+                                            'label': '不完整重试(分钟)',
+                                            'placeholder': '30',
+                                            'hint': '不完整视频不计失败，到期后重新检查'
                                         }
                                     }
                                 ]
@@ -1778,6 +2103,9 @@ class AutoSubv2Plus(_PluginBase):
             "listen_transfer_event": True,
             "run_now": False,
             "path_list": "",
+            "auto_scan_enabled": True,
+            "auto_scan_cron": "*/10 * * * *",
+            "integrity_retry_minutes": 10,
             "parallel_tasks": 1,
             "translate_preference": "english_first",
             "translate_zh": False,
@@ -1802,6 +2130,166 @@ class AutoSubv2Plus(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         pass
 
+    @staticmethod
+    def get_dashboard_meta() -> Optional[List[Dict[str, str]]]:
+        return [{
+            "key": "progress",
+            "name": "AI字幕进度"
+        }]
+
+    def get_dashboard(self, key: str = "progress", **kwargs):
+        tasks = sorted(
+            self.load_tasks().values(),
+            key=lambda item: item.add_time,
+            reverse=True
+        )
+        counts = {
+            TaskStatus.PENDING: 0,
+            TaskStatus.IN_PROGRESS: 0,
+            TaskStatus.WAITING_FILE: 0,
+            TaskStatus.COMPLETED: 0,
+            TaskStatus.IGNORED: 0,
+            TaskStatus.FAILED: 0,
+        }
+        for task in tasks:
+            counts[task.status] = counts.get(task.status, 0) + 1
+        active_tasks = [
+            task for task in tasks
+            if task.status in [TaskStatus.IN_PROGRESS, TaskStatus.PENDING, TaskStatus.WAITING_FILE]
+        ][:8]
+        if not active_tasks:
+            active_tasks = tasks[:8]
+
+        elements = [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__dashboard_metric("处理中", counts.get(TaskStatus.IN_PROGRESS, 0), "warning"),
+                    self.__dashboard_metric("等待中", counts.get(TaskStatus.PENDING, 0), "info"),
+                    self.__dashboard_metric("等待文件", counts.get(TaskStatus.WAITING_FILE, 0), "info"),
+                    self.__dashboard_metric("已完成", counts.get(TaskStatus.COMPLETED, 0), "success"),
+                ]
+            },
+            self.__dashboard_task_list(active_tasks)
+        ]
+        return (
+            {"cols": 12, "md": 6},
+            {
+                "refresh": 5,
+                "border": True,
+                "title": "AI字幕任务进度",
+                "subtitle": f"队列 {counts.get(TaskStatus.PENDING, 0)} · 处理中 {counts.get(TaskStatus.IN_PROGRESS, 0)}",
+            },
+            elements
+        )
+
+    @staticmethod
+    def __dashboard_metric(title: str, value: int, color: str) -> dict:
+        return {
+            "component": "VCol",
+            "props": {"cols": 6, "md": 3},
+            "content": [
+                {
+                    "component": "VSheet",
+                    "props": {
+                        "class": "pa-3 rounded border",
+                        "color": "transparent",
+                    },
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption text-medium-emphasis"},
+                            "text": title
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": f"text-h6 text-{color}"},
+                            "text": str(value)
+                        }
+                    ]
+                }
+            ]
+        }
+
+    def __dashboard_task_list(self, tasks: List[TaskItem]) -> dict:
+        if not tasks:
+            return {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "density": "compact"},
+                "text": "暂无任务"
+            }
+
+        status_text = {
+            TaskStatus.PENDING: "等待中",
+            TaskStatus.IN_PROGRESS: "处理中",
+            TaskStatus.WAITING_FILE: "等待文件完整",
+            TaskStatus.COMPLETED: "已完成",
+            TaskStatus.IGNORED: "已忽略",
+            TaskStatus.FAILED: "失败"
+        }
+        status_color = {
+            TaskStatus.PENDING: "info",
+            TaskStatus.IN_PROGRESS: "warning",
+            TaskStatus.WAITING_FILE: "info",
+            TaskStatus.COMPLETED: "success",
+            TaskStatus.IGNORED: "grey",
+            TaskStatus.FAILED: "error"
+        }
+        items = []
+        for task in tasks:
+            progress = self.__clip_progress(task.progress)
+            title = os.path.basename(task.video_file) or task.video_file
+            detail_parts = [status_text.get(task.status, task.status.value)]
+            if task.progress_stage:
+                detail_parts.append(task.progress_stage)
+            if task.progress_detail:
+                detail_parts.append(task.progress_detail[:80])
+            items.append({
+                "component": "div",
+                "props": {"class": "py-2"},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex align-center justify-space-between ga-2"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": "text-body-2 text-truncate",
+                                    "style": "max-width:360px"
+                                },
+                                "text": title
+                            },
+                            {
+                                "component": "span",
+                                "props": {"class": "text-caption text-no-wrap"},
+                                "text": f"{progress:.1f}%"
+                            }
+                        ]
+                    },
+                    {
+                        "component": "VProgressLinear",
+                        "props": {
+                            "model-value": progress,
+                            "height": 6,
+                            "rounded": True,
+                            "color": status_color.get(task.status, "info"),
+                            "class": "mt-1"
+                        }
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption text-medium-emphasis text-truncate mt-1"},
+                        "text": " · ".join(detail_parts)
+                    }
+                ]
+            })
+        return {
+            "component": "div",
+            "props": {"class": "mt-2"},
+            "content": items
+        }
+
     def get_page(self) -> List[dict]:
         # 加载任务并按添加时间倒序排列
         tasks: Dict[str, TaskItem] = self.load_tasks()
@@ -1814,6 +2302,7 @@ class AutoSubv2Plus(_PluginBase):
         status_classes = {
             TaskStatus.PENDING: "text-info",
             TaskStatus.IN_PROGRESS: "text-warning",
+            TaskStatus.WAITING_FILE: "text-info",
             TaskStatus.COMPLETED: "text-success",
             TaskStatus.IGNORED: "text-muted",
             TaskStatus.FAILED: "text-error"
@@ -1823,12 +2312,14 @@ class AutoSubv2Plus(_PluginBase):
         for task_id, task in sorted_tasks:
             source_label = {
                 TaskSource.MANUAL: "手动添加",
-                TaskSource.EVENT: "入库触发"
+                TaskSource.EVENT: "入库触发",
+                TaskSource.AUTO_SCAN: "定时扫描"
             }.get(task.source, task.source)
 
             status_text = {
                 TaskStatus.PENDING: "等待中",
                 TaskStatus.IN_PROGRESS: "处理中",
+                TaskStatus.WAITING_FILE: "等待文件完整",
                 TaskStatus.COMPLETED: "已完成",
                 TaskStatus.IGNORED: "已忽略",
                 TaskStatus.FAILED: "失败"
@@ -1845,6 +2336,7 @@ class AutoSubv2Plus(_PluginBase):
             progress_color = {
                 TaskStatus.PENDING: "#1976D2",
                 TaskStatus.IN_PROGRESS: "#F59E0B",
+                TaskStatus.WAITING_FILE: "#0288D1",
                 TaskStatus.COMPLETED: "#2E7D32",
                 TaskStatus.IGNORED: "#757575",
                 TaskStatus.FAILED: "#D32F2F"
@@ -2002,17 +2494,21 @@ class AutoSubv2Plus(_PluginBase):
         if self._tasks is not None:
             for task_id in list(self._tasks.keys()):
                 task = self._tasks[task_id]
-                if task.status == TaskStatus.PENDING or task.status == TaskStatus.IN_PROGRESS:
-                    task.status = TaskStatus.FAILED
-                    task.complete_time = datetime.now()
-                    task.progress_stage = "服务已停止"
+                if task.status == TaskStatus.IN_PROGRESS:
+                    task.status = TaskStatus.PENDING
+                    task.complete_time = None
+                    task.progress_stage = "等待重新处理"
                     task.progress_detail = "插件停止时任务未完成"
                     task.progress_updated = datetime.now()
+                elif task.status in [TaskStatus.PENDING, TaskStatus.WAITING_FILE]:
+                    task.complete_time = None
             self.save_tasks()  # 持久化更新后的任务列表
         self._running = False
         self._consumer_threads = {}
         self._consumer_thread = None
         self._current_processing_task = None
         self._current_processing_tasks = {}
+        self._scheduled_retry_tasks = {}
+        self._auto_scan_thread = None
         self._event.clear()
         logger.info(f"自动字幕生成服务已停止")
