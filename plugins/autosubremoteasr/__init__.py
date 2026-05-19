@@ -103,7 +103,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.26"
+    plugin_version = "1.0.27"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2210,6 +2210,8 @@ class AutoSubRemoteAsr(_PluginBase):
             raise UserInterruptException("用户中断当前任务")
 
         result = {}
+        request_id = uuid4().hex[:8]
+        lock_wait_started = time.time()
 
         def worker():
             try:
@@ -2218,7 +2220,12 @@ class AutoSubRemoteAsr(_PluginBase):
                 result["error"] = err
                 result["traceback"] = traceback.format_exc()
 
+        logger.info(f"接口翻译准备请求：request_id={request_id} 等待并发锁")
         with self._translate_lock:
+            logger.info(
+                f"接口翻译获得并发锁：request_id={request_id} "
+                f"wait={time.time() - lock_wait_started:.2f}s"
+            )
             thread = threading.Thread(
                 target=worker,
                 name="autosubremoteasr-translate-request",
@@ -2237,6 +2244,10 @@ class AutoSubRemoteAsr(_PluginBase):
                         f"翻译请求超过 {self._translate_request_timeout} 秒，已放弃本次请求"
                     )
                 thread.join(timeout=1)
+            logger.info(
+                f"接口翻译请求线程结束：request_id={request_id} "
+                f"elapsed={time.time() - started_at:.2f}s"
+            )
 
         if result.get("error"):
             raise result["error"]
