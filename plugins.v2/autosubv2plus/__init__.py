@@ -5,7 +5,7 @@ import time
 import traceback
 from datetime import timedelta, datetime
 from pathlib import Path
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional
 from threading import Event
 import iso639
 import psutil
@@ -54,6 +54,10 @@ class TaskItem:
     add_time: datetime
     status: TaskStatus = TaskStatus.PENDING
     complete_time: datetime = None
+    progress: float = 0.0
+    progress_stage: str = "等待中"
+    progress_detail: str = ""
+    progress_updated: datetime = None
 
 
 class AutoSubv2Plus(_PluginBase):
@@ -66,7 +70,7 @@ class AutoSubv2Plus(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.5.6"
+    plugin_version = "2.5.7"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -83,6 +87,7 @@ class AutoSubv2Plus(_PluginBase):
     _task_queue = None
     _consumer_thread = None
     _current_processing_task = None
+    _progress_save_at: Dict[str, float] = None
     _running = False
     _event = Event()
     _enabled = None
@@ -111,6 +116,7 @@ class AutoSubv2Plus(_PluginBase):
         if not config:
             return
         self._tasks = self.load_tasks()
+        self._progress_save_at = {}
         self._enabled = config.get('enabled', False)
         self._clear_history = config.get('clear_history', False)
         self._listen_transfer_event = config.get('listen_transfer_event', True)
@@ -194,19 +200,45 @@ class AutoSubv2Plus(_PluginBase):
         else:
             self.stop_service()
 
+    @staticmethod
+    def __default_task_progress(status: TaskStatus) -> Tuple[float, str]:
+        if status == TaskStatus.COMPLETED:
+            return 100.0, "处理完成"
+        if status == TaskStatus.IGNORED:
+            return 100.0, "已忽略"
+        if status == TaskStatus.FAILED:
+            return 0.0, "处理失败"
+        if status == TaskStatus.IN_PROGRESS:
+            return 1.0, "处理中"
+        return 0.0, "等待中"
+
+    @staticmethod
+    def __parse_datetime(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
     def load_tasks(self) -> Dict[str, TaskItem]:
         raw_tasks = self.get_data("tasks") or {}
         tasks = {}
         for task_id, task_dict in raw_tasks.items():
             try:
+                status = TaskStatus(task_dict["status"])
+                default_progress, default_stage = self.__default_task_progress(status)
                 task = TaskItem(
                     task_id=task_dict["task_id"],
                     video_file=task_dict["video_file"],
                     source=TaskSource(task_dict["source"]),
                     add_time=datetime.fromisoformat(task_dict["add_time"]),
-                    status=TaskStatus(task_dict["status"]),
-                    complete_time=datetime.fromisoformat(task_dict["complete_time"])
-                    if task_dict.get("complete_time") else None,
+                    status=status,
+                    complete_time=self.__parse_datetime(task_dict.get("complete_time")),
+                    progress=float(task_dict.get("progress", default_progress) or 0.0),
+                    progress_stage=task_dict.get("progress_stage") or default_stage,
+                    progress_detail=task_dict.get("progress_detail") or "",
+                    progress_updated=self.__parse_datetime(task_dict.get("progress_updated")),
                 )
                 tasks[task_id] = task
             except Exception as e:
@@ -222,11 +254,55 @@ class AutoSubv2Plus(_PluginBase):
             "add_time": task.add_time.isoformat() if task.add_time else None,
             "status": task.status.value,
             "complete_time": task.complete_time.isoformat() if task.complete_time else None,
+            "progress": round(float(task.progress or 0), 1),
+            "progress_stage": task.progress_stage or "",
+            "progress_detail": task.progress_detail or "",
+            "progress_updated": task.progress_updated.isoformat() if task.progress_updated else None,
         }
 
     def save_tasks(self):
         tasks_dict = {task_id: self._serialize_task(task) for task_id, task in self._tasks.items()}
         self.save_data("tasks", tasks_dict)
+
+    @staticmethod
+    def __clip_progress(progress: float) -> float:
+        try:
+            return round(max(0.0, min(100.0, float(progress))), 1)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def __scale_progress(start: float, end: float, current: float, total: float) -> float:
+        try:
+            if total <= 0:
+                return start
+            ratio = max(0.0, min(1.0, float(current) / float(total)))
+            return start + (end - start) * ratio
+        except Exception:
+            return start
+
+    def __update_task_progress(self, task: Optional[TaskItem] = None, progress: Optional[float] = None,
+                               stage: Optional[str] = None, detail: Optional[str] = None,
+                               force: bool = False):
+        task = task or self._current_processing_task
+        if not task:
+            return
+        if progress is not None:
+            task.progress = self.__clip_progress(progress)
+        if stage is not None:
+            task.progress_stage = stage
+        if detail is not None:
+            task.progress_detail = detail
+        task.progress_updated = datetime.now()
+        self._tasks[task.task_id] = task
+
+        now = time.time()
+        if self._progress_save_at is None:
+            self._progress_save_at = {}
+        last_save_at = self._progress_save_at.get(task.task_id, 0)
+        if force or now - last_save_at >= 3 or task.progress >= 100:
+            self.save_tasks()
+            self._progress_save_at[task.task_id] = now
 
     def add_task(self, video_file: str, source: TaskSource):
         """
@@ -277,10 +353,21 @@ class AutoSubv2Plus(_PluginBase):
                 self._current_processing_task = task
                 logger.info(f"开始处理任务 {task.task_id}: {task.video_file}")
                 task.status = TaskStatus.IN_PROGRESS
+                task.progress = 1.0
+                task.progress_stage = "准备处理"
+                task.progress_detail = "任务已开始"
+                task.progress_updated = datetime.now()
                 self._tasks[task.task_id] = task
                 self.save_tasks()
-                task.status = self.__process_autosub(task.video_file)
+                task.status = self.__process_autosub(task.video_file, task)
                 task.complete_time = datetime.now()
+                if task.status == TaskStatus.COMPLETED:
+                    self.__update_task_progress(task, 100, "处理完成", "字幕处理完成", force=True)
+                elif task.status == TaskStatus.IGNORED:
+                    self.__update_task_progress(task, 100, "已忽略", task.progress_detail or "任务已忽略", force=True)
+                elif task.status == TaskStatus.FAILED:
+                    self.__update_task_progress(task, task.progress, "处理失败",
+                                                task.progress_detail or "任务处理失败", force=True)
                 self._tasks[task.task_id] = task
                 self.save_tasks()
                 self._task_queue.task_done()
@@ -341,11 +428,12 @@ class AutoSubv2Plus(_PluginBase):
             return False
         return True
 
-    def __process_autosub(self, video_file) -> TaskStatus:
+    def __process_autosub(self, video_file, task: Optional[TaskItem] = None) -> TaskStatus:
         if not video_file:
             return TaskStatus.FAILED
         # 如果文件大小小于指定大小， 则不处理
         if os.path.getsize(video_file) < self._file_size * 1024 * 1024:
+            self.__update_task_progress(task, 100, "已忽略", "文件小于配置的处理大小", force=True)
             return TaskStatus.IGNORED
 
         start_time = time.time()
@@ -354,23 +442,29 @@ class AutoSubv2Plus(_PluginBase):
 
         try:
             logger.info(f"开始处理文件：{video_file} ...")
+            self.__update_task_progress(task, 3, "准备处理", "正在检查字幕和媒体信息", force=True)
             # 判断目的字幕（和内嵌）是否已存在
             if self.__target_subtitle_exists(video_file):
                 logger.warn(f"字幕文件已经存在，不进行处理")
+                self.__update_task_progress(task, 100, "已忽略", "目标字幕已存在", force=True)
                 return TaskStatus.IGNORED
             # 生成字幕
-            ret, lang, gen_sub_path = self.__generate_subtitle(video_file, file_path, self._enable_asr)
+            ret, lang, gen_sub_path = self.__generate_subtitle(video_file, file_path, self._enable_asr, task)
             if not ret:
                 message = f" 媒体: {file_name}\n 生成字幕失败，跳过后续处理"
                 if self._send_notify:
                     self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
+                self.__update_task_progress(task, task.progress if task else 0, "处理失败", "生成字幕失败", force=True)
                 return TaskStatus.FAILED
 
+            self.__update_task_progress(task, 75 if self._translate_zh else 95, "字幕已生成",
+                                        f"原始语言：{lang}", force=True)
             if self._translate_zh:
                 # 翻译字幕
                 logger.info(f"开始翻译字幕为中文 ...")
-                self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt")
+                self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt", task)
                 logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
+                self.__update_task_progress(task, 98, "翻译完成", "中文字幕已生成", force=True)
 
             end_time = time.time()
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
@@ -383,6 +477,7 @@ class AutoSubv2Plus(_PluginBase):
             return TaskStatus.COMPLETED
         except UserInterruptException:
             logger.info(f"用户中断当前任务：{video_file}")
+            self.__update_task_progress(task, task.progress if task else 0, "已中断", "用户中断当前任务", force=True)
             return TaskStatus.FAILED
         except Exception as e:
             logger.error(f"自动字幕生成 处理异常：{e}")
@@ -392,9 +487,10 @@ class AutoSubv2Plus(_PluginBase):
                 self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
             # 打印调用栈
             logger.error(traceback.format_exc())
+            self.__update_task_progress(task, task.progress if task else 0, "处理异常", str(e)[:120], force=True)
             return TaskStatus.FAILED
 
-    def __do_speech_recognition(self, audio_lang, audio_file):
+    def __do_speech_recognition(self, audio_lang, audio_file, task: Optional[TaskItem] = None):
         """
         语音识别, 生成字幕
         :param audio_lang:
@@ -404,6 +500,7 @@ class AutoSubv2Plus(_PluginBase):
         lang = audio_lang
         try:
             from faster_whisper import WhisperModel, download_model
+            self.__update_task_progress(task, 32, "加载识别模型", f"模型：{self._faster_whisper_model}", force=True)
             # 设置缓存目录, 防止缓存同目录出现 cross-device 错误
             cache_dir = os.path.join(self._faster_whisper_model_path, "cache")
             if not os.path.exists(cache_dir):
@@ -417,6 +514,7 @@ class AutoSubv2Plus(_PluginBase):
                 device="cpu", compute_type="int8", cpu_threads=psutil.cpu_count(logical=False))
             
             try:
+                self.__update_task_progress(task, 38, "语音识别", "开始转录音频", force=True)
                 segments, info = model.transcribe(audio_file,
                                                   language=lang if lang != 'auto' else None,
                                                   word_timestamps=True,
@@ -424,6 +522,7 @@ class AutoSubv2Plus(_PluginBase):
                                                   temperature=0,
                                                   beam_size=5)
                 logger.info("Detected language '%s' with probability %f" % (info.language, info.language_probability))
+                duration = float(getattr(info, "duration", 0) or 0)
 
                 if lang == 'auto':
                     lang = info.language
@@ -446,6 +545,10 @@ class AutoSubv2Plus(_PluginBase):
                     if self._event.is_set():
                         logger.info(f"whisper音轨转录服务停止")
                         raise UserInterruptException(f"用户中断当前任务")
+                    segment_end = float(getattr(segment, "end", 0) or 0)
+                    percent = self.__scale_progress(38, 72, segment_end, duration)
+                    detail = f"{segment_end:.1f}/{duration:.1f} 秒" if duration else "正在识别英文音频"
+                    self.__update_task_progress(task, percent, "语音识别", detail)
                     for word in segment.words:
                         idx += 1
                         subs.append(srt.Subtitle(index=idx,
@@ -458,11 +561,16 @@ class AutoSubv2Plus(_PluginBase):
                     if self._event.is_set():
                         logger.info(f"whisper音轨转录服务停止")
                         raise UserInterruptException(f"用户中断当前任务")
+                    segment_end = float(getattr(segment, "end", 0) or 0)
+                    percent = self.__scale_progress(38, 72, segment_end, duration)
+                    detail = f"{segment_end:.1f}/{duration:.1f} 秒" if duration else "正在识别音频"
+                    self.__update_task_progress(task, percent, "语音识别", detail)
                     subs.append(srt.Subtitle(index=i,
                                              start=timedelta(seconds=segment.start),
                                              end=timedelta(seconds=segment.end),
                                              content=segment.text))
             self.__save_srt(f"{audio_file}.srt", subs)
+            self.__update_task_progress(task, 72, "语音识别完成", f"识别到 {len(subs)} 条字幕", force=True)
             logger.info(f"音轨转字幕完成")
             return True, lang
         except ImportError:
@@ -473,7 +581,7 @@ class AutoSubv2Plus(_PluginBase):
             logger.error(f"faster-whisper 处理异常：{e}")
             return False, None
 
-    def __generate_subtitle(self, video_file, subtitle_file, enable_asr=True):
+    def __generate_subtitle(self, video_file, subtitle_file, enable_asr=True, task: Optional[TaskItem] = None):
         """
         生成字幕
         :param video_file: 视频文件
@@ -481,9 +589,11 @@ class AutoSubv2Plus(_PluginBase):
         :return: 生成成功返回True，字幕语言,字幕路径，否则返回False, None, None
         """
         # 获取文件元数据
+        self.__update_task_progress(task, 6, "读取媒体信息", "正在读取视频元数据", force=True)
         video_meta = Ffmpeg().get_video_metadata(video_file)
         if not video_meta:
             logger.error(f"获取视频文件元数据失败，跳过后续处理")
+            self.__update_task_progress(task, 6, "处理失败", "获取视频文件元数据失败", force=True)
             return False, None, None
         # 获取字幕语言偏好
         if self._translate_preference == "english_only":
@@ -500,6 +610,7 @@ class AutoSubv2Plus(_PluginBase):
         ret, audio_index, audio_lang = self.__get_video_prefer_audio(video_meta, prefer_lang=prefer_subtitle_langs)
         if not ret:
             logger.info(f"字幕源偏好：{self._translate_preference} 获取音轨元数据失败")
+            self.__update_task_progress(task, 10, "处理失败", "获取音轨元数据失败", force=True)
             return False, None, None
         
         # 如果开启了自动语言检测，直接设置为auto，跳过metadata的语言信息
@@ -515,12 +626,14 @@ class AutoSubv2Plus(_PluginBase):
             prefer_subtitle_langs = ['en', 'eng'] if audio_lang == 'auto' else [audio_lang,
                                                                                 iso639.to_iso639_1(audio_lang)]
         # 获取外挂字幕
+        self.__update_task_progress(task, 12, "匹配字幕", "正在匹配外挂字幕", force=True)
         logger.info(f"使用 {prefer_subtitle_langs} 匹配已有外挂字幕文件 ...")
         external_sub_exist, external_sub_lang, exist_sub_name = self.__external_subtitle_exists(video_file,
                                                                                                 prefer_subtitle_langs,
                                                                                                 only_srt=True,
                                                                                                 strict=strict)
         # 获取内嵌字幕
+        self.__update_task_progress(task, 16, "匹配字幕", "正在匹配内嵌字幕", force=True)
         logger.info(f"使用 {prefer_subtitle_langs} 匹配内嵌字幕文件 ...")
         inner_sub_exist, subtitle_index, inner_sub_lang, = self.__get_video_prefer_subtitle(video_meta,
                                                                                             prefer_subtitle_langs,
@@ -535,6 +648,7 @@ class AutoSubv2Plus(_PluginBase):
         if self._translate_preference == "english_only":
             if external_sub_exist:
                 logger.info(f"字幕源偏好：{self._translate_preference} 外挂字幕存在，字幕语言 {external_sub_lang}")
+                self.__update_task_progress(task, 65, "使用已有字幕", f"外挂字幕语言：{external_sub_lang}", force=True)
                 return True, iso639.to_iso639_1(external_sub_lang), get_sub_path()
             elif inner_sub_exist:
                 logger.info(f"字幕源偏好：{self._translate_preference} 内嵌字幕存在，字幕语言 {inner_sub_lang}")
@@ -544,12 +658,14 @@ class AutoSubv2Plus(_PluginBase):
         else:  # english_first/origin_first
             if external_sub_exist and external_sub_lang in prefer_subtitle_langs:
                 logger.info(f"字幕源偏好：{self._translate_preference} 外挂字幕存在，字幕语言 {external_sub_lang}")
+                self.__update_task_progress(task, 65, "使用已有字幕", f"外挂字幕语言：{external_sub_lang}", force=True)
                 return True, iso639.to_iso639_1(external_sub_lang), get_sub_path()
             elif inner_sub_exist and inner_sub_lang in prefer_subtitle_langs:
                 logger.info(f"字幕源偏好：{self._translate_preference} 内嵌字幕存在，字幕语言 {inner_sub_lang}")
                 extract_subtitle = True
             elif external_sub_exist:
                 logger.info(f"字幕源偏好：{self._translate_preference} 外挂字幕存在，字幕语言 {external_sub_lang}")
+                self.__update_task_progress(task, 65, "使用已有字幕", f"外挂字幕语言：{external_sub_lang}", force=True)
                 return True, iso639.to_iso639_1(external_sub_lang), get_sub_path()
             elif inner_sub_exist:
                 logger.info(f"字幕源偏好：{self._translate_preference} 内嵌字幕存在，字幕语言 {inner_sub_lang}")
@@ -561,8 +677,10 @@ class AutoSubv2Plus(_PluginBase):
             inner_sub_lang = iso639.to_iso639_1(inner_sub_lang) \
                 if (inner_sub_lang and iso639.find(inner_sub_lang) and iso639.to_iso639_1(inner_sub_lang)) else 'und'
             extracted_sub_path = f"{subtitle_file}.{inner_sub_lang}.srt"
+            self.__update_task_progress(task, 28, "提取内嵌字幕", f"字幕语言：{inner_sub_lang}", force=True)
             Ffmpeg().extract_subtitle_from_video(video_file, extracted_sub_path, subtitle_index)
             logger.info(f"提取字幕完成：{extracted_sub_path}")
+            self.__update_task_progress(task, 65, "提取内嵌字幕完成", f"字幕语言：{inner_sub_lang}", force=True)
             return True, inner_sub_lang, extracted_sub_path
         # 使用asr音轨识别字幕
         if audio_lang != 'auto':
@@ -570,6 +688,7 @@ class AutoSubv2Plus(_PluginBase):
 
         if not enable_asr:
             logger.info(f"未开启语音识别，且无已有字幕文件，跳过后续处理")
+            self.__update_task_progress(task, 20, "处理失败", "未开启语音识别且无可用字幕", force=True)
             return False, None, None
 
         # 清理异常退出的临时文件
@@ -581,17 +700,20 @@ class AutoSubv2Plus(_PluginBase):
         with tempfile.NamedTemporaryFile(prefix='autosub-', suffix='.wav', delete=True) as audio_file:
             # 提取音频
             logger.info(f"正在提取音频：{audio_file.name} ...")
+            self.__update_task_progress(task, 24, "提取音频", "正在从视频提取音轨", force=True)
             Ffmpeg().extract_wav_from_video(video_file, audio_file.name, audio_index)
             logger.info(f"提取音频完成：{audio_file.name}")
+            self.__update_task_progress(task, 30, "提取音频完成", "音频已提取，准备识别", force=True)
 
             # 生成字幕
             logger.info(f"开始生成字幕, 语言 {audio_lang} ...")
-            ret, lang = self.__do_speech_recognition(audio_lang, audio_file.name)
+            ret, lang = self.__do_speech_recognition(audio_lang, audio_file.name, task)
             if ret:
                 logger.info(f"生成字幕成功，原始语言：{lang}")
                 # 复制字幕文件
                 SystemUtils.copy(Path(f"{audio_file.name}.srt"), Path(f"{subtitle_file}.{lang}.srt"))
                 logger.info(f"复制字幕文件：{subtitle_file}.{lang}.srt")
+                self.__update_task_progress(task, 74, "保存字幕", f"字幕语言：{lang}", force=True)
                 # 删除临时文件
                 os.remove(f"{audio_file.name}.srt")
                 return ret, lang, Path(f"{subtitle_file}.{lang}.srt")
@@ -877,7 +999,8 @@ class AutoSubv2Plus(_PluginBase):
             item.content = f"[翻译失败]\n{item.content}"
             return item
 
-    def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str):
+    def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str,
+                                task: Optional[TaskItem] = None):
         self._stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0}
         subs = self.__load_srt(source_subtitle)
         if source_lang in ["en", "eng"] and self._enable_merge:
@@ -890,9 +1013,11 @@ class AutoSubv2Plus(_PluginBase):
             logger.warning("字幕文件为空或没有有效的字幕条目，跳过翻译")
             # 创建一个空的字幕文件
             self.__save_srt(dest_subtitle, [])
+            self.__update_task_progress(task, 98, "翻译完成", "字幕为空，已生成空中文字幕", force=True)
             return
             
         self._stats['total'] = len(valid_subs)
+        self.__update_task_progress(task, 76, "翻译字幕", f"共 {len(valid_subs)} 行", force=True)
         processed = []
         current_batch = []
 
@@ -903,11 +1028,18 @@ class AutoSubv2Plus(_PluginBase):
                 processed += self.__process_items(valid_subs, current_batch)
                 current_batch = []
                 logger.info(f"进度: {len(processed)}/{len(valid_subs)}")
+                percent = self.__scale_progress(76, 98, len(processed), len(valid_subs))
+                self.__update_task_progress(task, percent, "翻译字幕",
+                                            f"{len(processed)}/{len(valid_subs)} 行")
 
         if current_batch:
             processed += self.__process_items(valid_subs, current_batch)
+            percent = self.__scale_progress(76, 98, len(processed), len(valid_subs))
+            self.__update_task_progress(task, percent, "翻译字幕",
+                                        f"{len(processed)}/{len(valid_subs)} 行", force=True)
 
         self.__save_srt(dest_subtitle, processed)
+        self.__update_task_progress(task, 98, "翻译完成", f"已翻译 {len(processed)} 行", force=True)
         
         success_rate = (self._stats['batch_success'] / self._stats['total'] * 100) if self._stats['total'] > 0 else 0.0
         
@@ -1609,6 +1741,20 @@ class AutoSubv2Plus(_PluginBase):
                 task.complete_time.strftime("%Y-%m-%d %H:%M:%S")
                 if task.complete_time else "-"
             )
+            progress = self.__clip_progress(task.progress)
+            progress_color = {
+                TaskStatus.PENDING: "#1976D2",
+                TaskStatus.IN_PROGRESS: "#F59E0B",
+                TaskStatus.COMPLETED: "#2E7D32",
+                TaskStatus.IGNORED: "#757575",
+                TaskStatus.FAILED: "#D32F2F"
+            }.get(task.status, "#1976D2")
+            progress_detail_parts = [task.progress_stage or status_text]
+            if task.progress_detail and task.progress_detail not in progress_detail_parts:
+                progress_detail_parts.append(task.progress_detail)
+            if task.progress_updated:
+                progress_detail_parts.append(task.progress_updated.strftime("%H:%M:%S"))
+            progress_detail = " · ".join(progress_detail_parts)
 
             rows.append({
                 "component": "tr",
@@ -1622,6 +1768,49 @@ class AutoSubv2Plus(_PluginBase):
                         "component": "td",
                         "props": {"class": status_class},
                         "text": status_text
+                    },
+                    {
+                        "component": "td",
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": "d-flex align-center",
+                                    "style": "gap:8px;min-width:180px"
+                                },
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {
+                                            "style": "width:120px;height:8px;border-radius:999px;"
+                                                     "background:rgba(125,125,125,.18);overflow:hidden"
+                                        },
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "style": f"height:100%;width:{progress}%;"
+                                                             f"background:{progress_color};border-radius:999px"
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "component": "span",
+                                        "props": {"class": "text-caption text-no-wrap"},
+                                        "text": f"{progress:.1f}%"
+                                    }
+                                ]
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": "text-caption text-muted mt-1",
+                                    "style": "max-width:280px;white-space:normal"
+                                },
+                                "text": progress_detail
+                            }
+                        ]
                     },
                 ],
             })
@@ -1666,6 +1855,11 @@ class AutoSubv2Plus(_PluginBase):
                                                 "props": {"class": "text-start ps-4"},
                                                 "text": "状态"
                                             },
+                                            {
+                                                "component": "th",
+                                                "props": {"class": "text-start ps-4"},
+                                                "text": "进度"
+                                            },
                                         ]
                                     },
                                     {"component": "tbody", "content": rows}
@@ -1709,6 +1903,9 @@ class AutoSubv2Plus(_PluginBase):
                 if task.status == TaskStatus.PENDING or task.status == TaskStatus.IN_PROGRESS:
                     task.status = TaskStatus.FAILED
                     task.complete_time = datetime.now()
+                    task.progress_stage = "服务已停止"
+                    task.progress_detail = "插件停止时任务未完成"
+                    task.progress_updated = datetime.now()
             self.save_tasks()  # 持久化更新后的任务列表
         self._running = False
         self._event.clear()
