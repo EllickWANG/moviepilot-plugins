@@ -6,7 +6,8 @@
 
 ## 功能特点
 
-- 支持从视频音轨中提取字幕（外部命令后端，可接入 whisper.cpp / OpenVINO / Vulkan）
+- 支持从视频音轨中提取字幕（OpenVINO GenAI 后端，默认使用 Intel GPU）
+- 支持外部命令后端，可接入 whisper.cpp / Vulkan 等工具
 - 保留 faster-whisper 兼容后端，但默认不再依赖 faster-whisper
 - 支持从视频内嵌字幕中提取字幕
 - 支持从外挂字幕文件中提取字幕
@@ -39,12 +40,19 @@
 | 配置项                 | 说明                                      | 默认值              |
 |---------------------|-----------------------------------------|------------------|
 | 允许从音轨提取字幕           | 是否允许从视频音轨中提取字幕                      | 是                |
-| ASR 后端              | 外部命令或 faster-whisper 兼容后端              | external_command |
+| ASR 后端              | OpenVINO GenAI、外部命令或 faster-whisper 兼容后端 | openvino_genai |
+| OpenVINO模型ID        | HuggingFace 上已转换的 OpenVINO Whisper 模型      | OpenVINO/whisper-base-int8-ov |
+| OpenVINO设备          | OpenVINO 推理设备                              | GPU |
+| 自动下载模型           | 模型目录不存在时自动下载模型                         | 是 |
+| OpenVINO模型目录       | 模型保存目录，留空时使用插件数据目录                    | 空 |
+| 最大Token             | OpenVINO GenAI 生成最大 token 数                 | 448 |
 | 外部ASR命令             | 调用 whisper.cpp/OpenVINO/Vulkan 等外部程序生成SRT | 空                |
 | 外部ASR超时             | 外部命令最长运行时间，单位秒                       | 7200             |
 | 自动检测失败默认语言          | 外部命令无法返回语言时使用的字幕源语言                  | en               |
 | faster-whisper 模型选择 | 兼容后端使用的 Whisper 模型大小                  | base             |
 | faster-whisper 使用代理下载模型 | 兼容后端是否使用代理下载模型                 | 是                |
+
+OpenVINO GenAI 后端会自动下载默认模型，并通过 `WhisperPipeline(model_path, "GPU")` 生成带时间轴的 SRT。
 
 外部命令示例：
 
@@ -134,7 +142,7 @@ whisper-cli -m /models/ggml-base.bin -f {audio} -l {language} -osrt -of {output}
 ## 注意事项
 
 1. 翻译功能依赖大模型配置，使用前请确保已正确配置 OpenAI Key 或 ChatGPT 插件。
-2. GPU 版默认使用外部ASR命令，MoviePilot 容器或 sidecar 中需要提前准备好 whisper.cpp/OpenVINO 等可执行程序和模型文件。
+2. GPU 版默认使用 OpenVINO GenAI，MoviePilot 容器需要能通过 Python 加载 OpenVINO 并访问 `/dev/dri`。
 3. 使用 faster-whisper 兼容后端时，需要环境中已安装 faster-whisper；该后端仍是 CPU 路线。
 4. 媒体路径支持单个文件或文件夹的绝对路径。选择文件夹时会递归处理其中的所有视频文件，外挂字幕将从媒体文件同级目录中查找。
 4. 批量翻译通过一次处理多行字幕来减少 API 调用次数，提高效率。如果翻译结果与原文行数不匹配，系统会自动降级为逐行翻译。

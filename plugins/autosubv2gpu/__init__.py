@@ -1,4 +1,5 @@
 import copy
+import importlib.util
 import os
 import re
 import shlex
@@ -77,7 +78,7 @@ class AutoSubv2Gpu(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.6.1"
+    plugin_version = "2.7.0"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -118,6 +119,11 @@ class AutoSubv2Gpu(_PluginBase):
     _external_asr_command = None
     _external_asr_timeout = None
     _external_asr_default_language = None
+    _openvino_model_id = None
+    _openvino_model_path = None
+    _openvino_device = None
+    _openvino_auto_download = None
+    _openvino_max_new_tokens = None
     _latest_asr_test: Dict[str, Any] = None
     _huggingface_proxy = None
     _faster_whisper_model_path = None
@@ -140,15 +146,25 @@ class AutoSubv2Gpu(_PluginBase):
         # 字幕生成设置
         self._translate_preference = config.get('translate_preference', 'english_first')
         self._enable_asr = config.get('enable_asr', True)
-        self._asr_backend = config.get('asr_backend', 'external_command')
-        if self._asr_backend not in ['external_command', 'faster_whisper']:
-            self._asr_backend = 'external_command'
+        self._asr_backend = config.get('asr_backend', 'openvino_genai')
+        if self._asr_backend not in ['openvino_genai', 'external_command', 'faster_whisper']:
+            self._asr_backend = 'openvino_genai'
         if self._enable_asr:
             self._auto_detect_language = config.get('auto_detect_language', False)
             self._external_asr_command = str(config.get('external_asr_command') or '').strip()
             self._external_asr_timeout = int(config.get('external_asr_timeout')) \
                 if config.get('external_asr_timeout') else 7200
             self._external_asr_default_language = str(config.get('external_asr_default_language') or 'en').strip()
+            self._openvino_model_id = str(config.get('openvino_model_id') or 'OpenVINO/whisper-base-int8-ov').strip()
+            self._openvino_model_path = str(
+                config.get('openvino_model_path') or (
+                    self.get_data_path() / "openvino-models" / self.__safe_model_dir(self._openvino_model_id)
+                )
+            )
+            self._openvino_device = str(config.get('openvino_device') or 'GPU').strip().upper()
+            self._openvino_auto_download = config.get('openvino_auto_download', True)
+            self._openvino_max_new_tokens = int(config.get('openvino_max_new_tokens')) \
+                if config.get('openvino_max_new_tokens') else 448
             self._latest_asr_test = (
                 config.get('latest_asr_test') if isinstance(config.get('latest_asr_test'), dict) else {}
             )
@@ -356,6 +372,17 @@ class AutoSubv2Gpu(_PluginBase):
                 self.add_task(path, TaskSource.MANUAL)
 
     def __check_asr(self):
+        if self._asr_backend == 'openvino_genai':
+            try:
+                import openvino_genai  # noqa
+            except ImportError:
+                logger.warn(f"openvino-genai 未安装，不进行处理")
+                return False
+            model_path = self.__prepare_openvino_model()
+            if not model_path:
+                return False
+            return True
+
         if self._asr_backend == 'external_command':
             if not self._external_asr_command:
                 logger.warn(f"外部ASR命令未配置，不进行处理")
@@ -432,9 +459,60 @@ class AutoSubv2Gpu(_PluginBase):
             return TaskStatus.FAILED
 
     def __do_speech_recognition(self, audio_lang, audio_file):
+        if self._asr_backend == 'openvino_genai':
+            return self.__do_openvino_genai_recognition(audio_lang, audio_file)
         if self._asr_backend == 'external_command':
             return self.__do_external_speech_recognition(audio_lang, audio_file)
         return self.__do_faster_whisper_recognition(audio_lang, audio_file)
+
+    def __do_openvino_genai_recognition(self, audio_lang, audio_file):
+        lang = audio_lang or 'auto'
+        try:
+            import openvino_genai as ov_genai
+
+            model_path = self.__prepare_openvino_model()
+            if not model_path:
+                return False, None
+
+            raw_speech = self.__read_wav_16k_mono(audio_file)
+            logger.info(f"开始使用 OpenVINO GenAI 生成字幕：device={self._openvino_device}, model={model_path}")
+            pipe = ov_genai.WhisperPipeline(str(model_path), self._openvino_device)
+            kwargs = {
+                "return_timestamps": True,
+                "max_new_tokens": self._openvino_max_new_tokens,
+            }
+            language_token = self.__openvino_language_token(lang)
+            if language_token:
+                kwargs["language"] = language_token
+            result = pipe.generate(raw_speech, **kwargs)
+            detected_lang = str(getattr(result, "language", "") or "").strip()
+            if lang == 'auto':
+                lang = detected_lang or self._external_asr_default_language or 'und'
+
+            subs = self.__openvino_result_to_subtitles(result)
+            if not subs:
+                text = self.__openvino_result_text(result).strip()
+                if text:
+                    duration = max(self.__wav_duration(audio_file), 1.0)
+                    subs = [srt.Subtitle(
+                        index=1,
+                        start=timedelta(seconds=0),
+                        end=timedelta(seconds=duration),
+                        content=text,
+                    )]
+                else:
+                    logger.info("OpenVINO GenAI 未检测到有效语音内容，生成空字幕文件以避免重复处理")
+
+            self.__save_srt(f"{audio_file}.srt", subs)
+            logger.info(f"OpenVINO GenAI 音轨转字幕完成，语言：{lang}，字幕条目：{len(subs)}")
+            return True, lang
+        except ImportError:
+            logger.warn(f"openvino-genai 未安装，不进行处理")
+            return False, None
+        except Exception as e:
+            logger.error(f"OpenVINO GenAI 处理异常：{e}")
+            logger.error(traceback.format_exc())
+            return False, None
 
     def __do_faster_whisper_recognition(self, audio_lang, audio_file):
         """
@@ -591,12 +669,27 @@ class AutoSubv2Gpu(_PluginBase):
         original_command = self._external_asr_command
         original_timeout = self._external_asr_timeout
         original_default_language = self._external_asr_default_language
+        original_backend = self._asr_backend
+        original_openvino_device = self._openvino_device
+        original_openvino_model_id = self._openvino_model_id
+        original_openvino_model_path = self._openvino_model_path
+        original_openvino_auto_download = self._openvino_auto_download
         if payload.get('external_asr_command'):
             self._external_asr_command = str(payload.get('external_asr_command') or '').strip()
         if payload.get('external_asr_timeout'):
             self._external_asr_timeout = int(payload.get('external_asr_timeout'))
         if payload.get('external_asr_default_language'):
             self._external_asr_default_language = str(payload.get('external_asr_default_language') or '').strip()
+        if payload.get('asr_backend'):
+            self._asr_backend = str(payload.get('asr_backend') or '').strip()
+        if payload.get('openvino_device'):
+            self._openvino_device = str(payload.get('openvino_device') or '').strip().upper()
+        if payload.get('openvino_model_id'):
+            self._openvino_model_id = str(payload.get('openvino_model_id') or '').strip()
+        if payload.get('openvino_model_path'):
+            self._openvino_model_path = str(payload.get('openvino_model_path') or '').strip()
+        if payload.get('openvino_auto_download') is not None:
+            self._openvino_auto_download = bool(payload.get('openvino_auto_download'))
 
         started = time.time()
         result = {
@@ -605,16 +698,17 @@ class AutoSubv2Gpu(_PluginBase):
             "message": "",
             "language": "",
             "duration": 0,
-            "runtime": self.__probe_external_asr_runtime(),
+            "backend": self._asr_backend,
+            "runtime": self.__probe_asr_runtime(),
         }
         try:
-            if not self._external_asr_command:
+            if self._asr_backend == 'external_command' and not self._external_asr_command:
                 result["message"] = "外部ASR命令未配置"
                 return schemas.Response(success=False, message=result["message"], data=result)
 
             with tempfile.NamedTemporaryFile(prefix='autosub-asr-test-', suffix='.wav', delete=True) as audio_file:
                 self.__write_test_wav(audio_file.name)
-                ret, lang = self.__do_external_speech_recognition('auto', audio_file.name)
+                ret, lang = self.__do_speech_recognition('auto', audio_file.name)
                 result["language"] = lang or ""
                 srt_path = f"{audio_file.name}.srt"
                 result["srt_exists"] = os.path.exists(srt_path)
@@ -634,6 +728,11 @@ class AutoSubv2Gpu(_PluginBase):
             self._external_asr_command = original_command
             self._external_asr_timeout = original_timeout
             self._external_asr_default_language = original_default_language
+            self._asr_backend = original_backend
+            self._openvino_device = original_openvino_device
+            self._openvino_model_id = original_openvino_model_id
+            self._openvino_model_path = original_openvino_model_path
+            self._openvino_auto_download = original_openvino_auto_download
 
     @staticmethod
     def __write_test_wav(file_path: str):
@@ -643,8 +742,145 @@ class AutoSubv2Gpu(_PluginBase):
             wav_file.setframerate(16000)
             wav_file.writeframes(b'\x00\x00' * 16000)
 
+    def __prepare_openvino_model(self) -> Optional[Path]:
+        model_path = Path(self._openvino_model_path).expanduser()
+        if self.__is_openvino_model_ready(model_path):
+            return model_path
+        if not self._openvino_auto_download:
+            logger.warn(f"OpenVINO模型目录无效且未开启自动下载：{model_path}")
+            return None
+        if not self._openvino_model_id:
+            logger.warn("OpenVINO模型ID未配置")
+            return None
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            logger.warn("huggingface_hub 未安装，无法自动下载 OpenVINO 模型")
+            return None
+
+        model_path.mkdir(parents=True, exist_ok=True)
+        cache_dir = model_path.parent / "hf-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if self._huggingface_proxy:
+            os.environ["HTTP_PROXY"] = settings.PROXY['http']
+            os.environ["HTTPS_PROXY"] = settings.PROXY['https']
+        logger.info(f"开始下载 OpenVINO Whisper 模型：{self._openvino_model_id} -> {model_path}")
+        try:
+            snapshot_download(
+                repo_id=self._openvino_model_id,
+                local_dir=str(model_path),
+                cache_dir=str(cache_dir),
+                local_dir_use_symlinks=False,
+            )
+        except TypeError:
+            snapshot_download(
+                repo_id=self._openvino_model_id,
+                local_dir=str(model_path),
+                cache_dir=str(cache_dir),
+            )
+        if not self.__is_openvino_model_ready(model_path):
+            logger.warn(f"OpenVINO模型下载后仍不完整：{model_path}")
+            return None
+        logger.info(f"OpenVINO模型已就绪：{model_path}")
+        return model_path
+
     @staticmethod
-    def __probe_external_asr_runtime() -> Dict[str, Any]:
+    def __is_openvino_model_ready(model_path: Path) -> bool:
+        if not model_path or not model_path.exists() or not model_path.is_dir():
+            return False
+        required_files = [
+            "config.json",
+            "openvino_encoder_model.xml",
+            "openvino_decoder_model.xml",
+        ]
+        return all((model_path / file_name).exists() for file_name in required_files)
+
+    @staticmethod
+    def __safe_model_dir(model_id: str) -> str:
+        value = str(model_id or "openvino-whisper").strip().replace("/", "__")
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value) or "openvino-whisper"
+
+    @staticmethod
+    def __read_wav_16k_mono(file_path: str) -> List[float]:
+        with wave.open(file_path, 'rb') as wav_file:
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            sample_rate = wav_file.getframerate()
+            frames = wav_file.readframes(wav_file.getnframes())
+        if channels != 1 or sample_width != 2 or sample_rate != 16000:
+            raise ValueError(
+                f"OpenVINO GenAI 需要 16kHz/16-bit/mono WAV，当前为 "
+                f"{sample_rate}Hz/{sample_width * 8}bit/{channels}ch"
+            )
+        import array
+        samples = array.array('h')
+        samples.frombytes(frames)
+        if samples.itemsize != 2:
+            raise ValueError("当前平台不支持按 16-bit PCM 读取 WAV")
+        return [max(-1.0, min(1.0, sample / 32768.0)) for sample in samples]
+
+    @staticmethod
+    def __wav_duration(file_path: str) -> float:
+        with wave.open(file_path, 'rb') as wav_file:
+            frames = wav_file.getnframes()
+            rate = wav_file.getframerate()
+        return frames / rate if rate else 0
+
+    @staticmethod
+    def __openvino_language_token(lang: str) -> str:
+        if not lang or lang == 'auto' or lang == 'und':
+            return ""
+        try:
+            normalized = iso639.to_iso639_1(lang) if iso639.find(lang) else lang
+        except Exception:
+            normalized = lang
+        normalized = str(normalized or "").strip().lower()
+        if not normalized:
+            return ""
+        return f"<|{normalized}|>"
+
+    @staticmethod
+    def __openvino_result_to_subtitles(result) -> List[srt.Subtitle]:
+        chunks = getattr(result, "chunks", None) or []
+        subtitles = []
+        for index, chunk in enumerate(chunks, start=1):
+            text = str(getattr(chunk, "text", "") or "").strip()
+            if not text:
+                continue
+            start = float(getattr(chunk, "start_ts", 0) or 0)
+            end = float(getattr(chunk, "end_ts", start) or start)
+            if end <= start:
+                end = start + 0.1
+            subtitles.append(srt.Subtitle(
+                index=index,
+                start=timedelta(seconds=start),
+                end=timedelta(seconds=end),
+                content=text,
+            ))
+        return subtitles
+
+    @staticmethod
+    def __openvino_result_text(result) -> str:
+        for attr in ("text", "m_text"):
+            value = getattr(result, attr, None)
+            if value:
+                return str(value)
+        texts = getattr(result, "texts", None)
+        if isinstance(texts, list) and texts:
+            return str(texts[0])
+        return str(result or "")
+
+    @staticmethod
+    def __probe_asr_runtime() -> Dict[str, Any]:
+        openvino_status = "installed" if importlib.util.find_spec("openvino_genai") else "missing"
+        hf_status = "installed" if importlib.util.find_spec("huggingface_hub") else "missing"
+        devices = []
+        try:
+            import openvino as ov
+            core = ov.Core()
+            devices = [str(device) for device in core.available_devices]
+        except Exception as err:
+            devices = [f"openvino_device_probe_error: {err}"]
         command = (
             "printf 'bins='; "
             "for b in whisper-cli whisper.cpp main whisper; do command -v \"$b\" 2>/dev/null | head -n 1; done; "
@@ -664,13 +900,22 @@ class AutoSubv2Gpu(_PluginBase):
             )
             return {
                 "returncode": completed.returncode,
+                "openvino_genai": openvino_status,
+                "huggingface_hub": hf_status,
+                "openvino_devices": devices,
                 "output": AutoSubv2Gpu.__clip_log(
                     "\n".join(item for item in [completed.stdout.strip(), completed.stderr.strip()] if item),
                     3000,
                 ),
             }
         except Exception as err:
-            return {"returncode": -1, "output": str(err)}
+            return {
+                "returncode": -1,
+                "openvino_genai": openvino_status,
+                "huggingface_hub": hf_status,
+                "openvino_devices": devices,
+                "output": str(err),
+            }
 
     @staticmethod
     def __format_external_asr_command(command: str, audio_file: str, output_prefix: str,
@@ -1481,6 +1726,8 @@ class AutoSubv2Gpu(_PluginBase):
                                             'model': 'asr_backend',
                                             'label': 'ASR 后端',
                                             'items': [
+                                                {'title': 'OpenVINO GenAI（Intel GPU）',
+                                                 'value': 'openvino_genai'},
                                                 {'title': '外部命令（GPU/whisper.cpp/OpenVINO）',
                                                  'value': 'external_command'},
                                                 {'title': 'faster-whisper（CPU兼容）',
@@ -1495,6 +1742,90 @@ class AutoSubv2Gpu(_PluginBase):
                     {
                         'component': 'VRow',
                         'props': {'v-show': 'enable_asr'},
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openvino_model_id',
+                                            'label': 'OpenVINO模型ID',
+                                            'placeholder': 'OpenVINO/whisper-base-int8-ov',
+                                            'hint': '默认使用 HuggingFace 上已转换的 OpenVINO Whisper INT8 模型',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'openvino_device',
+                                            'label': 'OpenVINO设备',
+                                            'items': ['GPU', 'CPU', 'AUTO']
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'openvino_auto_download',
+                                            'label': '自动下载模型'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openvino_max_new_tokens',
+                                            'label': '最大Token',
+                                            'placeholder': '448',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'props': {'v-show': 'enable_asr'},
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openvino_model_path',
+                                            'label': 'OpenVINO模型目录',
+                                            'placeholder': '留空时使用插件数据目录/openvino-models/OpenVINO__whisper-base-int8-ov'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'props': {'v-show': "enable_asr && asr_backend == 'external_command'"},
                         'content': [
                             {
                                 'component': 'VCol',
@@ -1518,7 +1849,7 @@ class AutoSubv2Gpu(_PluginBase):
                     },
                     {
                         'component': 'VRow',
-                        'props': {'v-show': 'enable_asr'},
+                        'props': {'v-show': "enable_asr && asr_backend == 'external_command'"},
                         'content': [
                             {
                                 'component': 'VCol',
@@ -1581,7 +1912,7 @@ class AutoSubv2Gpu(_PluginBase):
                                         'props': {
                                             'model': 'proxy',
                                             'hint': '需配置MP环境变量PROXY_HOST',
-                                            'label': 'faster-whisper 使用代理下载模型'
+                                            'label': '下载模型使用代理'
                                         }
                                     }
                                 ]
@@ -1873,11 +2204,16 @@ class AutoSubv2Gpu(_PluginBase):
             "translate_preference": "english_first",
             "translate_zh": False,
             "enable_asr": True,
-            "asr_backend": "external_command",
+            "asr_backend": "openvino_genai",
             "auto_detect_language": False,
             "external_asr_command": "",
             "external_asr_timeout": 7200,
             "external_asr_default_language": "en",
+            "openvino_model_id": "OpenVINO/whisper-base-int8-ov",
+            "openvino_model_path": "",
+            "openvino_device": "GPU",
+            "openvino_auto_download": True,
+            "openvino_max_new_tokens": 448,
             "latest_asr_test": {},
             "faster_whisper_model": "base",
             "proxy": True,
