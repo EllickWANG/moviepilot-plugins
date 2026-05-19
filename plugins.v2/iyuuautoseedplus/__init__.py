@@ -149,7 +149,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.11"
+    plugin_version = "2.15.12"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1082,23 +1082,37 @@ class IYUUAutoSeedPlus(_PluginBase):
         """
         定时检查下载器中种子是否校验完成，校验完成且完整的自动开始辅种
         """
+        self.__clean_recheck_torrents()
         if not self._recheck_torrents:
             return
         if self._is_recheck_running:
             return
         self._is_recheck_running = True
-        if self.auto_service_info:
-            # 检查指定下载器
-            self.check_recheck_service(self.auto_service_info)
+        try:
+            auto_service = self.auto_service_info
+            if auto_service:
+                # 检查指定下载器
+                self.check_recheck_service(auto_service)
+                return
+            services = self.service_infos
+            if not services:
+                return
+            for service in services.values():
+                # 需要检查的种子
+                self.check_recheck_service(service)
+        finally:
+            self.__clean_recheck_torrents()
             self._is_recheck_running = False
-            return
-        if not self.service_infos:
-            self._is_recheck_running = False
-            return
-        for service in self.service_infos.values():
-            # 需要检查的种子
-            self.check_recheck_service(service)
-        self._is_recheck_running = False
+
+    def __clean_recheck_torrents(self):
+        """
+        清理已完成的空校验队列，避免定时任务空跑刷日志。
+        """
+        self._recheck_torrents = {
+            downloader: torrent_ids
+            for downloader, torrent_ids in self._recheck_torrents.items()
+            if torrent_ids
+        }
 
     def check_recheck_service(self, service: ServiceInfo):
         """
@@ -1112,7 +1126,10 @@ class IYUUAutoSeedPlus(_PluginBase):
             return
         logger.info(f"开始检查下载器 {downloader} 的校验任务 ...")
         # 获取下载器中的种子状态
-        torrents, _ = downloader_obj.get_torrents(ids=recheck_torrents)
+        torrents, query_error = downloader_obj.get_torrents(ids=recheck_torrents)
+        if query_error:
+            logger.info(f"下载器 {downloader} 查询校验任务失败，将在下次继续查询 ...")
+            return
         if torrents:
             can_seeding_torrents = []
             for torrent in torrents:
@@ -1127,9 +1144,6 @@ class IYUUAutoSeedPlus(_PluginBase):
                 # 去除已经处理过的种子
                 self._recheck_torrents[downloader] = list(
                     set(recheck_torrents).difference(set(can_seeding_torrents)))
-        elif torrents is None:
-            logger.info(f"下载器 {downloader} 查询校验任务失败，将在下次继续查询 ...")
-            return
         else:
             logger.info(f"下载器 {downloader} 中没有需要检查的校验任务，清空待处理列表 ...")
             self._recheck_torrents[downloader] = []
