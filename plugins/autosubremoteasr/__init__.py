@@ -108,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.53"
+    plugin_version = "1.0.54"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1918,10 +1918,56 @@ class AutoSubRemoteAsr(_PluginBase):
         return True
 
     @staticmethod
+    def __parse_duration_seconds(value: Any) -> float:
+        if value in (None, ""):
+            return 0.0
+        try:
+            duration = float(value)
+            return duration if duration > 0 else 0.0
+        except Exception:
+            pass
+
+        text = str(value).strip()
+        match = re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$", text)
+        if not match:
+            return 0.0
+        try:
+            hours = float(match.group(1) or 0)
+            minutes = float(match.group(2) or 0)
+            seconds = float(match.group(3) or 0)
+            duration = hours * 3600 + minutes * 60 + seconds
+            return duration if duration > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def __get_video_duration(video_meta: Optional[dict]) -> float:
         try:
-            duration = (video_meta or {}).get("format", {}).get("duration")
-            return float(duration or 0)
+            meta = video_meta or {}
+            duration = AutoSubRemoteAsr.__parse_duration_seconds((meta.get("format") or {}).get("duration"))
+            if duration > 0:
+                return duration
+
+            format_tags = (meta.get("format") or {}).get("tags") or {}
+            for key in ("DURATION", "duration"):
+                duration = AutoSubRemoteAsr.__parse_duration_seconds(format_tags.get(key))
+                if duration > 0:
+                    return duration
+
+            stream_durations = []
+            for stream in meta.get("streams") or []:
+                if not isinstance(stream, dict):
+                    continue
+                duration = AutoSubRemoteAsr.__parse_duration_seconds(stream.get("duration"))
+                if duration <= 0:
+                    tags = stream.get("tags") or {}
+                    for key in ("DURATION", "duration"):
+                        duration = AutoSubRemoteAsr.__parse_duration_seconds(tags.get(key))
+                        if duration > 0:
+                            break
+                if duration > 0:
+                    stream_durations.append(duration)
+            return max(stream_durations) if stream_durations else 0.0
         except Exception:
             return 0.0
 
@@ -2023,7 +2069,8 @@ class AutoSubRemoteAsr(_PluginBase):
         return None
 
     def __detect_target_language_before_hard_subtitle(self, video_file: str,
-                                                      task: Optional[TaskItem] = None) -> str:
+                                                      task: Optional[TaskItem] = None,
+                                                      media_duration: float = 0) -> str:
         if not self.__check_asr() or not self._translate_zh:
             return ""
 
@@ -2046,6 +2093,8 @@ class AutoSubRemoteAsr(_PluginBase):
 
             if self._auto_detect_language or not iso639.find(audio_lang) or not iso639.to_iso639_1(audio_lang):
                 duration = self.__get_video_duration(video_meta)
+                if duration <= 0 and media_duration > 0:
+                    duration = media_duration
                 with tempfile.TemporaryDirectory(prefix='autosubremoteasr-probe-') as audio_dir:
                     lang = self.__detect_global_audio_language(
                         video_file,
@@ -2102,7 +2151,11 @@ class AutoSubRemoteAsr(_PluginBase):
                 return TaskStatus.IGNORED
             if not self.__check_video_integrity(process_file, task, media_input=media_input):
                 return TaskStatus.WAITING_FILE if task and task.status == TaskStatus.WAITING_FILE else TaskStatus.FAILED
-            target_lang = self.__detect_target_language_before_hard_subtitle(process_file, task)
+            target_lang = self.__detect_target_language_before_hard_subtitle(
+                process_file,
+                task,
+                float(media_input.get("duration") or 0),
+            )
             if target_lang:
                 self.__update_task_progress(
                     task,
@@ -2112,7 +2165,11 @@ class AutoSubRemoteAsr(_PluginBase):
                     force=True,
                 )
                 return TaskStatus.COMPLETED
-            hard_subtitle_reason = self.__hard_subtitle_reason(process_file, task=task)
+            hard_subtitle_reason = self.__hard_subtitle_reason(
+                process_file,
+                task=task,
+                media_duration=float(media_input.get("duration") or 0),
+            )
             if hard_subtitle_reason:
                 logger.warn(f"检测到硬字幕，不进行处理：{hard_subtitle_reason}")
                 self.__update_task_progress(task, 100, "已存在字幕", hard_subtitle_reason, force=True)
@@ -2458,7 +2515,9 @@ class AutoSubRemoteAsr(_PluginBase):
         except Exception:
             duration = 0
         if duration <= 0:
-            return []
+            fallback_offsets = [60.0, 180.0, 360.0, 720.0, 1200.0, 1800.0, 2400.0, 3000.0]
+            count = max(1, min(sample_count, int(sample_count or 5), len(fallback_offsets)))
+            return sorted(random.sample(fallback_offsets, count))
         if duration <= sample_seconds + 6:
             return [0.0]
 
@@ -2700,6 +2759,9 @@ class AutoSubRemoteAsr(_PluginBase):
             self.__update_task_progress(task, 24, "全局语言检测",
                                         f"复用缓存语言 {cached_language}，后续分段统一使用该语言", force=True)
             return cached_language
+
+        if not duration:
+            logger.warn("全局语言探测未读取到有效视频时长，使用固定偏移兜底抽样")
 
         for round_no in range(1, max_rounds + 1):
             offsets = self.__build_language_probe_offsets(
@@ -4179,11 +4241,14 @@ class AutoSubRemoteAsr(_PluginBase):
             "row_span": subtitle_band["row_span"],
         }
 
-    def __hard_subtitle_reason(self, video_file: str, task: Optional[TaskItem] = None) -> str:
+    def __hard_subtitle_reason(self, video_file: str, task: Optional[TaskItem] = None,
+                               media_duration: float = 0) -> str:
         video_meta = Ffmpeg().get_video_metadata(video_file, stop_event=self._event)
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
         duration = self.__get_video_duration(video_meta)
+        if duration <= 0 and media_duration > 0:
+            duration = media_duration
         samples = self.__hard_subtitle_sample_times(duration)
         if not samples:
             logger.info(f"硬字幕检测跳过：未读取到有效时长 {video_file}")
