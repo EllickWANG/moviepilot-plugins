@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.42"
+    plugin_version = "1.0.44"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
