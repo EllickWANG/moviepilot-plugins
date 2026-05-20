@@ -129,7 +129,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.56"
+    plugin_version = "1.0.57"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -5053,21 +5053,12 @@ class AutoSubRemoteAsr(_PluginBase):
                 "content": [
                     self.__form_col(
                         self.__form_text(
-                            "asr_api_model",
-                            "默认ASR模型",
-                            "whisper-1",
-                            "ASR通道配置为空时使用；需要支持 verbose_json 和 segments",
-                        ),
-                        md=4,
-                    ),
-                    self.__form_col(
-                        self.__form_text(
                             "asr_chunk_minutes",
                             "音频分段分钟",
                             "10",
                             "范围5-30；过短会增加接口调用",
                         ),
-                        md=4,
+                        md=6,
                     ),
                     self.__form_col(
                         self.__form_text(
@@ -5076,7 +5067,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "300",
                             "单段ASR请求超时后重试",
                         ),
-                        md=4,
+                        md=6,
                     ),
                 ],
             },
@@ -5098,6 +5089,28 @@ class AutoSubRemoteAsr(_PluginBase):
         ])
 
         asr_channel_settings = self.__form_card("ASR通道池", "可以配置多个转写接口，单段失败时自动切换健康通道", [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_api_model",
+                            "默认ASR模型",
+                            "whisper-1",
+                            "ASR通道配置为空时使用；需要支持 verbose_json 和 segments",
+                        ),
+                        md=4,
+                    ),
+                    self.__form_col(
+                        {
+                            "component": "VAlert",
+                            "props": {"type": "info", "variant": "tonal", "density": "compact"},
+                            "text": "通道池为空时，会使用翻译接口地址、翻译API密钥和这里的默认ASR模型创建单个ASR通道。",
+                        },
+                        md=8,
+                    ),
+                ],
+            },
             {
                 "component": "VRow",
                 "content": [
