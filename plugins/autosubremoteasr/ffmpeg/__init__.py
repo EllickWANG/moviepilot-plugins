@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import select
 import subprocess
 import time
@@ -213,6 +214,69 @@ class Ffmpeg:
             output_path
         ]
         return Ffmpeg._run_command(command, stop_event=stop_event)
+
+    @staticmethod
+    def measure_audio_volume(audio_path, stop_event=None, threads=None):
+        """
+        使用 ffmpeg volumedetect 读取短音频的平均/峰值音量，用于跳过静音采样。
+        """
+        if not audio_path:
+            return False, {}, "音频路径为空"
+
+        command = [
+            'ffmpeg', "-hide_banner", "-nostats", "-v", "info",
+            "-threads", str(max(1, int(threads or 1))),
+            "-i", audio_path,
+            "-af", "volumedetect",
+            "-f", "null", "-"
+        ]
+
+        process = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            while process.poll() is None:
+                if stop_event and stop_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                    return False, {}, "用户中断当前任务"
+                time.sleep(0.2)
+
+            stderr = process.stderr.read() if process.stderr else ""
+            ret = process.wait()
+            if ret != 0:
+                return False, {}, (stderr.strip() or f"ffmpeg退出码：{ret}")[:1000]
+
+            def parse_db(raw_value):
+                if raw_value == "-inf":
+                    return float("-inf")
+                return float(raw_value)
+
+            metrics = {}
+            for line in stderr.splitlines():
+                match = re.search(r"(mean|max)_volume:\s+(-?inf|-?\d+(?:\.\d+)?)\s+dB", line)
+                if match:
+                    metrics[f"{match.group(1)}_volume"] = parse_db(match.group(2))
+            if not metrics:
+                return False, {}, "未读取到音量信息"
+            return True, metrics, ""
+        except Exception as e:
+            if process and process.poll() is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            return False, {}, str(e)[:1000]
 
     @staticmethod
     def get_video_metadata(video_path, stop_event=None):

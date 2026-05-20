@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import inspect
 import json
 import math
@@ -103,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.33"
+    plugin_version = "1.0.34"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -137,6 +138,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _asr_chunk_minutes = 10
     _asr_chunk_seconds = 600
     _asr_request_timeout = 300
+    _asr_prompt = ""
     _translate_request_timeout = 120
     _asr_random_check_rate = 0.2
     _asr_request_retries = 3
@@ -218,9 +220,16 @@ class AutoSubRemoteAsr(_PluginBase):
             return 10
 
     @staticmethod
+    def __default_asr_prompt() -> str:
+        return (
+            "请按原音语言转写为字幕文本，不翻译、不总结、不改写；"
+            "保留重复、停顿、语气词、拟声词和人名术语。"
+        )
+
+    @staticmethod
     def __normalize_asr_chunk_minutes(value) -> int:
         try:
-            return max(1, min(30, int(value or 10)))
+            return max(5, min(30, int(value or 10)))
         except Exception:
             return 10
 
@@ -356,6 +365,10 @@ class AutoSubRemoteAsr(_PluginBase):
         self._asr_chunk_minutes = self.__normalize_asr_chunk_minutes(config.get('asr_chunk_minutes'))
         self._asr_chunk_seconds = self._asr_chunk_minutes * 60
         self._asr_request_timeout = self.__normalize_request_timeout(config.get('asr_request_timeout'), 300)
+        asr_prompt = config.get('asr_prompt')
+        if asr_prompt is None:
+            asr_prompt = self.__default_asr_prompt()
+        self._asr_prompt = str(asr_prompt or "").strip()
         self._translate_request_timeout = self.__normalize_request_timeout(config.get('translate_request_timeout'), 120)
         self._reuse_autosub_config = bool(config.get('reuse_autosub_config', True))
         self._auto_detect_language = config.get('auto_detect_language', False)
@@ -772,6 +785,11 @@ class AutoSubRemoteAsr(_PluginBase):
                 return None
             if checkpoint.get("video_file") != video_file:
                 return None
+            signature = self.__video_file_signature(video_file)
+            if checkpoint.get("source_size") is not None and int(checkpoint.get("source_size") or 0) != signature["size"]:
+                return None
+            if checkpoint.get("source_mtime") is not None and int(checkpoint.get("source_mtime") or 0) != signature["mtime"]:
+                return None
             if int(checkpoint.get("expected_chunks") or 0) != int(expected_chunks or 0):
                 return None
             if int(checkpoint.get("asr_chunk_seconds") or 0) != int(self._asr_chunk_seconds or 0):
@@ -796,12 +814,15 @@ class AutoSubRemoteAsr(_PluginBase):
             return
         try:
             now = datetime.now().isoformat()
+            signature = self.__video_file_signature(video_file)
             with self._tasks_lock:
                 checkpoints = self.__load_asr_checkpoints_unlocked()
                 checkpoint = checkpoints.get(key) if isinstance(checkpoints.get(key), dict) else {}
                 checkpoint.update({
                     "task_id": task.task_id if task else None,
                     "video_file": video_file,
+                    "source_size": signature["size"],
+                    "source_mtime": signature["mtime"],
                     "expected_chunks": int(expected_chunks or 0),
                     "asr_chunk_seconds": int(self._asr_chunk_seconds or 0),
                     "asr_api_model": self._asr_api_model,
@@ -833,6 +854,86 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.save_data("asr_checkpoints", checkpoints)
         except Exception as err:
             logger.warn(f"清理接口ASR断点失败：{err}")
+
+    @staticmethod
+    def __video_file_signature(video_file: str) -> Dict[str, int]:
+        try:
+            stat = os.stat(video_file)
+            return {"size": int(stat.st_size), "mtime": int(stat.st_mtime)}
+        except Exception:
+            return {"size": 0, "mtime": 0}
+
+    def __language_probe_cache_key(self, video_file: str, audio_index: int) -> Tuple[str, Dict[str, int]]:
+        signature = self.__video_file_signature(video_file)
+        audio_index = int(audio_index or 0)
+        raw = (
+            f"{video_file}|size={signature['size']}|mtime={signature['mtime']}|"
+            f"audio={audio_index}|model={self._asr_api_model}|probe=v3"
+        )
+        return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest(), signature
+
+    def __load_language_probe_cache_unlocked(self) -> Dict[str, dict]:
+        cache = self.get_data("asr_language_probe_cache") or {}
+        return cache if isinstance(cache, dict) else {}
+
+    def __get_cached_language_probe(self, video_file: str, audio_index: int) -> Optional[str]:
+        try:
+            key, signature = self.__language_probe_cache_key(video_file, audio_index)
+            with self._tasks_lock:
+                entry = self.__load_language_probe_cache_unlocked().get(key)
+            if not isinstance(entry, dict):
+                return None
+            language = self.__normalize_language_code(entry.get("language"), fallback="")
+            if not language:
+                return None
+            if entry.get("video_file") != video_file:
+                return None
+            if int(entry.get("audio_index") or 0) != int(audio_index or 0):
+                return None
+            if entry.get("asr_api_model") != self._asr_api_model:
+                return None
+            if int(entry.get("source_size") or 0) != signature["size"]:
+                return None
+            if int(entry.get("source_mtime") or 0) != signature["mtime"]:
+                return None
+            logger.info(
+                f"复用全局语言探测缓存：language={language}，"
+                f"samples={entry.get('sample_count') or '?'}，updated={entry.get('updated_at') or '-'}"
+            )
+            return language
+        except Exception as err:
+            logger.warn(f"读取全局语言探测缓存失败：{err}")
+            return None
+
+    def __save_cached_language_probe(self, video_file: str, audio_index: int, language: str,
+                                     reason: str, sample_count: int, valid_count: int):
+        language = self.__normalize_language_code(language, fallback="")
+        if not language:
+            return
+        try:
+            key, signature = self.__language_probe_cache_key(video_file, audio_index)
+            now = datetime.now().isoformat()
+            with self._tasks_lock:
+                cache = self.__load_language_probe_cache_unlocked()
+                cache[key] = {
+                    "video_file": video_file,
+                    "audio_index": int(audio_index or 0),
+                    "source_size": signature["size"],
+                    "source_mtime": signature["mtime"],
+                    "asr_api_model": self._asr_api_model,
+                    "language": language,
+                    "reason": reason,
+                    "sample_count": int(sample_count or 0),
+                    "valid_count": int(valid_count or 0),
+                    "updated_at": now,
+                }
+                if len(cache) > 200:
+                    records = sorted(cache.items(), key=lambda item: (item[1] or {}).get("updated_at") or "")
+                    for old_key, _ in records[:len(cache) - 200]:
+                        cache.pop(old_key, None)
+                self.save_data("asr_language_probe_cache", cache)
+        except Exception as err:
+            logger.warn(f"保存全局语言探测缓存失败：{err}")
 
     @staticmethod
     def __checkpoint_path(path) -> str:
@@ -1448,7 +1549,7 @@ class AutoSubRemoteAsr(_PluginBase):
         except Exception:
             return fallback
 
-    def __transcribe_audio_chunk(self, audio_file: str, audio_lang: str) -> dict:
+    def __transcribe_audio_chunk(self, audio_file: str, audio_lang: str, use_prompt: bool = True) -> dict:
         request_lang = self.__normalize_language_code(audio_lang, fallback="")
         data = {
             "model": self._asr_api_model,
@@ -1457,6 +1558,8 @@ class AutoSubRemoteAsr(_PluginBase):
         }
         if request_lang:
             data["language"] = request_lang
+        if use_prompt and self._asr_prompt:
+            data["prompt"] = self._asr_prompt
 
         url = f"{self.__get_openai_base_url()}/audio/transcriptions"
         try:
@@ -1538,7 +1641,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def __transcribe_audio_chunk_with_progress(self, audio_file: str, audio_lang: str, chunk_no: int,
                                                expected_chunks: int, task: Optional[TaskItem],
-                                               base_progress: float) -> dict:
+                                               base_progress: float, use_prompt: bool = True) -> dict:
         max_attempts = max(1, int(self._asr_request_retries or 1))
         last_error = None
         last_traceback = ""
@@ -1548,7 +1651,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
             def worker():
                 try:
-                    result["response"] = self.__transcribe_audio_chunk(audio_file, audio_lang)
+                    result["response"] = self.__transcribe_audio_chunk(audio_file, audio_lang, use_prompt=use_prompt)
                 except Exception as err:
                     result["error"] = err
                     result["traceback"] = traceback.format_exc()
@@ -1621,6 +1724,36 @@ class AutoSubRemoteAsr(_PluginBase):
             return float((meta or {}).get("format", {}).get("duration") or 0)
         except Exception:
             return 0.0
+
+    @staticmethod
+    def __format_db_value(value: Optional[float]) -> str:
+        if value is None:
+            return "-"
+        if not math.isfinite(float(value)):
+            return str(value)
+        return f"{value:.1f}dB"
+
+    def __probe_audio_local_quality(self, sample_file: str) -> Tuple[bool, str]:
+        ok, metrics, error = Ffmpeg().measure_audio_volume(
+            sample_file,
+            stop_event=self._event,
+            threads=self._cpu_threads,
+        )
+        if not ok:
+            logger.debug(f"全局语言探测本地音量检查失败，继续上传ASR判断：{error}")
+            return True, "本地音量未知"
+
+        mean_volume = self.__safe_float((metrics or {}).get("mean_volume"))
+        max_volume = self.__safe_float((metrics or {}).get("max_volume"))
+        detail = (
+            f"mean={self.__format_db_value(mean_volume)} "
+            f"max={self.__format_db_value(max_volume)}"
+        )
+        if max_volume is not None and max_volume <= -45:
+            return False, f"本地音量过低 {detail}"
+        if mean_volume is not None and max_volume is not None and mean_volume <= -55 and max_volume <= -35:
+            return False, f"本地疑似静音 {detail}"
+        return True, detail
 
     @staticmethod
     def __build_language_probe_offsets(duration: float, sample_count: int = 5,
@@ -1867,6 +2000,12 @@ class AutoSubRemoteAsr(_PluginBase):
         total_samples = 0
         total_expected = sample_count * max_rounds
 
+        cached_language = self.__get_cached_language_probe(video_file, audio_index)
+        if cached_language:
+            self.__update_task_progress(task, 24, "全局语言检测",
+                                        f"复用缓存语言 {cached_language}，后续分段统一使用该语言", force=True)
+            return cached_language
+
         for round_no in range(1, max_rounds + 1):
             offsets = self.__build_language_probe_offsets(
                 duration,
@@ -1905,6 +2044,14 @@ class AutoSubRemoteAsr(_PluginBase):
                     continue
                 try:
                     self.__validate_audio_chunk(sample_file, total_samples, total_expected, force=True)
+                    usable, local_detail = self.__probe_audio_local_quality(sample_file)
+                    if not usable:
+                        invalid_details.append(f"{total_samples}:local:{local_detail}")
+                        logger.warn(
+                            f"全局语言探测样本 {total_samples}/{total_expected} 本地过滤跳过ASR："
+                            f"offset={round(offset, 2)}s {local_detail}"
+                        )
+                        continue
                     self.__update_task_progress(task, 24, "全局语言检测",
                                                 f"样本 {total_samples}/{total_expected} 上传ASR判断语言")
                     response = self.__transcribe_audio_chunk_with_progress(
@@ -1913,7 +2060,8 @@ class AutoSubRemoteAsr(_PluginBase):
                         total_samples,
                         total_expected,
                         task,
-                        24
+                        24,
+                        use_prompt=False
                     )
                     raw_language = response.get("language")
                     language = self.__normalize_language_code(raw_language, fallback="")
@@ -1931,7 +2079,7 @@ class AutoSubRemoteAsr(_PluginBase):
                         valid_details.append(f"{total_samples}:{language}/{quality['score']:.2f}")
                         logger.info(
                             f"全局语言探测样本 {total_samples}/{total_expected}：offset={round(offset, 2)}s "
-                            f"language={raw_language} -> {language} {metric_text}"
+                            f"language={raw_language} -> {language} local={local_detail} {metric_text}"
                         )
                     else:
                         reason = quality["reason"] or "语言无效"
@@ -1941,6 +2089,25 @@ class AutoSubRemoteAsr(_PluginBase):
                             f"offset={round(offset, 2)}s language={raw_language} -> {language or '-'} "
                             f"{metric_text} reason={reason}"
                         )
+
+                    winner, reason = self.__select_language_probe_winner(scores, counts, len(valid_details))
+                    if winner:
+                        logger.info(
+                            f"全局语言探测提前完成：language={winner}，{reason}，"
+                            f"samples={total_samples}/{total_expected}，"
+                            f"valid={', '.join(valid_details)}，invalid={', '.join(invalid_details[-6:])}"
+                        )
+                        self.__save_cached_language_probe(
+                            video_file,
+                            audio_index,
+                            winner,
+                            reason,
+                            total_samples,
+                            len(valid_details),
+                        )
+                        self.__update_task_progress(task, 24, "全局语言检测",
+                                                    f"语言锁定为 {winner}，后续分段统一使用该语言", force=True)
+                        return winner
                 except Exception as err:
                     invalid_details.append(f"{total_samples}:error:{err}")
                     logger.warn(f"全局语言探测样本 {total_samples}/{total_expected} 失败：{err}")
@@ -1955,6 +2122,14 @@ class AutoSubRemoteAsr(_PluginBase):
                 logger.info(
                     f"全局语言探测完成：language={winner}，{reason}，"
                     f"valid={', '.join(valid_details)}，invalid={', '.join(invalid_details[-6:])}"
+                )
+                self.__save_cached_language_probe(
+                    video_file,
+                    audio_index,
+                    winner,
+                    reason,
+                    total_samples,
+                    len(valid_details),
                 )
                 self.__update_task_progress(task, 24, "全局语言检测",
                                             f"语言锁定为 {winner}，后续分段统一使用该语言", force=True)
@@ -3274,7 +3449,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                                 "asr_chunk_minutes",
                                                 "音频分段分钟",
                                                 "10",
-                                                "分段上传，降低单次ASR超时风险",
+                                                "范围5-30，建议10-15；过短会增加接口调用次数",
                                             ),
                                             md=4,
                                         ),
@@ -3295,6 +3470,21 @@ class AutoSubRemoteAsr(_PluginBase):
                                                 "单次翻译请求超过此时间会放弃并重试",
                                             ),
                                             md=4,
+                                        ),
+                                    ],
+                                },
+                                {
+                                    "component": "VRow",
+                                    "content": [
+                                        self.__form_col(
+                                            self.__form_textarea(
+                                                "asr_prompt",
+                                                "ASR提示词",
+                                                self.__default_asr_prompt(),
+                                                "传给音频转写接口；用于固定原文转写风格，留空则不发送",
+                                                rows=2,
+                                            ),
+                                            md=12,
                                         ),
                                     ],
                                 },
@@ -3367,6 +3557,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "asr_api_model": "whisper-1",
             "asr_chunk_minutes": 10,
             "asr_request_timeout": 300,
+            "asr_prompt": self.__default_asr_prompt(),
             "translate_request_timeout": 120,
             "use_chatgpt": False,
             "openai_proxy": False,
@@ -3694,7 +3885,29 @@ class AutoSubRemoteAsr(_PluginBase):
                                             'model': 'asr_chunk_minutes',
                                             'label': '音频分段分钟',
                                             'placeholder': '10',
-                                            'hint': '分段上传，降低单次接口超时风险'
+                                            'hint': '范围5-30，建议10-15；过短会增加接口调用次数'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'props': {'v-show': 'enable_asr'},
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'asr_prompt',
+                                            'label': 'ASR提示词',
+                                            'placeholder': self.__default_asr_prompt(),
+                                            'hint': '传给音频转写接口；用于固定原文转写风格，留空则不发送',
+                                            'rows': 2
                                         }
                                     }
                                 ]
@@ -4006,6 +4219,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "reuse_autosub_config": True,
             "asr_api_model": "whisper-1",
             "asr_chunk_minutes": 10,
+            "asr_prompt": self.__default_asr_prompt(),
             "use_chatgpt": False,
             "openai_proxy": False,
             "compatible": False,
