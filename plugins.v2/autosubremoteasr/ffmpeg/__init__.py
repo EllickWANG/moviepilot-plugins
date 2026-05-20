@@ -187,6 +187,34 @@ class Ffmpeg:
             return False, len(processed), str(e)[:1000]
 
     @staticmethod
+    def extract_audio_sample_from_video(video_path, output_path, audio_index=None, start_seconds=0,
+                                        duration_seconds=12, stop_event=None, threads=None):
+        """
+        从指定位置提取一个短音频样本，用于全局语言探测。
+        """
+        if not video_path or not output_path:
+            return False, "视频路径或输出路径为空"
+
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        except Exception as e:
+            return False, str(e)[:1000]
+
+        audio_stream_index = 0 if audio_index is None else int(audio_index)
+        command = [
+            'ffmpeg', "-hide_banner", "-loglevel", "warning",
+            "-threads", str(max(1, int(threads or 1))),
+            "-ss", str(max(0, float(start_seconds or 0))),
+            "-t", str(max(3, float(duration_seconds or 12))),
+            '-y', '-i', video_path,
+            '-map', f'0:a:{audio_stream_index}',
+            '-vn', '-sn', '-dn',
+            '-ac', '1', '-ar', '24000', '-b:a', '64k',
+            output_path
+        ]
+        return Ffmpeg._run_command(command, stop_event=stop_event)
+
+    @staticmethod
     def get_video_metadata(video_path, stop_event=None):
         """
         获取视频元数据

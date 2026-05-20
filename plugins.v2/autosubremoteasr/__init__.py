@@ -103,7 +103,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.31"
+    plugin_version = "1.0.32"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1623,6 +1623,116 @@ class AutoSubRemoteAsr(_PluginBase):
             return 0.0
 
     @staticmethod
+    def __build_language_probe_offsets(duration: float, sample_count: int = 5,
+                                       sample_seconds: int = 12) -> List[float]:
+        try:
+            duration = float(duration or 0)
+        except Exception:
+            duration = 0
+        if duration <= 0:
+            return []
+        if duration <= sample_seconds + 6:
+            return [0.0]
+
+        trim = max(30.0, duration * 0.1)
+        if duration - (trim * 2) <= sample_seconds:
+            trim = max(0.0, (duration - sample_seconds) / 4)
+        start_min = max(0.0, trim)
+        start_max = max(start_min, duration - trim - sample_seconds)
+        if start_max <= start_min:
+            return [max(0.0, (duration - sample_seconds) / 2)]
+
+        count = max(1, min(sample_count, int(sample_count or 5)))
+        slot_width = (start_max - start_min) / count
+        offsets = []
+        for index in range(count):
+            left = start_min + index * slot_width
+            right = start_min + (index + 1) * slot_width
+            right = min(right, start_max)
+            if right <= left:
+                offsets.append(round(left, 2))
+            else:
+                offsets.append(round(random.uniform(left, right), 2))
+        return offsets
+
+    def __detect_global_audio_language(self, video_file: str, audio_index: int, duration: float,
+                                       audio_dir: str, task: Optional[TaskItem] = None) -> str:
+        sample_seconds = 12
+        offsets = self.__build_language_probe_offsets(duration, sample_count=5, sample_seconds=sample_seconds)
+        if not offsets:
+            raise RuntimeError("auto模式全局语言探测失败：未读取到有效视频时长")
+
+        probe_dir = os.path.join(audio_dir, "language_probe")
+        votes: Dict[str, int] = {}
+        details = []
+        logger.info(
+            f"开始全局语言探测：避开开头结尾，随机抽取 {len(offsets)} 个 {sample_seconds} 秒音频小段"
+        )
+        self.__update_task_progress(task, 24, "全局语言检测",
+                                    f"随机抽取 {len(offsets)} 个音频小段判断语言", force=True)
+
+        for index, offset in enumerate(offsets, 1):
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            sample_file = os.path.join(probe_dir, f"probe_{index:02d}.mp3")
+            ok, error = Ffmpeg().extract_audio_sample_from_video(
+                video_file,
+                sample_file,
+                audio_index=audio_index,
+                start_seconds=offset,
+                duration_seconds=sample_seconds,
+                stop_event=self._event,
+                threads=self._cpu_threads,
+            )
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            if not ok:
+                logger.warn(f"全局语言探测样本 {index}/{len(offsets)} 提取失败：{error}")
+                continue
+            try:
+                self.__validate_audio_chunk(sample_file, index, len(offsets), force=True)
+                self.__update_task_progress(task, 24, "全局语言检测",
+                                            f"样本 {index}/{len(offsets)} 上传ASR判断语言")
+                response = self.__transcribe_audio_chunk_with_progress(
+                    sample_file,
+                    "auto",
+                    index,
+                    len(offsets),
+                    task,
+                    24
+                )
+                raw_language = response.get("language")
+                language = self.__normalize_language_code(raw_language, fallback="")
+                if language and language != "und":
+                    votes[language] = votes.get(language, 0) + 1
+                    details.append(f"{index}:{language}")
+                    logger.info(
+                        f"全局语言探测样本 {index}/{len(offsets)}：offset={round(offset, 2)}s "
+                        f"language={raw_language} -> {language}"
+                    )
+                else:
+                    logger.warn(f"全局语言探测样本 {index}/{len(offsets)} 未返回有效语言：{raw_language}")
+            except Exception as err:
+                logger.warn(f"全局语言探测样本 {index}/{len(offsets)} 失败：{err}")
+            finally:
+                try:
+                    os.remove(sample_file)
+                except Exception:
+                    pass
+
+        if not votes:
+            raise RuntimeError("auto模式全局语言探测失败：5个随机样本均未得到有效语言")
+
+        language, count = sorted(votes.items(), key=lambda item: (-item[1], item[0]))[0]
+        logger.info(
+            f"全局语言探测完成：language={language}，投票 {count}/{len(details) or len(offsets)}，"
+            f"details={', '.join(details)}"
+        )
+        self.__update_task_progress(task, 24, "全局语言检测",
+                                    f"语言锁定为 {language}，后续分段统一使用该语言", force=True)
+        return language
+
+    @staticmethod
     def __get_chunk_no(chunk_file: str) -> int:
         try:
             return int(os.path.splitext(os.path.basename(chunk_file))[0].split("_")[-1]) + 1
@@ -1722,7 +1832,7 @@ class AutoSubRemoteAsr(_PluginBase):
         ))
 
     def __do_speech_recognition(self, video_file: str, audio_index: int, audio_lang: str, audio_dir: str,
-                                expected_chunks: int, task: Optional[TaskItem] = None):
+                                expected_chunks: int, task: Optional[TaskItem] = None, duration: float = 0):
         """
         流水线调用远程语音识别接口生成字幕。
         :param audio_lang:
@@ -1730,12 +1840,22 @@ class AutoSubRemoteAsr(_PluginBase):
         """
         lang = audio_lang
         try:
+            if lang == "auto":
+                lang = self.__detect_global_audio_language(
+                    video_file,
+                    audio_index,
+                    duration,
+                    audio_dir,
+                    task
+                )
+                logger.info(f"auto模式全局语言探测已锁定 ASR 语言：{lang}")
             self.__update_task_progress(task, 34, "接口语音识别",
-                                        f"模型：{self._asr_api_model}，预计 {expected_chunks} 段", force=True)
+                                        f"模型：{self._asr_api_model}，语言：{lang}，预计 {expected_chunks} 段",
+                                        force=True)
             subs = []
             checkpoint = self.__get_asr_checkpoint(task, video_file, expected_chunks, lang)
             checkpoint_chunks = (checkpoint or {}).get("chunks") or {}
-            detected_lang = (checkpoint or {}).get("detected_lang")
+            detected_lang = lang
             processed_chunks = 0
 
             def handle_chunk(chunk_file: str):
@@ -1752,7 +1872,6 @@ class AutoSubRemoteAsr(_PluginBase):
                     try:
                         response = copy.deepcopy(cached_response)
                         self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
-                        detected_lang = detected_lang or response.get("language")
                         offset = (chunk_no - 1) * self._asr_chunk_seconds
                         self.__append_asr_response_subs(subs, response, offset, chunk_file)
                         processed_chunks += 1
@@ -1784,7 +1903,6 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__mark_waiting_file(task, str(err))
                     raise
                 self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
-                detected_lang = detected_lang or response.get("language")
                 self.__save_asr_chunk_checkpoint(task, video_file, expected_chunks, lang,
                                                  chunk_no, response, detected_lang)
                 offset = (chunk_no - 1) * self._asr_chunk_seconds
@@ -1821,10 +1939,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 logger.error("接口ASR没有可识别的音频分段")
                 return False, None, []
 
-            final_lang = self.__normalize_language_code(
-                detected_lang if lang == "auto" else lang,
-                fallback="und"
-            )
+            final_lang = self.__normalize_language_code(lang, fallback="und")
             if not subs:
                 logger.info("音频文件中未检测到任何语言内容，生成空字幕文件以避免重复处理")
             self.__update_task_progress(task, 72, "语音识别完成", f"识别到 {len(subs)} 条字幕", force=True)
@@ -1874,7 +1989,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
         # 如果开启了自动语言检测，直接设置为auto，跳过metadata的语言信息
         if self._auto_detect_language:
-            logger.info("已开启自动语言检测，将由接口ASR自动识别语言")
+            logger.info("已开启ASR自动检测语言，将先随机抽取全局音频样本锁定语言")
             audio_lang = 'auto'
         elif not iso639.find(audio_lang) or not iso639.to_iso639_1(audio_lang):
             logger.info(f"字幕源偏好：{self._translate_preference} 未从音轨元数据中获取到语言信息")
@@ -1970,7 +2085,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 audio_lang,
                 audio_dir,
                 expected_chunks,
-                task
+                task,
+                duration=duration
             )
             if ret:
                 logger.info(f"生成字幕成功，原始语言：{lang}")
