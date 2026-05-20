@@ -108,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.50"
+    plugin_version = "1.0.51"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -380,6 +380,7 @@ class AutoSubRemoteAsr(_PluginBase):
             return None
         temp_dir = tempfile.TemporaryDirectory(prefix="autosubremoteasr-bdmv-")
         concat_path = os.path.join(temp_dir.name, "main.ffconcat")
+        total_duration = 0.0
         with open(concat_path, "w", encoding="utf-8") as file_obj:
             file_obj.write("ffconcat version 1.0\n")
             for stream in streams:
@@ -388,6 +389,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     meta = Ffmpeg().get_video_metadata(stream, stop_event=self._event)
                     duration = self.__get_video_duration(meta)
                     if duration > 0:
+                        total_duration += duration
                         file_obj.write(f"duration {duration:.3f}\n")
                 except Exception:
                     pass
@@ -395,6 +397,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "input_file": concat_path,
             "cleanup": temp_dir,
             "streams": streams,
+            "duration": total_duration,
         }
 
     def __prepare_media_input(self, video_file: str) -> dict:
@@ -1911,7 +1914,10 @@ class AutoSubRemoteAsr(_PluginBase):
                 return False
 
         total_size = sum(os.path.getsize(stream) for stream in streams if os.path.exists(stream))
+        duration = float((media_input or {}).get("duration") or 0)
         detail = f"主影片片段 {len(streams)} 个，大小 {round(total_size / 1024 / 1024 / 1024, 2)} GB"
+        if duration > 0:
+            detail += f"，时长 {round(duration / 60, 1)} 分钟"
         self.__update_task_progress(task, 24, "BDMV结构通过", detail, force=True)
         return True
 
@@ -2077,6 +2083,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 subtitle_lookup_file=video_file,
                 checkpoint_file=video_file,
                 bdmv_input=bool(media_input.get("bdmv")),
+                media_duration=float(media_input.get("duration") or 0),
             )
             if not ret:
                 if task and task.status == TaskStatus.WAITING_FILE:
@@ -3034,7 +3041,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def __generate_subtitle(self, video_file, subtitle_file, enable_asr=True, task: Optional[TaskItem] = None,
                             subtitle_lookup_file: Optional[str] = None, checkpoint_file: Optional[str] = None,
-                            bdmv_input: bool = False):
+                            bdmv_input: bool = False, media_duration: float = 0):
         """
         生成字幕
         :param video_file: 视频文件
@@ -3159,6 +3166,8 @@ class AutoSubRemoteAsr(_PluginBase):
 
         with tempfile.TemporaryDirectory(prefix='autosubremoteasr-') as audio_dir:
             duration = self.__get_video_duration(video_meta)
+            if duration <= 0 and media_duration > 0:
+                duration = media_duration
             expected_chunks = max(1, math.ceil(duration / self._asr_chunk_seconds)) if duration else 0
             logger.info(
                 f"开始接口ASR流水线，语言 {audio_lang}，模型 {self._asr_api_model}，"
