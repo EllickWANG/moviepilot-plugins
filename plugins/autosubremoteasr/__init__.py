@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.34"
+    plugin_version = "1.0.35"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -701,6 +701,14 @@ class AutoSubRemoteAsr(_PluginBase):
             or self.__is_incomplete_video_error(task.progress_detail)
         )
 
+    @staticmethod
+    def __is_existing_subtitle_task(task: TaskItem) -> bool:
+        if not task or task.status != TaskStatus.IGNORED:
+            return False
+        text = f"{task.progress_stage or ''} {task.progress_detail or ''}"
+        markers = ("已存在字幕", "已有字幕", "目标字幕已存在", "字幕文件已经存在", "外挂字幕", "内嵌字幕", "硬字幕")
+        return any(marker in text for marker in markers)
+
     def load_tasks(self) -> Dict[str, TaskItem]:
         raw_tasks = self.get_data("tasks") or {}
         tasks = {}
@@ -1167,6 +1175,29 @@ class AutoSubRemoteAsr(_PluginBase):
             return None
         return max(matched, key=lambda item: item.add_time or datetime.min)
 
+    def __record_existing_subtitle_task(self, video_file: str, source: TaskSource, reason: str) -> bool:
+        self.__ensure_runtime_state()
+        now = datetime.now()
+        task = TaskItem(
+            task_id=str(uuid4()),
+            video_file=video_file,
+            source=source,
+            add_time=now,
+            status=TaskStatus.IGNORED,
+            complete_time=now,
+            progress=100.0,
+            progress_stage="已存在字幕",
+            progress_detail=reason or "字幕已存在",
+            progress_updated=now,
+        )
+        with self._tasks_lock:
+            if self.__find_latest_task_by_video_file(video_file):
+                return False
+            self._tasks[task.task_id] = task
+            self.save_tasks()
+        logger.info(f"字幕已存在，记录到已存在字幕分类：{video_file} - {reason}")
+        return True
+
     def __is_duplicate_task(self, video_file: str) -> bool:
         self.__ensure_runtime_state()
         with self._tasks_lock:
@@ -1221,7 +1252,8 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__update_task_progress(task, 100, "处理完成", "字幕处理完成", force=True)
                 elif task.status == TaskStatus.IGNORED:
                     self.__clear_task_checkpoints(task)
-                    self.__update_task_progress(task, 100, "已忽略", task.progress_detail or "任务已忽略", force=True)
+                    ignored_stage = "已存在字幕" if self.__is_existing_subtitle_task(task) else "已忽略"
+                    self.__update_task_progress(task, 100, ignored_stage, task.progress_detail or "任务已忽略", force=True)
                 elif task.status == TaskStatus.FAILED:
                     self.__update_task_progress(task, task.progress, "处理失败",
                                                 task.progress_detail or "任务处理失败", force=True)
@@ -1364,7 +1396,9 @@ class AutoSubRemoteAsr(_PluginBase):
             if latest_task.status == TaskStatus.FAILED:
                 return "failed"
 
-        if self.__target_subtitle_exists(video_file):
+        subtitle_reason = self.__target_subtitle_reason(video_file)
+        if subtitle_reason:
+            self.__record_existing_subtitle_task(video_file, source, subtitle_reason)
             return "subtitle_exists"
 
         return "added" if self.add_task(video_file, source) else "skipped"
@@ -1478,12 +1512,18 @@ class AutoSubRemoteAsr(_PluginBase):
             logger.info(f"开始处理文件：{video_file} ...")
             self.__update_task_progress(task, 3, "准备处理", "正在检查字幕和媒体信息", force=True)
             # 判断目的字幕（和内嵌）是否已存在
-            if self.__target_subtitle_exists(video_file):
-                logger.warn(f"字幕文件已经存在，不进行处理")
-                self.__update_task_progress(task, 100, "已忽略", "目标字幕已存在", force=True)
+            subtitle_reason = self.__target_subtitle_reason(video_file)
+            if subtitle_reason:
+                logger.warn(f"字幕已经存在，不进行处理：{subtitle_reason}")
+                self.__update_task_progress(task, 100, "已存在字幕", subtitle_reason, force=True)
                 return TaskStatus.IGNORED
             if not self.__check_video_integrity(video_file, task):
                 return TaskStatus.WAITING_FILE if task and task.status == TaskStatus.WAITING_FILE else TaskStatus.FAILED
+            hard_subtitle_reason = self.__hard_subtitle_reason(video_file, task=task)
+            if hard_subtitle_reason:
+                logger.warn(f"检测到硬字幕，不进行处理：{hard_subtitle_reason}")
+                self.__update_task_progress(task, 100, "已存在字幕", hard_subtitle_reason, force=True)
+                return TaskStatus.IGNORED
             # 生成字幕
             ret, lang, gen_sub_path = self.__generate_subtitle(video_file, file_path, self._enable_asr, task)
             if not ret:
@@ -3176,9 +3216,9 @@ class AutoSubRemoteAsr(_PluginBase):
             return True, second_lang, second_file
         return False, None, None
 
-    def __target_subtitle_exists(self, video_file):
+    def __target_subtitle_reason(self, video_file) -> str:
         """
-        目标字幕文件是否存在
+        目标软字幕文件是否存在
         :param video_file:
         :return:
         """
@@ -3196,19 +3236,284 @@ class AutoSubRemoteAsr(_PluginBase):
                 prefer_langs = None
                 strict = False
 
-        exist, lang, _ = self.__external_subtitle_exists(video_file, prefer_langs, strict=strict)
+        exist, lang, name = self.__external_subtitle_exists(video_file, prefer_langs, strict=strict)
         if exist:
-            return True
+            return f"外挂字幕已存在：{name or '-'}（{lang or '未知'}）"
 
         video_meta = Ffmpeg().get_video_metadata(video_file)
         if not video_meta:
-            return False
+            return ""
         ret, subtitle_index, subtitle_lang = self.__get_video_prefer_subtitle(video_meta, prefer_lang=prefer_langs,
                                                                               only_srt=False)
         if ret and (not prefer_langs or subtitle_lang in prefer_langs):
-            return True
+            return f"内嵌字幕已存在：轨道 {subtitle_index}（{subtitle_lang or '未知'}）"
 
-        return False
+        return ""
+
+    def __target_subtitle_exists(self, video_file):
+        """
+        目标软字幕文件是否存在
+        :param video_file:
+        :return:
+        """
+        return bool(self.__target_subtitle_reason(video_file))
+
+    @staticmethod
+    def __hard_subtitle_sample_times(duration: float) -> List[float]:
+        if duration <= 0:
+            return []
+        margin = min(max(duration * 0.08, 20), max(duration * 0.20, 5))
+        start = min(max(3, margin), max(duration - 3, 3))
+        end = max(start + 1, duration - margin)
+        points = [0.06, 0.16, 0.27, 0.38, 0.50, 0.62, 0.73, 0.84, 0.94]
+        samples = []
+        for point in points:
+            pos = start + (end - start) * point
+            pos = min(max(1, pos), max(1, duration - 1))
+            if not samples or abs(pos - samples[-1]) >= 3:
+                samples.append(pos)
+        return samples
+
+    @staticmethod
+    def __edge_band_features(frame: bytes, width: int, height: int,
+                             y0: int, y1: int, x0: int, x1: int) -> Dict[str, Any]:
+        y0 = max(0, min(height - 2, y0))
+        y1 = max(y0 + 2, min(height - 1, y1))
+        x0 = max(0, min(width - 2, x0))
+        x1 = max(x0 + 2, min(width - 1, x1))
+        band_w = x1 - x0
+        band_h = y1 - y0
+        total = max(1, band_w * band_h)
+        mask = bytearray(total)
+        row_counts = [0] * band_h
+        col_counts = [0] * band_w
+        edge_count = 0
+        bright_count = 0
+        dark_count = 0
+
+        for yy in range(y0, y1):
+            row_offset = yy * width
+            next_row_offset = min(height - 1, yy + 1) * width
+            band_y = yy - y0
+            for xx in range(x0, x1):
+                idx = row_offset + xx
+                value = frame[idx]
+                if value >= 190:
+                    bright_count += 1
+                elif value <= 55:
+                    dark_count += 1
+                if yy >= height - 1 or xx >= width - 1:
+                    continue
+                gradient = abs(value - frame[idx + 1]) + abs(value - frame[next_row_offset + xx])
+                if gradient < 70:
+                    continue
+                band_x = xx - x0
+                mask_index = band_y * band_w + band_x
+                mask[mask_index] = 1
+                row_counts[band_y] += 1
+                col_counts[band_x] += 1
+                edge_count += 1
+
+        row_threshold = max(3, int(band_w * 0.018))
+        col_threshold = max(1, int(band_h * 0.012))
+        active_rows = [idx for idx, count in enumerate(row_counts) if count >= row_threshold]
+        active_cols = [idx for idx, count in enumerate(col_counts) if count >= col_threshold]
+
+        visited = bytearray(total)
+        components = 0
+        eligible_components = 0
+        max_component_area = 0
+        for start_index, value in enumerate(mask):
+            if not value or visited[start_index]:
+                continue
+            stack = [start_index]
+            visited[start_index] = 1
+            area = 0
+            min_x = band_w
+            max_x = 0
+            min_y = band_h
+            max_y = 0
+            while stack:
+                current = stack.pop()
+                cy, cx = divmod(current, band_w)
+                area += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                if cx > 0:
+                    nxt = current - 1
+                    if mask[nxt] and not visited[nxt]:
+                        visited[nxt] = 1
+                        stack.append(nxt)
+                if cx < band_w - 1:
+                    nxt = current + 1
+                    if mask[nxt] and not visited[nxt]:
+                        visited[nxt] = 1
+                        stack.append(nxt)
+                if cy > 0:
+                    nxt = current - band_w
+                    if mask[nxt] and not visited[nxt]:
+                        visited[nxt] = 1
+                        stack.append(nxt)
+                if cy < band_h - 1:
+                    nxt = current + band_w
+                    if mask[nxt] and not visited[nxt]:
+                        visited[nxt] = 1
+                        stack.append(nxt)
+
+            if area < 3:
+                continue
+            components += 1
+            max_component_area = max(max_component_area, area)
+            box_w = max_x - min_x + 1
+            box_h = max_y - min_y + 1
+            if 2 <= box_w <= int(band_w * 0.85) and 3 <= box_h <= 38 and 4 <= area <= 900:
+                eligible_components += 1
+
+        row_span = (active_rows[-1] - active_rows[0] + 1) if active_rows else 0
+        col_span = (active_cols[-1] - active_cols[0] + 1) if active_cols else 0
+        return {
+            "edge_density": edge_count / total,
+            "bright_density": bright_count / total,
+            "dark_density": dark_count / total,
+            "active_rows": len(active_rows),
+            "row_span": row_span,
+            "col_coverage": col_span / max(1, band_w),
+            "components": components,
+            "eligible_components": eligible_components,
+            "max_component_area": max_component_area,
+        }
+
+    @classmethod
+    def __analyze_hard_subtitle_frame(cls, frame: bytes, width: int = 320, height: int = 180) -> Dict[str, Any]:
+        if not frame or len(frame) < width * height:
+            return {"positive": False, "score": 0.0, "reason": "empty"}
+
+        x0 = int(width * 0.08)
+        x1 = int(width * 0.92)
+        subtitle_band = cls.__edge_band_features(
+            frame, width, height,
+            int(height * 0.58), int(height * 0.94), x0, x1
+        )
+        ref_band = cls.__edge_band_features(
+            frame, width, height,
+            int(height * 0.24), int(height * 0.52), x0, x1
+        )
+
+        subtitle_density = subtitle_band["edge_density"]
+        ref_density = ref_band["edge_density"]
+        ratio = subtitle_density / max(ref_density, 0.004)
+        delta = subtitle_density - ref_density
+        density_score = min(1.0, max(0.0, (subtitle_density - 0.010) / 0.055))
+        component_score = min(1.0, subtitle_band["eligible_components"] / 16)
+        coverage_score = min(1.0, subtitle_band["col_coverage"] / 0.34)
+        row_span = subtitle_band["row_span"]
+        if 8 <= row_span <= 46:
+            row_score = 1.0
+        elif 5 <= row_span <= 58:
+            row_score = 0.55
+        else:
+            row_score = 0.15
+        contrast_score = min(
+            1.0,
+            max(subtitle_band["bright_density"], subtitle_band["dark_density"]) / 0.055
+        )
+        score = (
+            density_score * 0.30
+            + component_score * 0.26
+            + coverage_score * 0.20
+            + row_score * 0.14
+            + contrast_score * 0.10
+        )
+        if ratio < 1.08 and delta < 0.008:
+            score *= 0.72
+        if subtitle_density > 0.20 or subtitle_band["active_rows"] > 58:
+            score *= 0.70
+        if subtitle_band["max_component_area"] > 1800:
+            score *= 0.82
+
+        positive = (
+            score >= 0.58
+            and subtitle_band["eligible_components"] >= 6
+            and subtitle_band["col_coverage"] >= 0.16
+            and 0.012 <= subtitle_density <= 0.22
+            and (ratio >= 1.08 or delta >= 0.008)
+        )
+        return {
+            "positive": positive,
+            "score": round(score, 3),
+            "ratio": round(ratio, 2),
+            "delta": round(delta, 4),
+            "density": round(subtitle_density, 4),
+            "ref_density": round(ref_density, 4),
+            "components": subtitle_band["eligible_components"],
+            "coverage": round(subtitle_band["col_coverage"], 3),
+            "row_span": subtitle_band["row_span"],
+        }
+
+    def __hard_subtitle_reason(self, video_file: str, task: Optional[TaskItem] = None) -> str:
+        video_meta = Ffmpeg().get_video_metadata(video_file, stop_event=self._event)
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+        duration = self.__get_video_duration(video_meta)
+        samples = self.__hard_subtitle_sample_times(duration)
+        if not samples:
+            logger.info(f"硬字幕检测跳过：未读取到有效时长 {video_file}")
+            return ""
+
+        frame_width = 320
+        frame_height = 180
+        self.__update_task_progress(task, 25, "检测硬字幕", f"抽样 {len(samples)} 帧", force=True)
+        results = []
+        failed = 0
+        for index, start_second in enumerate(samples, 1):
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            ok, frame, error = Ffmpeg().read_video_gray_frame(
+                video_file,
+                start_seconds=start_second,
+                width=frame_width,
+                height=frame_height,
+                stop_event=self._event,
+                threads=self._cpu_threads,
+                timeout=25,
+            )
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            if not ok:
+                failed += 1
+                logger.warn(f"硬字幕检测抽帧失败：{video_file} {start_second:.1f}s - {error}")
+                continue
+            result = self.__analyze_hard_subtitle_frame(frame, frame_width, frame_height)
+            result["time"] = round(start_second, 1)
+            results.append(result)
+            progress = self.__scale_progress(25, 29, index, len(samples))
+            positives = sum(1 for item in results if item.get("positive"))
+            self.__update_task_progress(
+                task,
+                progress,
+                "检测硬字幕",
+                f"抽样 {index}/{len(samples)}，疑似 {positives}",
+            )
+
+        if len(results) < max(3, min(5, len(samples) - failed)):
+            logger.info(f"硬字幕检测样本不足：{video_file} success={len(results)} failed={failed}")
+            return ""
+
+        positives = sum(1 for item in results if item.get("positive"))
+        strong = sum(1 for item in results if float(item.get("score") or 0) >= 0.74)
+        avg_score = sum(float(item.get("score") or 0) for item in results) / len(results)
+        required = 3 if len(results) < 6 else max(4, math.ceil(len(results) * 0.55))
+        detected = positives >= required and avg_score >= 0.48 and (strong >= 1 or positives >= required + 1)
+        logger.info(
+            f"硬字幕检测结果：detected={detected} samples={len(results)} failed={failed} "
+            f"positive={positives} strong={strong} avg={avg_score:.2f} details={_log_preview(results, 1600)}"
+        )
+        if not detected:
+            return ""
+        confidence = min(0.99, max(avg_score, positives / max(1, len(results))))
+        return f"检测到硬字幕（{positives}/{len(results)} 帧，置信度 {confidence:.2f}）"
 
     @staticmethod
     def __form_col(content: Any, md: int = 4, cols: int = 12, props: Optional[dict] = None) -> dict:
@@ -4339,7 +4644,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def api_page_tab(self, payload: Optional[Dict[str, Any]] = None) -> schemas.Response:
         tab = (payload or {}).get("tab") or "queue"
-        if tab not in {"queue", "waiting_file"}:
+        if tab not in {"queue", "waiting_file", "existing_subtitle"}:
             tab = "queue"
         self.save_data("page_tab", tab)
         return schemas.Response(success=True, message="已切换任务页签")
@@ -4671,6 +4976,9 @@ class AutoSubRemoteAsr(_PluginBase):
         rows = []
         for task in task_list[:200]:
             filename = os.path.basename(task.video_file) or task.video_file
+            existing_subtitle = self.__is_existing_subtitle_task(task)
+            status_label = "已存在字幕" if existing_subtitle else self.__status_label(task.status)
+            status_color = "success" if existing_subtitle else self.__status_color(task.status)
             rows.append({
                 "component": "tr",
                 "content": [
@@ -4697,9 +5005,9 @@ class AutoSubRemoteAsr(_PluginBase):
                                 "props": {
                                     "size": "small",
                                     "variant": "tonal",
-                                    "color": self.__status_color(task.status),
+                                    "color": status_color,
                                 },
-                                "text": self.__status_label(task.status),
+                                "text": status_label,
                             }
                         ],
                     },
@@ -4750,10 +5058,40 @@ class AutoSubRemoteAsr(_PluginBase):
             }
         ]
 
-    def __task_tabs(self, queue_tasks: List[TaskItem], waiting_file_tasks: List[TaskItem], selected_tab: str) -> dict:
-        selected_tab = selected_tab if selected_tab in {"queue", "waiting_file"} else "queue"
-        active_tasks = waiting_file_tasks if selected_tab == "waiting_file" else queue_tasks
-        empty_text = "暂无等待文件完整任务" if selected_tab == "waiting_file" else "暂无处理队列任务"
+    @staticmethod
+    def __task_table_scroll(content: List[dict]) -> dict:
+        return {
+            "component": "div",
+            "props": {
+                "style": "max-height:64vh;overflow-y:auto;overflow-x:auto;"
+            },
+            "content": content,
+        }
+
+    @staticmethod
+    def __task_tab(tab: str, text: str) -> dict:
+        return {
+            "component": "VTab",
+            "props": {"value": tab},
+            "text": text,
+            "events": {
+                "click": {
+                    "api": "plugin/AutoSubRemoteAsr/page_tab",
+                    "method": "post",
+                    "params": {"tab": tab},
+                }
+            },
+        }
+
+    def __task_tabs(self, queue_tasks: List[TaskItem], waiting_file_tasks: List[TaskItem],
+                    existing_subtitle_tasks: List[TaskItem], selected_tab: str) -> dict:
+        tab_data = {
+            "queue": (queue_tasks, "暂无处理队列任务"),
+            "waiting_file": (waiting_file_tasks, "暂无等待文件完整任务"),
+            "existing_subtitle": (existing_subtitle_tasks, "暂无已存在字幕任务"),
+        }
+        selected_tab = selected_tab if selected_tab in tab_data else "queue"
+        active_tasks, empty_text = tab_data[selected_tab]
         return {
             "component": "VRow",
             "content": [
@@ -4772,36 +5110,18 @@ class AutoSubRemoteAsr(_PluginBase):
                                         "model-value": selected_tab,
                                         "color": "primary",
                                         "density": "comfortable",
+                                        "show-arrows": True,
+                                        "style": "max-height:112px;overflow-y:auto;overflow-x:auto;",
                                     },
                                     "content": [
-                                        {
-                                            "component": "VTab",
-                                            "props": {"value": "queue"},
-                                            "text": f"处理队列 ({len(queue_tasks)})",
-                                            "events": {
-                                                "click": {
-                                                    "api": "plugin/AutoSubRemoteAsr/page_tab",
-                                                    "method": "post",
-                                                    "params": {"tab": "queue"},
-                                                }
-                                            },
-                                        },
-                                        {
-                                            "component": "VTab",
-                                            "props": {"value": "waiting_file"},
-                                            "text": f"等待文件完整 ({len(waiting_file_tasks)})",
-                                            "events": {
-                                                "click": {
-                                                    "api": "plugin/AutoSubRemoteAsr/page_tab",
-                                                    "method": "post",
-                                                    "params": {"tab": "waiting_file"},
-                                                }
-                                            },
-                                        },
+                                        self.__task_tab("queue", f"处理队列 ({len(queue_tasks)})"),
+                                        self.__task_tab("waiting_file", f"等待文件完整 ({len(waiting_file_tasks)})"),
+                                        self.__task_tab("existing_subtitle",
+                                                        f"已存在字幕 ({len(existing_subtitle_tasks)})"),
                                     ],
                                 },
                                 {"component": "VDivider"},
-                                {"component": "div", "content": self.__task_table_content(active_tasks, empty_text)},
+                                self.__task_table_scroll(self.__task_table_content(active_tasks, empty_text)),
                             ],
                         },
                     ],
@@ -4822,7 +5142,11 @@ class AutoSubRemoteAsr(_PluginBase):
 
         processing_tasks = [task for task in tasks if task.status == TaskStatus.IN_PROGRESS]
         waiting_file_tasks = [task for task in tasks if self.__is_waiting_file_task(task)]
-        queue_tasks = [task for task in tasks if not self.__is_waiting_file_task(task)]
+        existing_subtitle_tasks = [task for task in tasks if self.__is_existing_subtitle_task(task)]
+        queue_tasks = [
+            task for task in tasks
+            if not self.__is_waiting_file_task(task) and not self.__is_existing_subtitle_task(task)
+        ]
         selected_tab = self.get_data("page_tab") or "queue"
         latest_update = None
         for task in tasks:
@@ -4858,7 +5182,9 @@ class AutoSubRemoteAsr(_PluginBase):
                 self.__page_metric("等待文件", counts.get(TaskStatus.WAITING_FILE, 0), "info"),
                 self.__page_metric("失败", counts.get(TaskStatus.FAILED, 0), "error"),
                 self.__page_metric("已完成", counts.get(TaskStatus.COMPLETED, 0), "success"),
-                self.__page_metric("已忽略", counts.get(TaskStatus.IGNORED, 0), "grey"),
+                self.__page_metric("已存在字幕", len(existing_subtitle_tasks), "success"),
+                self.__page_metric("其他忽略", max(0, counts.get(TaskStatus.IGNORED, 0) - len(existing_subtitle_tasks)),
+                                   "grey"),
                 {
                     "component": "VCol",
                     "props": {"cols": 12},
@@ -4901,7 +5227,7 @@ class AutoSubRemoteAsr(_PluginBase):
             ],
         }
 
-        task_table = self.__task_tabs(queue_tasks, waiting_file_tasks, selected_tab)
+        task_table = self.__task_tabs(queue_tasks, waiting_file_tasks, existing_subtitle_tasks, selected_tab)
 
         return [action_row, summary, processing_section, task_table]
 

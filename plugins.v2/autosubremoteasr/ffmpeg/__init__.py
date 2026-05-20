@@ -279,6 +279,70 @@ class Ffmpeg:
             return False, {}, str(e)[:1000]
 
     @staticmethod
+    def read_video_gray_frame(video_path, start_seconds=0, width=320, height=180,
+                              stop_event=None, threads=None, timeout=30):
+        """
+        从指定时间点读取一帧缩放后的灰度原始像素，用于轻量画面分析。
+        """
+        if not video_path:
+            return False, b"", "视频路径为空"
+
+        width = max(64, int(width or 320))
+        height = max(64, int(height or 180))
+        command = [
+            'ffmpeg', "-hide_banner", "-loglevel", "error",
+            "-threads", str(max(1, int(threads or 1))),
+            "-ss", str(max(0, float(start_seconds or 0))),
+            "-i", video_path,
+            "-map", "0:v:0",
+            "-frames:v", "1",
+            "-vf", f"scale={width}:{height}:flags=bicubic,format=gray",
+            "-an", "-sn", "-dn",
+            "-f", "rawvideo",
+            "pipe:1"
+        ]
+
+        process = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            deadline = time.time() + max(5, float(timeout or 30))
+            while process.poll() is None:
+                if stop_event and stop_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                    return False, b"", "用户中断当前任务"
+                if time.time() > deadline:
+                    process.kill()
+                    process.wait(timeout=3)
+                    return False, b"", "读取视频帧超时"
+                time.sleep(0.1)
+
+            stdout, stderr = process.communicate()
+            ret = process.returncode
+            if ret != 0:
+                error = (stderr or b"").decode("utf-8", errors="replace").strip()
+                return False, b"", (error or f"ffmpeg退出码：{ret}")[:1000]
+            expected_size = width * height
+            if len(stdout or b"") < expected_size:
+                return False, b"", f"读取视频帧数据不足：{len(stdout or b'')}/{expected_size}"
+            return True, stdout[:expected_size], ""
+        except Exception as e:
+            if process and process.poll() is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            return False, b"", str(e)[:1000]
+
+    @staticmethod
     def get_video_metadata(video_path, stop_event=None):
         """
         获取视频元数据
