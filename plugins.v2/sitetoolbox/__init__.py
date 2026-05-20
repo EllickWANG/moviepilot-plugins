@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.6"
+    plugin_version = "1.3.7"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -56,6 +56,7 @@ class sitetoolbox(_PluginBase):
     _cleanup_downloader_names: List[str] = []
     _cleanup_delete_files = False
     _cleanup_auto_enabled = False
+    _cleanup_auto_cleanup = False
     _cleanup_auto_cron = "0 */6 * * *"
     _latest_missing_preview: Dict[str, Any] = {}
     _latest_missing_cleanup: Dict[str, Any] = {}
@@ -101,6 +102,7 @@ class sitetoolbox(_PluginBase):
         )
         self._cleanup_delete_files = _to_bool(config.get("cleanup_delete_files", False), False)
         self._cleanup_auto_enabled = _to_bool(config.get("cleanup_auto_enabled", False), False)
+        self._cleanup_auto_cleanup = _to_bool(config.get("cleanup_auto_cleanup", False), False)
         self._cleanup_auto_cron = str(config.get("cleanup_auto_cron") or "0 */6 * * *").strip()
         self._latest_missing_preview = (
             config.get("latest_missing_preview") if isinstance(config.get("latest_missing_preview"), dict) else {}
@@ -132,6 +134,7 @@ class sitetoolbox(_PluginBase):
         self.__class__._cleanup_downloader_names = self._cleanup_downloader_names
         self.__class__._cleanup_delete_files = self._cleanup_delete_files
         self.__class__._cleanup_auto_enabled = self._cleanup_auto_enabled
+        self.__class__._cleanup_auto_cleanup = self._cleanup_auto_cleanup
         self.__class__._cleanup_auto_cron = self._cleanup_auto_cron
         self.__class__._latest_missing_preview = self._latest_missing_preview
         self.__class__._latest_missing_cleanup = self._latest_missing_cleanup
@@ -179,7 +182,7 @@ class sitetoolbox(_PluginBase):
             else:
                 services.append({
                     "id": "sitetoolbox_missing_preview",
-                    "name": "站点工具箱缺失种子扫描",
+                    "name": "站点工具箱缺失种子扫描/清理",
                     "trigger": trigger,
                     "func": self.auto_preview_missing_torrents,
                     "kwargs": {},
@@ -360,11 +363,19 @@ class sitetoolbox(_PluginBase):
                         {
                             "component": "VRow",
                             "content": [
-                                _col(12, 4, {
+                                _col(12, 3, {
                                     "component": "VSwitch",
                                     "props": {"model": "cleanup_auto_enabled", "label": "定时扫描"},
                                 }),
-                                _col(12, 8, {
+                                _col(12, 3, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "cleanup_auto_cleanup",
+                                        "label": "定时自动清理",
+                                        "hint": "开启后定时扫描会自动清理仍为 missingFiles 的种子",
+                                    },
+                                }),
+                                _col(12, 6, {
                                     "component": "VTextField",
                                     "props": {
                                         "model": "cleanup_auto_cron",
@@ -475,6 +486,7 @@ class sitetoolbox(_PluginBase):
             "cleanup_downloader_names": [],
             "cleanup_delete_files": False,
             "cleanup_auto_enabled": False,
+            "cleanup_auto_cleanup": False,
             "cleanup_auto_cron": "0 */6 * * *",
             "latest_missing_preview": {},
             "latest_missing_cleanup": {},
@@ -509,6 +521,7 @@ class sitetoolbox(_PluginBase):
             "cleanup_downloader_names": self._cleanup_downloader_names,
             "cleanup_delete_files": self._cleanup_delete_files,
             "cleanup_auto_enabled": self._cleanup_auto_enabled,
+            "cleanup_auto_cleanup": self._cleanup_auto_cleanup,
             "cleanup_auto_cron": self._cleanup_auto_cron,
             "latest_missing_preview": self._latest_missing_preview,
             "latest_missing_cleanup": self._latest_missing_cleanup,
@@ -608,9 +621,27 @@ class sitetoolbox(_PluginBase):
         try:
             preview = _build_missing_torrent_preview(self._cleanup_downloader_names)
             self._save_missing_preview(preview)
-            message = f"{preview.get('total_count', 0)} 个，{_format_size(preview.get('total_size', 0))}"
+            total_count = int(preview.get("total_count") or 0)
+            message = f"{total_count} 个，{_format_size(preview.get('total_size', 0))}"
+            if self._cleanup_auto_cleanup and total_count:
+                cleanup_items = preview.get("items") if isinstance(preview.get("items"), list) else []
+                cleanup = _cleanup_missing_torrents_from_preview(
+                    cleanup_items,
+                    delete_files=self._cleanup_delete_files,
+                )
+                self._save_missing_cleanup(cleanup)
+                refreshed = _build_missing_torrent_preview(self._cleanup_downloader_names)
+                self._save_missing_preview(refreshed)
+                message = (
+                    f"扫描 {total_count} 个，自动清理删除 {cleanup.get('deleted_count', 0)} 个，"
+                    f"跳过 {cleanup.get('skipped_count', 0)} 个，失败 {cleanup.get('failed_count', 0)} 个，"
+                    f"剩余 {refreshed.get('total_count', 0)} 个"
+                )
             self._set_job_state("missing_auto", name, "success", message, finished_at=_now())
-            logger.info(f"站点工具箱缺失种子定时扫描完成：{message}")
+            logger.info(
+                f"站点工具箱缺失种子定时扫描完成：{message}，"
+                f"auto_cleanup={self._cleanup_auto_cleanup}，delete_files={self._cleanup_delete_files}"
+            )
         except Exception as err:
             self._set_job_state("missing_auto", name, "error", str(err), finished_at=_now())
             raise
@@ -955,6 +986,10 @@ def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) 
     delete_files = _to_bool((payload or {}).get("delete_files"), plugin._cleanup_delete_files)
 
     def worker() -> str:
+        logger.info(
+            f"站点工具箱开始清理缺失种子：候选 {len(cleanup_items)} 个，"
+            f"downloaders={downloader_names}，delete_files={delete_files}"
+        )
         cleanup = _cleanup_missing_torrents_from_preview(cleanup_items, delete_files=delete_files)
         plugin._save_missing_cleanup(cleanup)
 
@@ -967,6 +1002,7 @@ def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) 
         message = f"缺失种子清理完成：删除 {deleted_count} 个，跳过 {skipped_count} 个"
         if failed_count:
             message += f"，失败 {failed_count} 个"
+        logger.info(f"站点工具箱{message}，delete_files={delete_files}")
         return message
 
     return plugin._start_background_job("missing_cleanup", "缺失种子清理", worker)
@@ -1338,6 +1374,10 @@ def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_f
         if not delete_hashes:
             continue
         try:
+            logger.info(
+                f"站点工具箱调用下载器删除缺失种子：downloader={downloader_name}，"
+                f"count={len(delete_hashes)}，delete_files={delete_files}"
+            )
             deleted = bool(server.delete_torrents(delete_file=delete_files, ids=delete_hashes))
         except Exception as err:
             deleted = False
@@ -2349,6 +2389,7 @@ def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, 
                                 ],
                             },
                             _status_chip("安全模式" if not plugin._cleanup_delete_files else "删除文件", "success" if not plugin._cleanup_delete_files else "warning"),
+                            _status_chip("定时清理" if plugin._cleanup_auto_cleanup else "仅定时预览", "warning" if plugin._cleanup_auto_cleanup else "info"),
                         ],
                     },
                     {
@@ -2383,7 +2424,8 @@ def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any],
             "content": [
                 _operation_col(
                     "缺失种子",
-                    f"最近：{missing_time} · 定时：{plugin._cleanup_auto_cron if plugin._cleanup_auto_enabled else '关闭'}",
+                    f"最近：{missing_time} · 定时：{plugin._cleanup_auto_cron if plugin._cleanup_auto_enabled else '关闭'}"
+                    f"{' · 自动清理' if plugin._cleanup_auto_cleanup else ''}",
                     [
                         _action_button("预览", "mdi-eye-search", "primary", "plugin/sitetoolbox/cleanup/missing/preview"),
                         _action_button("清理", "mdi-delete-alert", "error", "plugin/sitetoolbox/cleanup/missing"),
@@ -2767,7 +2809,13 @@ def _missing_torrent_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plu
                             _compact_col("配置下载器", ", ".join(plugin._cleanup_downloader_names) or "未选择"),
                             _compact_col("预览数量", preview.get("total_count", 0)),
                             _compact_col("预览体积", _format_size(preview.get("total_size"))),
-                            _compact_col("最近清理", f"{cleanup.get('deleted_count', 0)} 个" if cleanup else "-"),
+                            _compact_col(
+                                "最近清理",
+                                (
+                                    f"{cleanup.get('deleted_count', 0)} 个 / "
+                                    f"{'删文件' if cleanup.get('delete_files') else '仅任务'}"
+                                ) if cleanup else "-",
+                            ),
                         ],
                     },
                     {
@@ -2777,6 +2825,7 @@ def _missing_torrent_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plu
                             "variant": "tonal",
                             "text": (
                                 "当前配置会同时删除下载器中的数据文件；清理前请确认预览列表。"
+                                + (" 定时自动清理已开启。" if plugin._cleanup_auto_cleanup else "")
                                 if plugin._cleanup_delete_files
                                 else "当前为安全清理：只删除下载器任务，不删除数据文件。清理时会复查任务仍为 missingFiles。"
                             ),

@@ -29,7 +29,7 @@
   "sitetoolbox": {
     "name": "站点工具箱",
     "description": "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。",
-    "version": "1.3.6",
+    "version": "1.3.7",
     "icon": "mdi-toolbox",
     "author": "Ellick",
     "level": 1,
