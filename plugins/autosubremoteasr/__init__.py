@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.42"
+    plugin_version = "1.0.43"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -722,7 +722,8 @@ class AutoSubRemoteAsr(_PluginBase):
         if not task or task.status != TaskStatus.COMPLETED:
             return False
         text = f"{task.progress_stage or ''} {task.progress_detail or ''}"
-        markers = ("同语言跳过", "无需翻译", "原始语言已是中文", "源字幕语言已是中文", "字幕已是中文")
+        markers = ("同语言跳过", "无需翻译", "原始语言已是中文", "源字幕语言已是中文",
+                   "字幕已是中文", "匹配目标翻译语言")
         return any(marker in text for marker in markers)
 
     def load_tasks(self) -> Dict[str, TaskItem]:
@@ -1375,11 +1376,22 @@ class AutoSubRemoteAsr(_PluginBase):
                     stats["invalid"] += 1
                     logger.warn(f"AI字幕扫描路径无效，跳过：{path}")
                     continue
-                for video_file in self.__get_library_files(path):
-                    if self._event.is_set():
-                        break
-                    result = self.__scan_video_file_for_task(video_file)
-                    stats[result] = stats.get(result, 0) + 1
+                try:
+                    video_files = self.__get_library_files(path)
+                    for video_file in video_files:
+                        if self._event.is_set():
+                            break
+                        try:
+                            result = self.__scan_video_file_for_task(video_file)
+                            stats[result] = stats.get(result, 0) + 1
+                        except Exception as err:
+                            stats["skipped"] += 1
+                            logger.error(f"AI字幕扫描文件异常，已跳过：{video_file} - {err}")
+                            logger.error(traceback.format_exc())
+                except Exception as err:
+                    stats["skipped"] += 1
+                    logger.error(f"AI字幕扫描路径异常，已跳过：{path} - {err}")
+                    logger.error(traceback.format_exc())
         except Exception as e:
             logger.error(f"AI字幕{reason}异常：{e}")
             logger.error(traceback.format_exc())
@@ -1525,6 +1537,59 @@ class AutoSubRemoteAsr(_PluginBase):
         self.__mark_waiting_file(task, error or "视频完整性校验失败")
         return False
 
+    def __audio_probe_prefer_langs(self) -> Optional[List[str]]:
+        if self._translate_preference in {"english_only", "english_first"}:
+            return ["en", "eng"]
+        return None
+
+    def __detect_target_language_before_hard_subtitle(self, video_file: str,
+                                                      task: Optional[TaskItem] = None) -> str:
+        if not self.__check_asr() or not self._translate_zh:
+            return ""
+
+        try:
+            self.__update_task_progress(task, 24, "目标语言预检", "正在读取音轨语言", force=True)
+            video_meta = Ffmpeg().get_video_metadata(video_file, stop_event=self._event)
+            if self._event.is_set():
+                raise UserInterruptException("用户中断当前任务")
+            if not video_meta:
+                logger.warn(f"目标语言预检跳过：读取视频元数据失败 {video_file}")
+                return ""
+
+            ret, audio_index, audio_lang = self.__get_video_prefer_audio(
+                video_meta,
+                prefer_lang=self.__audio_probe_prefer_langs(),
+            )
+            if not ret:
+                logger.warn(f"目标语言预检跳过：未读取到可用音轨 {video_file}")
+                return ""
+
+            if self._auto_detect_language or not iso639.find(audio_lang) or not iso639.to_iso639_1(audio_lang):
+                duration = self.__get_video_duration(video_meta)
+                with tempfile.TemporaryDirectory(prefix='autosubremoteasr-probe-') as audio_dir:
+                    lang = self.__detect_global_audio_language(
+                        video_file,
+                        audio_index,
+                        duration,
+                        audio_dir,
+                        task,
+                    )
+            else:
+                lang = self.__normalize_language_code(audio_lang, fallback="")
+                self.__update_task_progress(task, 24, "目标语言预检",
+                                            f"音轨元数据语言 {lang}", force=True)
+
+            if self.__is_target_language(lang):
+                logger.info(f"目标语言预检命中：{video_file} language={lang}")
+                return lang
+            logger.info(f"目标语言预检未命中：{video_file} language={lang or '-'}")
+            return ""
+        except UserInterruptException:
+            raise
+        except Exception as err:
+            logger.warn(f"目标语言预检失败，继续后续硬字幕检测：{video_file} - {err}")
+            return ""
+
     def __process_autosub(self, video_file, task: Optional[TaskItem] = None) -> TaskStatus:
         if not video_file:
             return TaskStatus.FAILED
@@ -1544,6 +1609,16 @@ class AutoSubRemoteAsr(_PluginBase):
                 return TaskStatus.IGNORED
             if not self.__check_video_integrity(video_file, task):
                 return TaskStatus.WAITING_FILE if task and task.status == TaskStatus.WAITING_FILE else TaskStatus.FAILED
+            target_lang = self.__detect_target_language_before_hard_subtitle(video_file, task)
+            if target_lang:
+                self.__update_task_progress(
+                    task,
+                    98,
+                    "同语言跳过",
+                    f"音轨语言已匹配目标翻译语言：{target_lang}，无需生成字幕",
+                    force=True,
+                )
+                return TaskStatus.COMPLETED
             hard_subtitle_reason = self.__hard_subtitle_reason(video_file, task=task)
             if hard_subtitle_reason:
                 logger.warn(f"检测到硬字幕，不进行处理：{hard_subtitle_reason}")
