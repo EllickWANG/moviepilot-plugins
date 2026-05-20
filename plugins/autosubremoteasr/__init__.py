@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.41"
+    plugin_version = "1.0.42"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1560,9 +1560,9 @@ class AutoSubRemoteAsr(_PluginBase):
                 self.__update_task_progress(task, task.progress if task else 0, "处理失败", "生成字幕失败", force=True)
                 return TaskStatus.FAILED
 
-            if self.__is_chinese_language(lang):
-                logger.info(f"原始字幕语言已是中文（{lang}），任务完成，不生成字幕文件")
-                self.__update_task_progress(task, 98, "同语言跳过", f"原始语言已是中文：{lang}", force=True)
+            if self.__is_target_language(lang):
+                logger.info(f"原始语言已匹配目标翻译语言（{lang}），任务完成，不生成字幕文件")
+                self.__update_task_progress(task, 98, "同语言跳过", f"原始语言已匹配目标翻译语言：{lang}", force=True)
             else:
                 self.__update_task_progress(task, 75 if self._translate_zh else 95, "字幕已生成",
                                             f"原始语言：{lang}", force=True)
@@ -1582,7 +1582,7 @@ class AutoSubRemoteAsr(_PluginBase):
             end_time = time.time()
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
             if self._translate_zh:
-                if self.__is_chinese_language(lang):
+                if self.__is_target_language(lang):
                     message += "字幕已是中文，跳过翻译\n "
                 else:
                     message += "字幕翻译语言: zh\n "
@@ -1639,6 +1639,11 @@ class AutoSubRemoteAsr(_PluginBase):
         if base in chinese_codes:
             return True
         return cls.__normalize_language_code(normalized, fallback="") == "zh"
+
+    def __is_target_language(self, value: Optional[str]) -> bool:
+        if self._translate_zh:
+            return self.__is_chinese_language(value)
+        return False
 
     def __transcribe_audio_chunk(self, audio_file: str, audio_lang: str, use_prompt: bool = True) -> dict:
         request_lang = self.__normalize_language_code(audio_lang, fallback="")
@@ -2359,14 +2364,14 @@ class AutoSubRemoteAsr(_PluginBase):
                     task
                 )
                 logger.info(f"auto模式全局语言探测已锁定 ASR 语言：{lang}")
-            if self.__is_chinese_language(lang):
-                logger.info(f"音轨语言已锁定为中文（{lang}），跳过ASR分段识别和字幕文件生成")
+            if self.__is_target_language(lang):
+                logger.info(f"音轨语言已匹配目标翻译语言（{lang}），跳过ASR分段识别和字幕文件生成")
                 self.__clear_asr_checkpoint(task, video_file)
                 self.__update_task_progress(
                     task,
                     98,
                     "同语言跳过",
-                    f"音轨语言已是中文：{lang}，无需生成字幕",
+                    f"音轨语言已匹配目标翻译语言：{lang}，无需生成字幕",
                     force=True,
                 )
                 return True, lang, []
@@ -2610,9 +2615,9 @@ class AutoSubRemoteAsr(_PluginBase):
                 duration=duration
             )
             if ret:
-                if self.__is_chinese_language(lang):
-                    logger.info(f"原始语言已是中文（{lang}），不保存原文字幕文件：{subtitle_file}.{lang}.srt")
-                    self.__update_task_progress(task, 98, "同语言跳过", f"原始语言已是中文：{lang}", force=True)
+                if self.__is_target_language(lang):
+                    logger.info(f"原始语言已匹配目标翻译语言（{lang}），不保存原文字幕文件：{subtitle_file}.{lang}.srt")
+                    self.__update_task_progress(task, 98, "同语言跳过", f"原始语言已匹配目标翻译语言：{lang}", force=True)
                     return True, lang, None
                 logger.info(f"生成字幕成功，原始语言：{lang}")
                 gen_subtitle_path = Path(f"{subtitle_file}.{lang}.srt")
