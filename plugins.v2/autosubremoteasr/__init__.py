@@ -108,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.48"
+    plugin_version = "1.0.49"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -5999,8 +5999,6 @@ class AutoSubRemoteAsr(_PluginBase):
                                                   "plugin/AutoSubRemoteAsr/scan"),
                         self.__page_action_button("重试失败", "mdi-reload", "warning",
                                                   "plugin/AutoSubRemoteAsr/retry_failed"),
-                        self.__page_action_button("清理已完成", "mdi-check-circle-outline", "secondary",
-                                                  "plugin/AutoSubRemoteAsr/clear_completed"),
                         self.__page_action_button("重置", "mdi-restore", "error",
                                                   "plugin/AutoSubRemoteAsr/reset_tasks"),
                     ],
