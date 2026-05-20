@@ -108,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.49"
+    plugin_version = "1.0.50"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -408,6 +408,10 @@ class AutoSubRemoteAsr(_PluginBase):
         prepared["display_file"] = disc_root
         return prepared
 
+    def __has_video_stream(self, video_meta: Optional[dict]) -> bool:
+        streams = (video_meta or {}).get("streams") or []
+        return any(stream.get("codec_type") == "video" for stream in streams)
+
     @staticmethod
     def __pick_first_key(key_value: Optional[str]) -> Optional[str]:
         if not key_value:
@@ -554,6 +558,7 @@ class AutoSubRemoteAsr(_PluginBase):
             self.reset_tasks()
 
         self.__reconcile_bdmv_tasks("配置加载")
+        self.__recover_bdmv_waiting_tasks("配置加载")
         self.__reconcile_excluded_tasks("配置加载")
 
         if not self._enabled and not self._run_now:
@@ -1444,6 +1449,35 @@ class AutoSubRemoteAsr(_PluginBase):
             )
         return changed
 
+    def __recover_bdmv_waiting_tasks(self, reason: str = "BDMV完整性逻辑更新") -> int:
+        self.__ensure_runtime_state()
+        recovered = 0
+        now = datetime.now()
+        with self._tasks_lock:
+            tasks = self._tasks or {}
+            for task_id, task in list(tasks.items()):
+                if task.status != TaskStatus.WAITING_FILE:
+                    continue
+                if not self.__bdmv_disc_root(task.video_file):
+                    continue
+                task.status = TaskStatus.PENDING
+                task.complete_time = None
+                task.next_retry_time = None
+                task.progress = 0.0
+                task.progress_stage = "等待重新处理"
+                task.progress_detail = "BDMV改为主影片结构校验，不再按普通视频完整性等待"
+                task.progress_updated = now
+                tasks[task_id] = task
+                if self._scheduled_retry_tasks is not None:
+                    self._scheduled_retry_tasks.pop(task_id, None)
+                recovered += 1
+            if recovered:
+                self._tasks = tasks
+                self.save_tasks()
+        if recovered:
+            logger.info(f"AI字幕{reason}：恢复BDMV待检测任务 {recovered} 个")
+        return recovered
+
     def __reconcile_excluded_tasks(self, reason: str = "排除路径更新") -> int:
         self.__ensure_runtime_state()
         removed_task_ids = set()
@@ -1845,9 +1879,49 @@ class AutoSubRemoteAsr(_PluginBase):
         except Exception:
             return 0.0
 
-    def __check_video_integrity(self, video_file: str, task: Optional[TaskItem] = None) -> bool:
+    def __check_bdmv_integrity(self, media_input: dict, task: Optional[TaskItem] = None) -> bool:
+        streams = list((media_input or {}).get("streams") or [])
+        process_file = (media_input or {}).get("input_file")
+        if not streams:
+            self.__update_task_progress(task, 5, "BDMV结构异常", "未匹配到主影片片段", force=True)
+            return False
+
+        missing = [
+            stream for stream in streams
+            if not os.path.exists(stream) or os.path.getsize(stream) <= 0
+        ]
+        if missing:
+            sample = "、".join(os.path.basename(path) for path in missing[:3])
+            self.__mark_waiting_file(task, f"BDMV主影片片段缺失或为空：{sample}")
+            return False
+
+        self.__update_task_progress(task, 5, "校验BDMV结构", "正在读取主影片播放列表", force=True)
+        video_meta = Ffmpeg().get_video_metadata(process_file, stop_event=self._event) if process_file else None
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
+        if not self.__has_video_stream(video_meta):
+            for stream in streams:
+                video_meta = Ffmpeg().get_video_metadata(stream, stop_event=self._event)
+                if self._event.is_set():
+                    raise UserInterruptException("用户中断当前任务")
+                if self.__has_video_stream(video_meta):
+                    break
+            else:
+                self.__mark_waiting_file(task, "BDMV主影片片段未读取到视频流，可能仍未完整")
+                return False
+
+        total_size = sum(os.path.getsize(stream) for stream in streams if os.path.exists(stream))
+        detail = f"主影片片段 {len(streams)} 个，大小 {round(total_size / 1024 / 1024 / 1024, 2)} GB"
+        self.__update_task_progress(task, 24, "BDMV结构通过", detail, force=True)
+        return True
+
+    def __check_video_integrity(self, video_file: str, task: Optional[TaskItem] = None,
+                                media_input: Optional[dict] = None) -> bool:
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+
+        if media_input and media_input.get("bdmv"):
+            return self.__check_bdmv_integrity(media_input, task)
 
         self.__update_task_progress(task, 5, "校验视频完整性", "正在读取视频元数据", force=True)
         video_meta = Ffmpeg().get_video_metadata(video_file, stop_event=self._event)
@@ -1977,7 +2051,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 logger.warn(f"字幕已经存在，不进行处理：{subtitle_reason}")
                 self.__update_task_progress(task, 100, "已存在字幕", subtitle_reason, force=True)
                 return TaskStatus.IGNORED
-            if not self.__check_video_integrity(process_file, task):
+            if not self.__check_video_integrity(process_file, task, media_input=media_input):
                 return TaskStatus.WAITING_FILE if task and task.status == TaskStatus.WAITING_FILE else TaskStatus.FAILED
             target_lang = self.__detect_target_language_before_hard_subtitle(process_file, task)
             if target_lang:
@@ -2002,6 +2076,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 task,
                 subtitle_lookup_file=video_file,
                 checkpoint_file=video_file,
+                bdmv_input=bool(media_input.get("bdmv")),
             )
             if not ret:
                 if task and task.status == TaskStatus.WAITING_FILE:
@@ -2821,7 +2896,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def __do_speech_recognition(self, video_file: str, audio_index: int, audio_lang: str, audio_dir: str,
                                 expected_chunks: int, task: Optional[TaskItem] = None, duration: float = 0,
-                                checkpoint_file: Optional[str] = None):
+                                checkpoint_file: Optional[str] = None, bdmv_input: bool = False):
         """
         流水线调用远程语音识别接口生成字幕。
         :param audio_lang:
@@ -2933,7 +3008,10 @@ class AutoSubRemoteAsr(_PluginBase):
                 logger.error(f"接口ASR音频流水线失败：{error}")
                 if task and task.status == TaskStatus.WAITING_FILE:
                     return False, None, []
-                if error and not error.startswith("处理音频分段失败"):
+                if bdmv_input:
+                    self.__update_task_progress(task, task.progress if task else 0, "BDMV处理失败",
+                                                (error or "提取BDMV主影片音频失败")[:120], force=True)
+                elif error and not error.startswith("处理音频分段失败"):
                     self.__mark_waiting_file(task, error or "提取音频失败，可能文件仍未完整")
                 return False, None, []
             if chunk_count <= 0:
@@ -2955,7 +3033,8 @@ class AutoSubRemoteAsr(_PluginBase):
             return False, None, []
 
     def __generate_subtitle(self, video_file, subtitle_file, enable_asr=True, task: Optional[TaskItem] = None,
-                            subtitle_lookup_file: Optional[str] = None, checkpoint_file: Optional[str] = None):
+                            subtitle_lookup_file: Optional[str] = None, checkpoint_file: Optional[str] = None,
+                            bdmv_input: bool = False):
         """
         生成字幕
         :param video_file: 视频文件
@@ -2971,7 +3050,11 @@ class AutoSubRemoteAsr(_PluginBase):
             raise UserInterruptException("用户中断当前任务")
         if not video_meta:
             logger.error(f"获取视频文件元数据失败，跳过后续处理")
-            self.__mark_waiting_file(task, "获取视频文件元数据失败，可能文件仍未完整")
+            if bdmv_input:
+                self.__update_task_progress(task, task.progress if task else 0, "BDMV媒体读取失败",
+                                            "读取BDMV主影片元数据失败", force=True)
+            else:
+                self.__mark_waiting_file(task, "获取视频文件元数据失败，可能文件仍未完整")
             return False, None, None
         # 获取字幕语言偏好
         if self._translate_preference == "english_only":
@@ -3091,7 +3174,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 expected_chunks,
                 task,
                 duration=duration,
-                checkpoint_file=checkpoint_source
+                checkpoint_file=checkpoint_source,
+                bdmv_input=bdmv_input,
             )
             if ret:
                 if self.__is_target_language(lang):
