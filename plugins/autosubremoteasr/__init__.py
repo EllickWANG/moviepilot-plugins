@@ -108,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.52"
+    plugin_version = "1.0.53"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -378,6 +378,22 @@ class AutoSubRemoteAsr(_PluginBase):
         streams = self.__select_bdmv_stream_files(disc_root)
         if not streams:
             return None
+        if len(streams) == 1:
+            stream = streams[0]
+            duration = 0.0
+            try:
+                meta = Ffmpeg().get_video_metadata(stream, stop_event=self._event)
+                duration = self.__get_video_duration(meta)
+            except Exception:
+                pass
+            logger.info(f"BDMV主影片仅 1 个片段，直接处理：{stream}")
+            return {
+                "input_file": stream,
+                "cleanup": None,
+                "streams": streams,
+                "duration": duration,
+                "direct_stream": True,
+            }
         temp_dir = tempfile.TemporaryDirectory(prefix="autosubremoteasr-bdmv-")
         concat_path = os.path.join(temp_dir.name, "main.ffconcat")
         total_duration = 0.0
@@ -398,6 +414,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "cleanup": temp_dir,
             "streams": streams,
             "duration": total_duration,
+            "direct_stream": False,
         }
 
     def __prepare_media_input(self, video_file: str) -> dict:
@@ -859,6 +876,19 @@ class AutoSubRemoteAsr(_PluginBase):
         if status == TaskStatus.WAITING_FILE:
             return 5.0, "等待文件完整"
         return 0.0, "等待中"
+
+    @staticmethod
+    def __task_failure_detail(task: Optional[TaskItem], fallback: str = "生成字幕失败") -> str:
+        if not task:
+            return fallback
+        stage = (task.progress_stage or "").strip()
+        detail = (task.progress_detail or "").strip()
+        parts = []
+        if stage and stage not in {"处理失败", "准备处理", "等待重新处理"}:
+            parts.append(stage)
+        if detail and detail not in parts and detail not in {"任务已开始"}:
+            parts.append(detail)
+        return ("：".join(parts) if parts else fallback)[:240]
 
     @staticmethod
     def __parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -2101,10 +2131,11 @@ class AutoSubRemoteAsr(_PluginBase):
             if not ret:
                 if task and task.status == TaskStatus.WAITING_FILE:
                     return TaskStatus.WAITING_FILE
-                message = f" 媒体: {file_name}\n 生成字幕失败，跳过后续处理"
+                failure_detail = self.__task_failure_detail(task)
+                message = f" 媒体: {file_name}\n 生成字幕失败：{failure_detail}\n 跳过后续处理"
                 if self._send_notify:
                     self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
-                self.__update_task_progress(task, task.progress if task else 0, "处理失败", "生成字幕失败", force=True)
+                self.__update_task_progress(task, task.progress if task else 0, "处理失败", failure_detail, force=True)
                 return TaskStatus.FAILED
 
             if self.__is_target_language(lang):
@@ -3036,6 +3067,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 return False, None, []
             if chunk_count <= 0:
                 logger.error("接口ASR没有可识别的音频分段")
+                self.__update_task_progress(task, task.progress if task else 0, "接口语音识别失败",
+                                            "没有可识别的音频分段", force=True)
                 return False, None, []
 
             final_lang = self.__normalize_language_code(lang, fallback="und")
@@ -3050,6 +3083,7 @@ class AutoSubRemoteAsr(_PluginBase):
         except Exception as e:
             logger.error(f"接口ASR处理异常：{e}")
             logger.error(traceback.format_exc())
+            self.__update_task_progress(task, task.progress if task else 0, "接口ASR异常", str(e)[:120], force=True)
             return False, None, []
 
     def __generate_subtitle(self, video_file, subtitle_file, enable_asr=True, task: Optional[TaskItem] = None,
