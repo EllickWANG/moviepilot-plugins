@@ -108,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.54"
+    plugin_version = "1.0.55"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2509,15 +2509,21 @@ class AutoSubRemoteAsr(_PluginBase):
 
     @staticmethod
     def __build_language_probe_offsets(duration: float, sample_count: int = 5,
-                                       sample_seconds: int = 12) -> List[float]:
+                                       sample_seconds: int = 12, fallback_round: int = 1) -> List[float]:
         try:
             duration = float(duration or 0)
         except Exception:
             duration = 0
         if duration <= 0:
-            fallback_offsets = [60.0, 180.0, 360.0, 720.0, 1200.0, 1800.0, 2400.0, 3000.0]
+            fallback_rounds = [
+                [0.0, 15.0, 30.0, 60.0, 120.0],
+                [180.0, 300.0, 480.0, 720.0, 960.0],
+                [1200.0, 1500.0, 1800.0, 2400.0, 3000.0],
+            ]
+            index = max(0, min(len(fallback_rounds) - 1, int(fallback_round or 1) - 1))
+            fallback_offsets = fallback_rounds[index]
             count = max(1, min(sample_count, int(sample_count or 5), len(fallback_offsets)))
-            return sorted(random.sample(fallback_offsets, count))
+            return fallback_offsets[:count]
         if duration <= sample_seconds + 6:
             return [0.0]
 
@@ -2761,13 +2767,14 @@ class AutoSubRemoteAsr(_PluginBase):
             return cached_language
 
         if not duration:
-            logger.warn("全局语言探测未读取到有效视频时长，使用固定偏移兜底抽样")
+            logger.warn("全局语言探测未读取到有效视频时长，使用短视频优先的固定偏移兜底抽样")
 
         for round_no in range(1, max_rounds + 1):
             offsets = self.__build_language_probe_offsets(
                 duration,
                 sample_count=sample_count,
-                sample_seconds=sample_seconds
+                sample_seconds=sample_seconds,
+                fallback_round=round_no,
             )
             if not offsets:
                 raise RuntimeError("auto模式全局语言探测失败：未读取到有效视频时长")
