@@ -108,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.51"
+    plugin_version = "1.0.52"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -632,6 +632,13 @@ class AutoSubRemoteAsr(_PluginBase):
         self.__ensure_runtime_state()
         if not self._task_queue:
             self._task_queue = queue.Queue()
+        alive_workers = [
+            thread for thread in self._consumer_threads.values()
+            if thread and thread.is_alive()
+        ]
+        if self._event.is_set() and alive_workers:
+            logger.warn("任务队列仍在等待旧消费者线程退出，暂不启动新线程")
+            return
         if self._event.is_set() and self._enabled:
             self._event.clear()
         for worker_index, thread in list(self._consumer_threads.items()):
@@ -702,10 +709,13 @@ class AutoSubRemoteAsr(_PluginBase):
             )
             has_current_tasks = bool(self._current_processing_tasks)
             has_queued_marks = bool(self._queued_task_ids)
+        alive_workers = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
+        if self._event.is_set() and alive_workers:
+            logger.warn(f"AI字幕队列自修复：{reason} 等待旧消费者线程退出，暂不重启队列")
+            return 0
         if self._event.is_set():
             self._event.clear()
             logger.warn(f"AI字幕队列自修复：{reason} 清理停止标记")
-        alive_workers = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
         if has_pending_tasks and not has_current_tasks:
             if has_queued_marks:
                 with self._tasks_lock:
@@ -721,7 +731,10 @@ class AutoSubRemoteAsr(_PluginBase):
             self.__start_workers()
 
         now = datetime.now()
-        stale_seconds = max(90, int(self._translate_request_timeout or 60) + 30)
+        stale_seconds = max(
+            90,
+            int(max(self._translate_request_timeout or 60, self._asr_request_timeout or 60)) + 30
+        )
         repair_tasks = []
         changed = False
         with self._tasks_lock:
@@ -6363,10 +6376,20 @@ class AutoSubRemoteAsr(_PluginBase):
                     task.complete_time = None
             self.save_tasks()  # 持久化更新后的任务列表
         self._running = False
-        self._consumer_threads = {}
-        self._consumer_thread = None
-        self._current_processing_task = None
-        self._current_processing_tasks = {}
+        if alive_threads:
+            alive_ids = {id(thread) for thread in alive_threads}
+            self._consumer_threads = {
+                index: thread
+                for index, thread in (self._consumer_threads or {}).items()
+                if thread and id(thread) in alive_ids
+            }
+            self._consumer_thread = next(iter(self._consumer_threads.values()), None)
+            logger.warn("旧任务线程仍在退出中，保留停止标记，避免重载后旧线程继续写入进度")
+        else:
+            self._consumer_threads = {}
+            self._consumer_thread = None
+            self._current_processing_task = None
+            self._current_processing_tasks = {}
         self._scheduled_retry_tasks = {}
         self._auto_scan_thread = None
         if not alive_threads:
