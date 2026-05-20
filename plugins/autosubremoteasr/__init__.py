@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.46"
+    plugin_version = "1.0.47"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -163,6 +163,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _translate_preference = None
     _run_now = None
     _path_list = None
+    _exclude_path_list = None
     _translate_zh = None
     _openai = None
     _enable_batch = None
@@ -249,6 +250,30 @@ class AutoSubRemoteAsr(_PluginBase):
         else:
             paths = str(value).split("\n")
         return list(dict.fromkeys([path.strip() for path in paths if path and str(path).strip()]))
+
+    @staticmethod
+    def __path_matches_excludes(path: str, exclude_paths: Optional[List[str]]) -> bool:
+        if not path or not exclude_paths:
+            return False
+        path_text = str(path)
+        try:
+            abs_path = os.path.abspath(path_text)
+        except Exception:
+            abs_path = path_text
+        for rule in exclude_paths:
+            rule_text = str(rule or "").strip()
+            if not rule_text:
+                continue
+            if os.path.isabs(rule_text):
+                abs_rule = os.path.abspath(rule_text).rstrip(os.sep)
+                if abs_path == abs_rule or abs_path.startswith(f"{abs_rule}{os.sep}"):
+                    return True
+            elif rule_text in path_text:
+                return True
+        return False
+
+    def __is_excluded_path(self, path: str) -> bool:
+        return self.__path_matches_excludes(path, self._exclude_path_list)
 
     @staticmethod
     def __pick_first_key(key_value: Optional[str]) -> Optional[str]:
@@ -356,6 +381,7 @@ class AutoSubRemoteAsr(_PluginBase):
         self._run_now = config.get('run_now')
         self._retry_failed_once = config.get('retry_failed_once')
         self._path_list = self.__normalize_path_list(config.get('path_list'))
+        self._exclude_path_list = self.__normalize_path_list(config.get('exclude_path_list'))
         self._send_notify = config.get('send_notify', False)
         self._detailed_log = bool(config.get('detailed_log', False))
         self._parallel_tasks = self.__normalize_parallel_tasks(config.get('parallel_tasks', 1))
@@ -1382,7 +1408,9 @@ class AutoSubRemoteAsr(_PluginBase):
 
         for file_path in item_file_list:
             if os.path.splitext(file_path)[-1].lower() in settings.RMT_MEDIAEXT:
-                self.add_task(file_path, TaskSource.EVENT)
+                result = self.__scan_video_file_for_task(file_path, TaskSource.EVENT)
+                if result == "excluded":
+                    logger.info(f"媒体入库文件命中排除路径，跳过字幕任务：{file_path}")
 
     def auto_scan_media_files(self, reason: str = "定时扫描"):
         self.__ensure_runtime_state()
@@ -1416,6 +1444,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "subtitle_exists": 0,
             "failed": 0,
             "invalid": 0,
+            "excluded": 0,
             "skipped": 0,
         }
         logger.info(f"AI字幕{reason}开始，路径数：{len(self._path_list)}")
@@ -1427,8 +1456,12 @@ class AutoSubRemoteAsr(_PluginBase):
                     stats["invalid"] += 1
                     logger.warn(f"AI字幕扫描路径无效，跳过：{path}")
                     continue
+                if self.__is_excluded_path(path):
+                    stats["excluded"] += 1
+                    logger.info(f"AI字幕扫描路径命中排除规则，跳过：{path}")
+                    continue
                 try:
-                    video_files = self.__get_library_files(path)
+                    video_files = self.__get_library_files(path, self._exclude_path_list)
                     for video_file in video_files:
                         if self._event.is_set():
                             break
@@ -1452,10 +1485,13 @@ class AutoSubRemoteAsr(_PluginBase):
                 f"AI字幕{reason}完成：新增 {stats['added']}，重新排队 {stats['requeued']}，"
                 f"等待完整 {stats['waiting']}，已在队列 {stats['active']}，已处理 {stats['done']}，"
                 f"已有字幕 {stats['subtitle_exists']}，失败跳过 {stats['failed']}，"
-                f"无效路径 {stats['invalid']}，其他跳过 {stats['skipped']}，耗时 {seconds} 秒"
+                f"无效路径 {stats['invalid']}，排除 {stats['excluded']}，其他跳过 {stats['skipped']}，耗时 {seconds} 秒"
             )
 
     def __scan_video_file_for_task(self, video_file: str, source: TaskSource = TaskSource.AUTO_SCAN) -> str:
+        if self.__is_excluded_path(video_file):
+            logger.info(f"AI字幕扫描文件命中排除规则，跳过：{video_file}")
+            return "excluded"
         now = datetime.now()
         latest_task = self.__find_latest_task_by_video_file(video_file)
         if latest_task:
@@ -1501,6 +1537,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "subtitle_exists": 0,
             "failed": 0,
             "invalid": 0,
+            "excluded": 0,
             "skipped": 0,
         }
         for path in path_list:
@@ -1508,8 +1545,12 @@ class AutoSubRemoteAsr(_PluginBase):
                 stats["invalid"] += 1
                 logger.warn(f"目录/文件无效，不进行处理:{path}")
                 continue
+            if self.__is_excluded_path(path):
+                stats["excluded"] += 1
+                logger.info(f"手动扫描路径命中排除规则，跳过：{path}")
+                continue
             if os.path.isdir(path):
-                for video_file in self.__get_library_files(path):
+                for video_file in self.__get_library_files(path, self._exclude_path_list):
                     result = self.__scan_video_file_for_task(video_file, TaskSource.MANUAL)
                     stats[result] = stats.get(result, 0) + 1
             elif os.path.splitext(path)[-1].lower() in settings.RMT_MEDIAEXT:
@@ -1519,7 +1560,7 @@ class AutoSubRemoteAsr(_PluginBase):
             f"AI字幕手动扫描完成：新增 {stats['added']}，重新排队 {stats['requeued']}，"
             f"等待完整 {stats['waiting']}，已在队列 {stats['active']}，已处理 {stats['done']}，"
             f"已有字幕 {stats['subtitle_exists']}，失败跳过 {stats['failed']}，"
-            f"无效路径 {stats['invalid']}，其他跳过 {stats['skipped']}"
+            f"无效路径 {stats['invalid']}，排除 {stats['excluded']}，其他跳过 {stats['skipped']}"
         )
 
     def __check_asr(self):
@@ -2760,17 +2801,26 @@ class AutoSubRemoteAsr(_PluginBase):
         """
         获取目录媒体文件列表
         """
+        exclude_paths = AutoSubRemoteAsr.__normalize_path_list(exclude_path)
         if not os.path.isdir(in_path):
+            if AutoSubRemoteAsr.__path_matches_excludes(in_path, exclude_paths):
+                return
             yield in_path
             return
 
         for root, dirs, files in os.walk(in_path):
-            if exclude_path and any(os.path.abspath(root).startswith(os.path.abspath(path))
-                                    for path in exclude_path.split(",")):
+            if AutoSubRemoteAsr.__path_matches_excludes(root, exclude_paths):
+                dirs[:] = []
                 continue
+            dirs[:] = [
+                dirname for dirname in dirs
+                if not AutoSubRemoteAsr.__path_matches_excludes(os.path.join(root, dirname), exclude_paths)
+            ]
 
             for file in files:
                 cur_path = os.path.join(root, file)
+                if AutoSubRemoteAsr.__path_matches_excludes(cur_path, exclude_paths):
+                    continue
                 # 检查后缀
                 if os.path.splitext(file)[-1].lower() in settings.RMT_MEDIAEXT:
                     yield cur_path
@@ -3982,16 +4032,17 @@ class AutoSubRemoteAsr(_PluginBase):
                             "手动扫描和定时扫描共用这些路径",
                             rows=4,
                         ),
-                        md=8,
+                        md=6,
                     ),
                     self.__form_col(
-                        self.__form_text(
-                            "auto_scan_cron",
-                            "扫描周期",
-                            "*/10 * * * *",
-                            "默认每10分钟扫描一次",
+                        self.__form_textarea(
+                            "exclude_path_list",
+                            "排除路径",
+                            "每行一个，可填绝对路径或关键词",
+                            "命中后定时扫描、手动扫描和入库触发都会跳过",
+                            rows=4,
                         ),
-                        md=4,
+                        md=6,
                     ),
                 ],
             },
@@ -4000,12 +4051,21 @@ class AutoSubRemoteAsr(_PluginBase):
                 "content": [
                     self.__form_col(
                         self.__form_text(
+                            "auto_scan_cron",
+                            "扫描周期",
+                            "*/10 * * * *",
+                            "默认每10分钟扫描一次",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
                             "parallel_tasks",
                             "并行任务数",
                             "1",
                             "同一时间处理的视频数量",
                         ),
-                        md=4,
+                        md=3,
                     ),
                     self.__form_col(
                         self.__form_text(
@@ -4014,7 +4074,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "10",
                             "文件未完整时等待后重新检查",
                         ),
-                        md=4,
+                        md=3,
                     ),
                     self.__form_col(
                         self.__form_switch(
@@ -4022,7 +4082,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "完整解码校验",
                             "高CPU，仅排查视频损坏时开启",
                         ),
-                        md=4,
+                        md=3,
                     ),
                 ],
             },
@@ -4212,6 +4272,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "listen_transfer_event": True,
             "run_now": False,
             "path_list": "",
+            "exclude_path_list": "",
             "auto_scan_enabled": True,
             "auto_scan_cron": "*/10 * * * *",
             "integrity_retry_minutes": 10,
