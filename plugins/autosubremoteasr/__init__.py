@@ -96,7 +96,7 @@ class TaskItem:
 
 class AutoSubRemoteAsr(_PluginBase):
     # 插件名称
-    plugin_name = "AI字幕自动生成(接口ASR)"
+    plugin_name = "AI字幕ASR"
     # 插件描述
     plugin_desc = "使用远程语音识别接口生成字幕，并通过当前插件接口配置翻译中文字幕。"
     # 插件图标
@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.38"
+    plugin_version = "1.0.39"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -4681,8 +4681,8 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def api_page_tab(self, payload: Optional[Dict[str, Any]] = None) -> schemas.Response:
         tab = (payload or {}).get("tab") or "queue"
-        if tab not in {"queue", "waiting_file", "existing_subtitle", "same_language"}:
-            tab = "queue"
+        if tab not in {"processing", "pending", "waiting_check", "completed", "failed"}:
+            tab = "processing"
         self.save_data("page_tab", tab)
         return schemas.Response(success=True, message="已切换任务页签")
 
@@ -5015,12 +5015,22 @@ class AutoSubRemoteAsr(_PluginBase):
             filename = os.path.basename(task.video_file) or task.video_file
             existing_subtitle = self.__is_existing_subtitle_task(task)
             same_language = self.__is_same_language_skip_task(task)
+            generated_subtitle = task.status == TaskStatus.COMPLETED and not same_language
+            waiting_check = self.__is_waiting_file_task(task)
+            pending = task.status == TaskStatus.PENDING and not waiting_check
             status_label = (
                 "已存在字幕" if existing_subtitle
                 else "无需翻译" if same_language
+                else "已生成字幕" if generated_subtitle
+                else "待检测" if waiting_check
+                else "待处理" if pending
                 else self.__status_label(task.status)
             )
-            status_color = "success" if existing_subtitle or same_language else self.__status_color(task.status)
+            status_color = (
+                "success" if existing_subtitle or same_language or generated_subtitle
+                else "info" if pending or waiting_check
+                else self.__status_color(task.status)
+            )
             rows.append({
                 "component": "tr",
                 "content": [
@@ -5125,16 +5135,18 @@ class AutoSubRemoteAsr(_PluginBase):
             },
         }
 
-    def __task_tabs(self, queue_tasks: List[TaskItem], waiting_file_tasks: List[TaskItem],
-                    existing_subtitle_tasks: List[TaskItem], same_language_tasks: List[TaskItem],
+    def __task_tabs(self, processing_tasks: List[TaskItem], pending_tasks: List[TaskItem],
+                    waiting_check_tasks: List[TaskItem], completed_tasks: List[TaskItem],
+                    failed_tasks: List[TaskItem],
                     selected_tab: str) -> dict:
         tab_data = {
-            "queue": (queue_tasks, "暂无处理队列任务"),
-            "waiting_file": (waiting_file_tasks, "暂无等待文件完整任务"),
-            "existing_subtitle": (existing_subtitle_tasks, "暂无已存在字幕任务"),
-            "same_language": (same_language_tasks, "暂无无需翻译任务"),
+            "processing": (processing_tasks, "暂无正在处理任务"),
+            "pending": (pending_tasks, "暂无待处理任务"),
+            "waiting_check": (waiting_check_tasks, "暂无待检测任务"),
+            "completed": (completed_tasks, "暂无已完成任务"),
+            "failed": (failed_tasks, "暂无已失败任务"),
         }
-        selected_tab = selected_tab if selected_tab in tab_data else "queue"
+        selected_tab = selected_tab if selected_tab in tab_data else "processing"
         active_tasks, empty_text = tab_data[selected_tab]
         return {
             "component": "VRow",
@@ -5158,11 +5170,11 @@ class AutoSubRemoteAsr(_PluginBase):
                                         "style": "max-height:112px;overflow-y:auto;overflow-x:auto;",
                                     },
                                     "content": [
-                                        self.__task_tab("queue", f"处理队列 ({len(queue_tasks)})"),
-                                        self.__task_tab("waiting_file", f"等待文件完整 ({len(waiting_file_tasks)})"),
-                                        self.__task_tab("existing_subtitle",
-                                                        f"已存在字幕 ({len(existing_subtitle_tasks)})"),
-                                        self.__task_tab("same_language", f"无需翻译 ({len(same_language_tasks)})"),
+                                        self.__task_tab("processing", f"正在处理 ({len(processing_tasks)})"),
+                                        self.__task_tab("pending", f"待处理 ({len(pending_tasks)})"),
+                                        self.__task_tab("waiting_check", f"待检测 ({len(waiting_check_tasks)})"),
+                                        self.__task_tab("completed", f"已完成 ({len(completed_tasks)})"),
+                                        self.__task_tab("failed", f"已失败 ({len(failed_tasks)})"),
                                     ],
                                 },
                                 {"component": "VDivider"},
@@ -5187,15 +5199,17 @@ class AutoSubRemoteAsr(_PluginBase):
 
         processing_tasks = [task for task in tasks if task.status == TaskStatus.IN_PROGRESS]
         waiting_file_tasks = [task for task in tasks if self.__is_waiting_file_task(task)]
-        existing_subtitle_tasks = [task for task in tasks if self.__is_existing_subtitle_task(task)]
-        same_language_tasks = [task for task in tasks if self.__is_same_language_skip_task(task)]
-        queue_tasks = [
+        pending_tasks = [
             task for task in tasks
-            if not self.__is_waiting_file_task(task)
-            and not self.__is_existing_subtitle_task(task)
-            and not self.__is_same_language_skip_task(task)
+            if task.status == TaskStatus.PENDING and not self.__is_waiting_file_task(task)
         ]
-        selected_tab = self.get_data("page_tab") or "queue"
+        waiting_check_tasks = waiting_file_tasks
+        failed_tasks = [task for task in tasks if task.status == TaskStatus.FAILED]
+        completed_tasks = [
+            task for task in tasks
+            if task.status == TaskStatus.COMPLETED or self.__is_existing_subtitle_task(task)
+        ]
+        selected_tab = self.get_data("page_tab") or "processing"
         latest_update = None
         for task in tasks:
             for value in (task.progress_updated, task.complete_time, task.add_time):
@@ -5226,14 +5240,10 @@ class AutoSubRemoteAsr(_PluginBase):
             "component": "VRow",
             "content": [
                 self.__page_metric("处理中", counts.get(TaskStatus.IN_PROGRESS, 0), "warning"),
-                self.__page_metric("等待中", counts.get(TaskStatus.PENDING, 0), "info"),
-                self.__page_metric("等待文件", counts.get(TaskStatus.WAITING_FILE, 0), "info"),
-                self.__page_metric("失败", counts.get(TaskStatus.FAILED, 0), "error"),
-                self.__page_metric("已完成", counts.get(TaskStatus.COMPLETED, 0), "success"),
-                self.__page_metric("已存在字幕", len(existing_subtitle_tasks), "success"),
-                self.__page_metric("无需翻译", len(same_language_tasks), "success"),
-                self.__page_metric("其他忽略", max(0, counts.get(TaskStatus.IGNORED, 0) - len(existing_subtitle_tasks)),
-                                   "grey"),
+                self.__page_metric("待处理", len(pending_tasks), "info"),
+                self.__page_metric("待检测", len(waiting_check_tasks), "info"),
+                self.__page_metric("已失败", len(failed_tasks), "error"),
+                self.__page_metric("已完成", len(completed_tasks), "success"),
                 {
                     "component": "VCol",
                     "props": {"cols": 12},
@@ -5250,41 +5260,16 @@ class AutoSubRemoteAsr(_PluginBase):
             ],
         }
 
-        processing_section = {
-            "component": "VRow",
-            "content": [
-                {
-                    "component": "VCol",
-                    "props": {"cols": 12},
-                    "content": [
-                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium mb-2"}, "text": "正在处理"}
-                    ],
-                },
-                *([self.__processing_task_card(task) for task in processing_tasks] or [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {"type": "info", "variant": "tonal", "density": "compact"},
-                                "text": "暂无正在处理任务",
-                            }
-                        ],
-                    }
-                ]),
-            ],
-        }
-
         task_table = self.__task_tabs(
-            queue_tasks,
-            waiting_file_tasks,
-            existing_subtitle_tasks,
-            same_language_tasks,
+            processing_tasks,
+            pending_tasks,
+            waiting_check_tasks,
+            completed_tasks,
+            failed_tasks,
             selected_tab,
         )
 
-        return [action_row, summary, processing_section, task_table]
+        return [action_row, summary, task_table]
 
     def __legacy_get_page(self) -> List[dict]:
         # 加载任务并按添加时间倒序排列
