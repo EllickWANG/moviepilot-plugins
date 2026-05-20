@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.35"
+    plugin_version = "1.0.36"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1538,22 +1538,29 @@ class AutoSubRemoteAsr(_PluginBase):
             self.__update_task_progress(task, 75 if self._translate_zh else 95, "字幕已生成",
                                         f"原始语言：{lang}", force=True)
             if self._translate_zh:
-                # 翻译字幕
-                logger.info(f"开始翻译字幕为中文 ...")
-                if not self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt", task):
-                    message = f" 媒体: {file_name}\n 翻译字幕失败，跳过完成标记"
-                    if self._send_notify:
-                        self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
-                    self.__update_task_progress(task, task.progress if task else 0, "处理失败",
-                                                "中文字幕翻译失败", force=True)
-                    return TaskStatus.FAILED
-                logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
-                self.__update_task_progress(task, 98, "翻译完成", "中文字幕已生成", force=True)
+                if self.__is_chinese_language(lang):
+                    logger.info(f"原始字幕语言已是中文（{lang}），跳过中文字幕翻译和机翻字幕生成")
+                    self.__update_task_progress(task, 98, "跳过翻译", f"原始语言已是中文：{lang}", force=True)
+                else:
+                    # 翻译字幕
+                    logger.info(f"开始翻译字幕为中文 ...")
+                    if not self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt", task):
+                        message = f" 媒体: {file_name}\n 翻译字幕失败，跳过完成标记"
+                        if self._send_notify:
+                            self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
+                        self.__update_task_progress(task, task.progress if task else 0, "处理失败",
+                                                    "中文字幕翻译失败", force=True)
+                        return TaskStatus.FAILED
+                    logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
+                    self.__update_task_progress(task, 98, "翻译完成", "中文字幕已生成", force=True)
 
             end_time = time.time()
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
             if self._translate_zh:
-                message += f"字幕翻译语言: zh\n "
+                if self.__is_chinese_language(lang):
+                    message += "字幕已是中文，跳过翻译\n "
+                else:
+                    message += "字幕翻译语言: zh\n "
             message += f"耗时：{round(end_time - start_time, 2)}秒"
             logger.info(f"自动字幕生成 处理完成：{message}")
             if self._send_notify:
@@ -1588,6 +1595,25 @@ class AutoSubRemoteAsr(_PluginBase):
             return language or fallback
         except Exception:
             return fallback
+
+    @classmethod
+    def __is_chinese_language(cls, value: Optional[str]) -> bool:
+        if not value:
+            return False
+        normalized = str(value).strip().lower().replace("_", "-")
+        if not normalized or normalized == "auto":
+            return False
+        chinese_codes = {
+            "zh", "chi", "zho", "chinese", "cn", "chs", "cht", "zhs", "zht",
+            "zh-cn", "zh-sg", "zh-hans", "zh-hant", "zh-tw", "zh-hk", "zh-mo",
+            "cmn", "mandarin", "yue", "cantonese", "zhong", "simp",
+        }
+        if normalized in chinese_codes:
+            return True
+        base = normalized.split("-", 1)[0]
+        if base in chinese_codes:
+            return True
+        return cls.__normalize_language_code(normalized, fallback="") == "zh"
 
     def __transcribe_audio_chunk(self, audio_file: str, audio_lang: str, use_prompt: bool = True) -> dict:
         request_lang = self.__normalize_language_code(audio_lang, fallback="")
@@ -3039,6 +3065,11 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str,
                                 task: Optional[TaskItem] = None):
+        if self.__is_chinese_language(source_lang):
+            logger.info(f"源字幕语言已是中文（{source_lang}），跳过翻译，不生成机翻字幕：{dest_subtitle}")
+            self.__update_task_progress(task, 98, "跳过翻译", f"源字幕语言已是中文：{source_lang}", force=True)
+            return True
+
         stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0, 'line_fail': 0}
         subs = self.__load_srt(source_subtitle)
         if source_lang in ["en", "eng"] and self._enable_merge:
