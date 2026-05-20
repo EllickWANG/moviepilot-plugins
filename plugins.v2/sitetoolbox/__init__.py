@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.7"
+    plugin_version = "1.3.8"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -292,54 +292,40 @@ class sitetoolbox(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
-                    _form_section("基础", [
+                    _form_section("基础设置", "控制工具箱是否启用，以及系统错误记录保留时间。", [
                         {
                             "component": "VRow",
                             "content": [
-                                _col(12, 4, {
+                                _col(12, 6, {
                                     "component": "VSwitch",
-                                    "props": {"model": "enabled", "label": "启用插件"},
+                                    "props": {
+                                        "model": "enabled",
+                                        "label": "启用站点工具箱",
+                                        "hint": "关闭后会停用站点适配、系统错误记录和定时任务",
+                                    },
                                 }),
-                                _col(12, 4, {
-                                    "component": "VSwitch",
-                                    "props": {"model": "auto_discover", "label": "自动获取 RSS"},
-                                }),
-                                _col(12, 4, {
-                                    "component": "VSwitch",
-                                    "props": {"model": "save_discovered", "label": "保存获取到的 RSS"},
-                                }),
-                            ],
-                        },
-                    ]),
-                    _form_section("RSS 诊断", [
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 8, {
+                                _col(12, 6, {
                                     "component": "VSelect",
                                     "props": {
-                                        "model": "site_ids",
-                                        "label": "站点",
-                                        "items": site_options,
-                                        "multiple": True,
-                                        "chips": True,
-                                        "clearable": True,
-                                    },
-                                }),
-                                _col(12, 4, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "timeout",
-                                        "label": "超时(秒)",
-                                        "type": "number",
-                                        "min": 5,
-                                        "max": 120,
+                                        "model": "error_retention_days",
+                                        "label": "系统错误保留时间",
+                                        "items": _error_retention_options(),
+                                        "hint": "仅记录 ERROR/CRITICAL，详情页折叠展示",
                                     },
                                 }),
                             ],
                         },
                     ]),
-                    _form_section("缺失种子", [
+                    _form_section("缺失文件种子", "选择下载器并维护 missingFiles 种子；手动清理和定时自动清理都会先复查状态。", [
+                        {
+                            "component": "VAlert",
+                            "props": {
+                                "type": "warning",
+                                "variant": "tonal",
+                                "class": "mb-3",
+                                "text": "打开“同时删除数据文件”不会立即删除；只有点击详情页“清理”，或同时开启“定时自动清理”后才会执行删除。",
+                            },
+                        },
                         {
                             "component": "VRow",
                             "content": [
@@ -352,56 +338,142 @@ class sitetoolbox(_PluginBase):
                                         "multiple": True,
                                         "chips": True,
                                         "clearable": True,
+                                        "hint": "仅支持 qBittorrent 的 missingFiles 状态",
                                     },
                                 }),
                                 _col(12, 4, {
                                     "component": "VSwitch",
-                                    "props": {"model": "cleanup_delete_files", "label": "同时删除数据文件"},
+                                    "props": {
+                                        "model": "cleanup_delete_files",
+                                        "label": "同时删除数据文件",
+                                        "color": "warning",
+                                        "hint": "高风险：清理时要求下载器同步删除数据",
+                                    },
                                 }),
                             ],
                         },
                         {
                             "component": "VRow",
                             "content": [
-                                _col(12, 3, {
+                                _col(12, 4, {
                                     "component": "VSwitch",
-                                    "props": {"model": "cleanup_auto_enabled", "label": "定时扫描"},
+                                    "props": {
+                                        "model": "cleanup_auto_enabled",
+                                        "label": "定时扫描",
+                                        "hint": "只刷新预览，不会自动清理",
+                                    },
                                 }),
-                                _col(12, 3, {
+                                _col(12, 4, {
                                     "component": "VSwitch",
                                     "props": {
                                         "model": "cleanup_auto_cleanup",
                                         "label": "定时自动清理",
+                                        "color": "warning",
                                         "hint": "开启后定时扫描会自动清理仍为 missingFiles 的种子",
                                     },
                                 }),
-                                _col(12, 6, {
+                                _col(12, 4, {
                                     "component": "VTextField",
                                     "props": {
                                         "model": "cleanup_auto_cron",
                                         "label": "扫描周期(cron)",
                                         "placeholder": "0 */6 * * *",
+                                        "hint": "默认每 6 小时扫描一次",
                                     },
                                 }),
                             ],
                         },
                     ]),
-                    _form_section("系统错误", [
+                    _form_section("RSS 诊断", "测试或修复站点 RSS 配置，操作入口在详情页。", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 8, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "site_ids",
+                                        "label": "RSS 站点",
+                                        "items": site_options,
+                                        "multiple": True,
+                                        "chips": True,
+                                        "clearable": True,
+                                        "hint": "不影响站点订阅，只作为工具箱测试范围",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "timeout",
+                                        "label": "请求超时(秒)",
+                                        "type": "number",
+                                        "min": 5,
+                                        "max": 120,
+                                        "hint": "RSS 获取和解析共用",
+                                    },
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "auto_discover",
+                                        "label": "未配置 RSS 时自动获取",
+                                        "hint": "站点没有 RSS 地址时访问站点页面尝试生成",
+                                    },
+                                }),
+                                _col(12, 6, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "save_discovered",
+                                        "label": "保存自动获取到的 RSS",
+                                        "hint": "自动获取成功后写回站点配置",
+                                    },
+                                }),
+                            ],
+                        },
+                    ]),
+                    _form_section("站点适配", "补充或覆盖站点索引规则，并可启用用户数据解析修正。", [
                         {
                             "component": "VRow",
                             "content": [
                                 _col(12, 4, {
-                                    "component": "VSelect",
+                                    "component": "VSwitch",
                                     "props": {
-                                        "model": "error_retention_days",
-                                        "label": "错误保留时间",
-                                        "items": _error_retention_options(),
+                                        "model": "patch_userdata",
+                                        "label": "启用用户数据解析修正",
+                                        "hint": "只修正账号数据字段，不参与做种数和做种体积完整性判断",
+                                    },
+                                }),
+                                _col(12, 8, {
+                                    "component": "VAlert",
+                                    "props": {
+                                        "type": "info",
+                                        "variant": "tonal",
+                                        "text": "适配配置兼容原 siteadapter，可直接粘贴 JSON 或 domain|base64(json) 多行格式。",
+                                    },
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, None, {
+                                    "component": "VTextarea",
+                                    "props": {
+                                        "model": "site_conf",
+                                        "label": "适配规则",
+                                        "rows": 10,
+                                        "auto-grow": True,
+                                        "placeholder": "domain|base64(json)",
                                     },
                                 }),
                             ],
                         },
                     ]),
-                    _form_section("馒头登录", [
+                    _form_section("馒头登录检查", "检查 M-Team 真实登录历史，用于判断是否满足站点亲自浏览器登录要求。", [
                         {
                             "component": "VRow",
                             "content": [
@@ -430,7 +502,10 @@ class sitetoolbox(_PluginBase):
                                 }),
                                 _col(12, 3, {
                                     "component": "VSwitch",
-                                    "props": {"model": "mteam_auto_enabled", "label": "定时检查"},
+                                    "props": {
+                                        "model": "mteam_auto_enabled",
+                                        "label": "定时检查",
+                                    },
                                 }),
                             ],
                         },
@@ -443,27 +518,7 @@ class sitetoolbox(_PluginBase):
                                         "model": "mteam_auto_cron",
                                         "label": "检查周期(cron)",
                                         "placeholder": "0 9 * * *",
-                                    },
-                                }),
-                            ],
-                        },
-                    ]),
-                    _form_section("站点适配", [
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 3, {
-                                    "component": "VSwitch",
-                                    "props": {"model": "patch_userdata", "label": "用户数据补丁"},
-                                }),
-                                _col(12, 9, {
-                                    "component": "VTextarea",
-                                    "props": {
-                                        "model": "site_conf",
-                                        "label": "适配规则",
-                                        "rows": 10,
-                                        "auto-grow": True,
-                                        "placeholder": "domain|base64(json)",
+                                        "hint": "默认每天 9 点检查",
                                     },
                                 }),
                             ],
@@ -3144,14 +3199,25 @@ def _table_or_empty(rows: List[dict], empty_text: str, headers: List[dict]) -> d
     }
 
 
-def _form_section(title: str, content: List[dict]) -> dict:
+def _form_section(title: str, subtitle: str, content: List[dict]) -> dict:
     return {
-        "component": "div",
-        "props": {"class": "mb-4"},
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-4"},
         "content": [
-            {"component": "div", "props": {"class": "text-subtitle-1 mb-2"}, "text": title},
-            *content,
-            {"component": "VDivider", "props": {"class": "mt-2"}},
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex flex-column ga-1 mb-3"},
+                        "content": [
+                            {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
+                            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": subtitle},
+                        ],
+                    },
+                    *content,
+                ],
+            },
         ],
     }
 
