@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.39"
+    plugin_version = "1.0.40"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -3632,8 +3632,183 @@ class AutoSubRemoteAsr(_PluginBase):
         card_content.append({"component": "VCardText", "content": content})
         return {
             "component": "VCard",
-            "props": {"variant": "tonal", "class": "mb-3"},
+            "props": {"variant": "tonal", "class": "autosub-asr-form-card mb-3"},
             "content": card_content,
+        }
+
+    @staticmethod
+    def __responsive_style() -> dict:
+        return {
+            "component": "style",
+            "text": """
+            .autosub-asr-page,
+            .autosub-asr-form {
+                min-width: 0;
+            }
+            .autosub-asr-actions-col {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .autosub-asr-actions-col .v-btn {
+                margin: 0 !important;
+            }
+            .autosub-asr-task-scroll {
+                max-height: 64vh;
+                overflow-y: auto;
+                overflow-x: auto;
+            }
+            .autosub-asr-progress {
+                gap: 8px;
+                min-width: 0;
+                width: 100%;
+            }
+            .autosub-asr-progress-detail {
+                max-width: 420px;
+                white-space: normal;
+                word-break: break-word;
+            }
+            .autosub-asr-table td {
+                vertical-align: top;
+            }
+            @media (max-width: 700px) {
+                .autosub-asr-form .v-card-title {
+                    font-size: 1rem !important;
+                    line-height: 1.25 !important;
+                    white-space: normal !important;
+                    padding: 12px 12px 4px !important;
+                }
+                .autosub-asr-form .v-card-subtitle {
+                    line-height: 1.35 !important;
+                    white-space: normal !important;
+                    padding: 0 12px !important;
+                }
+                .autosub-asr-form .v-card-text {
+                    padding: 10px 12px 12px !important;
+                }
+                .autosub-asr-form .v-row,
+                .autosub-asr-page .v-row {
+                    margin: -4px !important;
+                }
+                .autosub-asr-form .v-col,
+                .autosub-asr-page .v-col {
+                    padding: 4px !important;
+                }
+                .autosub-asr-form .v-switch .v-label {
+                    font-size: .9rem !important;
+                    line-height: 1.25 !important;
+                    white-space: normal !important;
+                }
+                .autosub-asr-form .v-input,
+                .autosub-asr-form .v-field {
+                    min-width: 0 !important;
+                }
+                .autosub-asr-form .v-input__details {
+                    min-height: 0 !important;
+                    padding-top: 2px !important;
+                }
+                .autosub-asr-form textarea {
+                    min-height: 88px !important;
+                }
+                .autosub-asr-actions-col {
+                    display: grid !important;
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                    gap: 8px;
+                }
+                .autosub-asr-actions-col .v-btn {
+                    width: 100%;
+                    min-width: 0 !important;
+                    padding-inline: 8px !important;
+                }
+                .autosub-asr-actions-col .v-btn__content {
+                    min-width: 0;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                }
+                .autosub-asr-metric {
+                    padding: 10px !important;
+                }
+                .autosub-asr-task-shell {
+                    border-radius: 8px !important;
+                }
+                .autosub-asr-tabs {
+                    max-height: 104px !important;
+                    overflow-y: auto !important;
+                    overflow-x: hidden !important;
+                }
+                .autosub-asr-tabs .v-slide-group__content {
+                    flex-wrap: wrap !important;
+                    align-content: flex-start;
+                }
+                .autosub-asr-tabs .v-tab {
+                    flex: 1 0 50%;
+                    min-width: 0 !important;
+                    height: 42px !important;
+                    font-size: .82rem !important;
+                }
+                .autosub-asr-task-scroll {
+                    max-height: 60vh !important;
+                    overflow-x: hidden !important;
+                }
+                .autosub-asr-table table,
+                .autosub-asr-table thead,
+                .autosub-asr-table tbody,
+                .autosub-asr-table tr,
+                .autosub-asr-table td {
+                    display: block;
+                    width: 100%;
+                }
+                .autosub-asr-table thead {
+                    display: none;
+                }
+                .autosub-asr-table tr {
+                    margin: 10px 8px;
+                    padding: 10px;
+                    border: 1px solid rgba(128, 128, 128, .24);
+                    border-radius: 8px;
+                }
+                .autosub-asr-table td {
+                    border-bottom: 0 !important;
+                    padding: 4px 0 !important;
+                }
+                .autosub-asr-table td:nth-child(2)::before,
+                .autosub-asr-table td:nth-child(3)::before,
+                .autosub-asr-table td:nth-child(4)::before,
+                .autosub-asr-table td:nth-child(5)::before {
+                    display: block;
+                    margin-bottom: 2px;
+                    color: rgba(128, 128, 128, .92);
+                    font-size: .72rem;
+                    line-height: 1.2;
+                }
+                .autosub-asr-table td:nth-child(2)::before {
+                    content: "来源";
+                }
+                .autosub-asr-table td:nth-child(3)::before {
+                    content: "状态";
+                }
+                .autosub-asr-table td:nth-child(4)::before {
+                    content: "进度";
+                }
+                .autosub-asr-table td:nth-child(5)::before {
+                    content: "时间";
+                }
+                .autosub-asr-progress .v-progress-linear {
+                    min-width: 96px !important;
+                    max-width: none !important;
+                    flex: 1 1 auto;
+                }
+                .autosub-asr-progress-detail {
+                    max-width: none !important;
+                }
+            }
+            @media (max-width: 380px) {
+                .autosub-asr-actions-col {
+                    grid-template-columns: 1fr;
+                }
+            }
+            """
         }
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -3869,8 +4044,10 @@ class AutoSubRemoteAsr(_PluginBase):
         ])
 
         return [
+            self.__responsive_style(),
             {
                 "component": "VForm",
+                "props": {"class": "autosub-asr-form"},
                 "content": [
                     base_settings,
                     scan_settings,
@@ -4875,7 +5052,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 "color": color,
                 "prepend-icon": icon,
                 "size": "small",
-                "class": "mr-2 mb-2",
+                "class": "autosub-asr-action-btn",
             },
             "text": text,
             "events": {
@@ -4923,11 +5100,11 @@ class AutoSubRemoteAsr(_PluginBase):
     def __page_metric(self, title: str, value: int, color: str) -> dict:
         return {
             "component": "VCol",
-            "props": {"cols": 6, "md": 2},
+            "props": {"cols": 6, "md": 2, "class": "autosub-asr-metric-col"},
             "content": [
                 {
                     "component": "VSheet",
-                    "props": {"class": "pa-3 rounded border", "color": "transparent"},
+                    "props": {"class": "autosub-asr-metric pa-3 rounded border", "color": "transparent"},
                     "content": [
                         {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": title},
                         {"component": "div", "props": {"class": f"text-h6 text-{color}"}, "text": str(value)},
@@ -4950,7 +5127,7 @@ class AutoSubRemoteAsr(_PluginBase):
         return [
             {
                 "component": "div",
-                "props": {"class": "d-flex align-center", "style": "gap:8px;min-width:180px"},
+                "props": {"class": "autosub-asr-progress d-flex align-center"},
                 "content": [
                     {
                         "component": "VProgressLinear",
@@ -4959,7 +5136,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "height": 8,
                             "rounded": True,
                             "color": color,
-                            "style": "min-width:120px;max-width:180px",
+                            "style": "min-width:96px;max-width:180px;flex:1 1 auto;",
                         },
                     },
                     {"component": "span", "props": {"class": "text-caption text-no-wrap"}, "text": f"{progress:.1f}%"},
@@ -4967,7 +5144,7 @@ class AutoSubRemoteAsr(_PluginBase):
             },
             {
                 "component": "div",
-                "props": {"class": "text-caption text-medium-emphasis mt-1", "style": "max-width:420px;white-space:normal"},
+                "props": {"class": "autosub-asr-progress-detail text-caption text-medium-emphasis mt-1"},
                 "text": " · ".join(detail_parts),
             },
         ]
@@ -5088,7 +5265,7 @@ class AutoSubRemoteAsr(_PluginBase):
         return [
             {
                 "component": "VTable",
-                "props": {"hover": True, "density": "comfortable"},
+                "props": {"hover": True, "density": "comfortable", "class": "autosub-asr-table"},
                 "content": [
                     {
                         "component": "thead",
@@ -5115,7 +5292,7 @@ class AutoSubRemoteAsr(_PluginBase):
         return {
             "component": "div",
             "props": {
-                "style": "max-height:64vh;overflow-y:auto;overflow-x:auto;"
+                "class": "autosub-asr-task-scroll",
             },
             "content": content,
         }
@@ -5158,7 +5335,7 @@ class AutoSubRemoteAsr(_PluginBase):
                         {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium mb-2"}, "text": "任务记录"},
                         {
                             "component": "VSheet",
-                            "props": {"class": "rounded border overflow-hidden", "color": "transparent"},
+                            "props": {"class": "autosub-asr-task-shell rounded border overflow-hidden", "color": "transparent"},
                             "content": [
                                 {
                                     "component": "VTabs",
@@ -5167,6 +5344,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                         "color": "primary",
                                         "density": "comfortable",
                                         "show-arrows": True,
+                                        "class": "autosub-asr-tabs",
                                         "style": "max-height:112px;overflow-y:auto;overflow-x:auto;",
                                     },
                                     "content": [
@@ -5218,10 +5396,11 @@ class AutoSubRemoteAsr(_PluginBase):
 
         action_row = {
             "component": "VRow",
+            "props": {"class": "autosub-asr-actions"},
             "content": [
                 {
                     "component": "VCol",
-                    "props": {"cols": 12},
+                    "props": {"cols": 12, "class": "autosub-asr-actions-col"},
                     "content": [
                         self.__page_action_button("立即扫描", "mdi-playlist-plus", "primary",
                                                   "plugin/AutoSubRemoteAsr/scan"),
@@ -5269,7 +5448,14 @@ class AutoSubRemoteAsr(_PluginBase):
             selected_tab,
         )
 
-        return [action_row, summary, task_table]
+        return [
+            self.__responsive_style(),
+            {
+                "component": "div",
+                "props": {"class": "autosub-asr-page"},
+                "content": [action_row, summary, task_table],
+            },
+        ]
 
     def __legacy_get_page(self) -> List[dict]:
         # 加载任务并按添加时间倒序排列
