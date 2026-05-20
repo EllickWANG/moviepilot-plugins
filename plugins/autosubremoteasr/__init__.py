@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.37"
+    plugin_version = "1.0.38"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -338,6 +338,15 @@ class AutoSubRemoteAsr(_PluginBase):
         # 如果没有配置信息， 则不处理
         if not config:
             return
+        config = dict(config)
+        removed_keys = []
+        for key in ("reuse_autosub_config", "compatible", "use_chatgpt", "cpu_threads"):
+            if key in config:
+                config.pop(key, None)
+                removed_keys.append(key)
+        if removed_keys:
+            logger.info(f"已清理接口ASR旧配置项：{', '.join(removed_keys)}")
+            self.update_config(config)
         self.__ensure_runtime_state()
         self._tasks = self.load_tasks()
         self._progress_save_at = {}
@@ -369,7 +378,7 @@ class AutoSubRemoteAsr(_PluginBase):
             asr_prompt = self.__default_asr_prompt()
         self._asr_prompt = str(asr_prompt or "").strip()
         self._translate_request_timeout = self.__normalize_request_timeout(config.get('translate_request_timeout'), 120)
-        self._reuse_autosub_config = bool(config.get('reuse_autosub_config', False))
+        self._reuse_autosub_config = False
         self._auto_detect_language = config.get('auto_detect_language', False)
         self._translate_zh = config.get('translate_zh', False)
         self._enable_batch = config.get('enable_batch', True)
