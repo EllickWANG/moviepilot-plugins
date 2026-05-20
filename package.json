@@ -11,7 +11,7 @@
   "sourceprioritysubscribefix": {
     "name": "订阅外部源优先",
     "description": "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，并在整理阶段按订阅来源回填。",
-    "version": "1.0.45",
+    "version": "1.0.46",
     "icon": "mdi-heart-cog",
     "author": "Ellick",
     "level": 1,

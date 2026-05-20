@@ -51,7 +51,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.45"
+    plugin_version = "1.0.46"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -998,6 +998,8 @@ def _source_keyword_targets_bangumi_only(source_keyword: Optional[dict],
         return False
     if subscribe:
         return _is_bangumi_only_subscribe(subscribe)
+    if source_keyword.get("id"):
+        return False
     return not source_keyword.get("tmdbid") and not source_keyword.get("doubanid")
 
 
