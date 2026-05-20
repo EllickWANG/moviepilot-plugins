@@ -46,9 +46,30 @@ class AsrTransientException(Exception):
 
 
 class AsrRequestError(RuntimeError):
-    def __init__(self, message: str, retryable: bool = False):
+    def __init__(self, message: str, retryable: bool = False, status_code: Optional[int] = None):
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
+
+
+class AsrChannelIncompatible(RuntimeError):
+    """ASR通道不兼容当前字幕时间轴生成要求"""
+    pass
+
+
+@dataclass
+class AsrChannel:
+    channel_id: str
+    name: str
+    url: str
+    key: str
+    model: str
+    priority: int = 100
+    timeout: int = 300
+    proxy: bool = False
+    enabled: bool = True
+    response_format: str = "verbose_json"
+    require_segments: bool = True
 
 
 def _log_preview(value: Any, limit: int = 6000) -> str:
@@ -108,7 +129,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.55"
+    plugin_version = "1.0.56"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -145,8 +166,15 @@ class AutoSubRemoteAsr(_PluginBase):
     _asr_prompt = ""
     _translate_request_timeout = 120
     _asr_random_check_rate = 0.2
-    _asr_request_retries = 3
     _asr_retry_delays = (10, 30, 60)
+    _asr_channels: List[AsrChannel] = None
+    _asr_channel_states: Dict[str, dict] = None
+    _asr_last_success_channel_id = None
+    _asr_channel_retries = 1
+    _asr_max_channel_attempts = 6
+    _asr_error_cooldown_seconds = 5 * 60
+    _asr_rate_limit_cooldown_seconds = 10 * 60
+    _asr_unavailable_cooldown_seconds = 30 * 60
     _reuse_autosub_config = False
     _openai_api_key = None
     _openai_api_url = None
@@ -195,6 +223,8 @@ class AutoSubRemoteAsr(_PluginBase):
             self._auto_scan_lock = threading.Lock()
         if self._translate_lock is None:
             self._translate_lock = threading.Semaphore(1)
+        if self._asr_channel_states is None:
+            self._asr_channel_states = {}
 
     @staticmethod
     def __normalize_parallel_tasks(value) -> int:
@@ -244,6 +274,44 @@ class AutoSubRemoteAsr(_PluginBase):
             return max(10, min(1800, int(value or default)))
         except Exception:
             return default
+
+    @staticmethod
+    def __normalize_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+        try:
+            return max(minimum, min(maximum, int(value if value not in (None, "") else default)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def __normalize_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value in (None, ""):
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "启用", "是"}
+
+    @staticmethod
+    def __asr_channels_example() -> str:
+        return json.dumps([
+            {
+                "name": "主接口",
+                "url": "https://api.openai.com",
+                "key": "sk-xxx",
+                "model": "whisper-1",
+                "priority": 1,
+                "timeout": 300,
+                "proxy": False
+            },
+            {
+                "name": "备用接口",
+                "url": "https://api.groq.com/openai/v1",
+                "key": "gsk-xxx",
+                "model": "whisper-large-v3-turbo",
+                "priority": 2,
+                "timeout": 180,
+                "proxy": False
+            }
+        ], ensure_ascii=False, indent=2)
 
     @staticmethod
     def __normalize_path_list(value) -> List[str]:
@@ -516,6 +584,226 @@ class AutoSubRemoteAsr(_PluginBase):
                 client_kwargs["proxies"] = proxy_url
         return httpx.Client(**client_kwargs)
 
+    def __build_asr_channel(self, item: dict, index: int) -> Optional[AsrChannel]:
+        if not isinstance(item, dict):
+            return None
+        key = self.__pick_first_key(item.get("key") or item.get("openai_key") or item.get("api_key"))
+        url = str(item.get("url") or item.get("openai_url") or item.get("api_url") or "").strip()
+        model = str(item.get("model") or item.get("asr_api_model") or "").strip()
+        if not key or not url or not model:
+            return None
+        name = str(item.get("name") or item.get("title") or f"ASR通道{index}").strip()
+        priority = self.__normalize_int(item.get("priority"), index, 1, 999)
+        timeout = self.__normalize_request_timeout(item.get("timeout"), self._asr_request_timeout or 300)
+        response_format = str(item.get("response_format") or "verbose_json").strip() or "verbose_json"
+        raw_id = str(item.get("id") or item.get("channel_id") or "").strip()
+        if not raw_id:
+            raw_id = hashlib.sha1(f"{name}|{url}|{model}|{priority}".encode("utf-8")).hexdigest()[:12]
+        return AsrChannel(
+            channel_id=raw_id,
+            name=name,
+            url=url,
+            key=key,
+            model=model,
+            priority=priority,
+            timeout=timeout,
+            proxy=self.__normalize_bool(item.get("proxy"), False),
+            enabled=self.__normalize_bool(item.get("enabled"), True),
+            response_format=response_format,
+            require_segments=self.__normalize_bool(item.get("require_segments"), True),
+        )
+
+    def __parse_asr_channels_raw(self, raw_value: Any) -> List[dict]:
+        if not raw_value:
+            return []
+        if isinstance(raw_value, list):
+            return [item for item in raw_value if isinstance(item, dict)]
+        if isinstance(raw_value, dict):
+            return [raw_value]
+
+        text = str(raw_value or "").strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+            if isinstance(parsed, dict):
+                return [parsed]
+        except Exception:
+            pass
+
+        items = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    items.append(parsed)
+                    continue
+            except Exception:
+                pass
+            parts = [part.strip() for part in line.split("|")]
+            if len(parts) >= 4:
+                items.append({
+                    "name": parts[0],
+                    "url": parts[1],
+                    "key": parts[2],
+                    "model": parts[3],
+                    "priority": parts[4] if len(parts) >= 5 else len(items) + 1,
+                    "timeout": parts[5] if len(parts) >= 6 else self._asr_request_timeout,
+                })
+        return items
+
+    def __normalize_asr_channels(self, config: dict) -> List[AsrChannel]:
+        raw_items = self.__parse_asr_channels_raw(
+            config.get("asr_channels") or config.get("asr_channels_json")
+        )
+        channels = []
+        for index, item in enumerate(raw_items, 1):
+            channel = self.__build_asr_channel(item, index)
+            if channel:
+                channels.append(channel)
+
+        if not channels:
+            fallback_key = self.__pick_first_key(config.get("asr_openai_key") or config.get("openai_key"))
+            fallback_url = config.get("asr_openai_url") or config.get("openai_url") or "https://api.openai.com"
+            fallback_model = config.get("asr_api_model") or "whisper-1"
+            if fallback_key and fallback_url and fallback_model:
+                channel = self.__build_asr_channel({
+                    "name": "默认ASR接口",
+                    "url": fallback_url,
+                    "key": fallback_key,
+                    "model": fallback_model,
+                    "priority": 1,
+                    "timeout": self._asr_request_timeout,
+                    "proxy": config.get("openai_proxy", False),
+                }, 1)
+                if channel:
+                    channels.append(channel)
+
+        channels = [channel for channel in channels if channel.enabled]
+        return sorted(channels, key=lambda item: (item.priority, item.name, item.channel_id))
+
+    @staticmethod
+    def __asr_channel_label(channel: AsrChannel) -> str:
+        return f"{channel.name}/{channel.model}" if channel else "-"
+
+    def __asr_models_label(self) -> str:
+        models = list(dict.fromkeys([channel.model for channel in self._asr_channels or [] if channel.model]))
+        return ", ".join(models) if models else self._asr_api_model or "-"
+
+    def __get_asr_base_url(self, channel: AsrChannel) -> str:
+        base_url = channel.url.rstrip("/") if channel and channel.url else "https://api.openai.com"
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
+        return base_url
+
+    def __create_asr_http_client(self, channel: AsrChannel, timeout: Optional[int] = None) -> httpx.Client:
+        proxy_url = None
+        if channel and channel.proxy:
+            proxy_config = settings.PROXY or {}
+            proxy_url = proxy_config.get("https") or proxy_config.get("http")
+        client_kwargs = {"timeout": timeout or (channel.timeout if channel else self._asr_request_timeout)}
+        if proxy_url:
+            httpx_client_params = inspect.signature(httpx.Client).parameters
+            if "proxy" in httpx_client_params:
+                client_kwargs["proxy"] = proxy_url
+            elif "proxies" in httpx_client_params:
+                client_kwargs["proxies"] = proxy_url
+        return httpx.Client(**client_kwargs)
+
+    def __asr_channel_state(self, channel: AsrChannel) -> dict:
+        self.__ensure_runtime_state()
+        return self._asr_channel_states.setdefault(channel.channel_id, {})
+
+    def __asr_channel_available(self, channel: AsrChannel, now: Optional[datetime] = None) -> bool:
+        state = self.__asr_channel_state(channel)
+        if state.get("incompatible"):
+            return False
+        cooldown_until = state.get("cooldown_until")
+        if cooldown_until:
+            now = now or datetime.now()
+            try:
+                if datetime.fromisoformat(cooldown_until) > now:
+                    return False
+            except Exception:
+                state.pop("cooldown_until", None)
+        return True
+
+    def __ordered_asr_channels(self) -> List[AsrChannel]:
+        now = datetime.now()
+        channels = [channel for channel in self._asr_channels or [] if self.__asr_channel_available(channel, now)]
+        if self._asr_last_success_channel_id:
+            preferred = [channel for channel in channels if channel.channel_id == self._asr_last_success_channel_id]
+            others = [channel for channel in channels if channel.channel_id != self._asr_last_success_channel_id]
+            if preferred:
+                channels = preferred + others
+        return channels
+
+    def __asr_channel_cooldown_seconds(self, err: Exception) -> int:
+        text = str(err or "").lower()
+        if isinstance(err, AsrChannelIncompatible):
+            return 0
+        if "无可用渠道" in text or "no available" in text or "distributor" in text or "model_not_found" in text:
+            return self._asr_unavailable_cooldown_seconds
+        if isinstance(err, AsrRequestError) and err.status_code == 429:
+            return self._asr_rate_limit_cooldown_seconds
+        if "429" in text or "rate limit" in text or "负载" in text:
+            return self._asr_rate_limit_cooldown_seconds
+        return self._asr_error_cooldown_seconds
+
+    def __record_asr_channel_success(self, channel: AsrChannel):
+        state = self.__asr_channel_state(channel)
+        state["failures"] = 0
+        state.pop("cooldown_until", None)
+        state.pop("last_error", None)
+        state["last_success"] = datetime.now().isoformat()
+        self._asr_last_success_channel_id = channel.channel_id
+
+    def __record_asr_channel_failure(self, channel: AsrChannel, err: Exception):
+        state = self.__asr_channel_state(channel)
+        state["failures"] = int(state.get("failures") or 0) + 1
+        state["last_error"] = str(err)[:300]
+        state["last_failure"] = datetime.now().isoformat()
+        error_text = str(err or "").lower()
+        if (
+                isinstance(err, AsrChannelIncompatible)
+                or "unsupported_value" in error_text
+                or "response_format" in error_text
+                or "not compatible" in error_text
+        ):
+            state["incompatible"] = True
+            logger.warn(f"ASR通道已标记不兼容：{self.__asr_channel_label(channel)} - {err}")
+            return
+        cooldown = self.__asr_channel_cooldown_seconds(err)
+        if cooldown > 0:
+            state["cooldown_until"] = (datetime.now() + timedelta(seconds=cooldown)).isoformat()
+            logger.warn(
+                f"ASR通道进入冷却 {round(cooldown / 60, 1)} 分钟："
+                f"{self.__asr_channel_label(channel)} - {err}"
+            )
+
+    def __asr_channel_status_summary(self) -> str:
+        parts = []
+        now = datetime.now()
+        for channel in self._asr_channels or []:
+            state = self.__asr_channel_state(channel)
+            if state.get("incompatible"):
+                status = "不兼容"
+            elif state.get("cooldown_until"):
+                try:
+                    cooldown_until = datetime.fromisoformat(state.get("cooldown_until"))
+                    status = f"冷却至 {cooldown_until.strftime('%H:%M:%S')}" if cooldown_until > now else "健康"
+                except Exception:
+                    status = "健康"
+            else:
+                status = "健康"
+            parts.append(f"{channel.name}({channel.model}) {status}")
+        return "；".join(parts) if parts else "未配置ASR通道"
+
     def init_plugin(self, config=None):
         # 如果没有配置信息， 则不处理
         if not config:
@@ -556,10 +844,21 @@ class AutoSubRemoteAsr(_PluginBase):
         self._asr_chunk_minutes = self.__normalize_asr_chunk_minutes(config.get('asr_chunk_minutes'))
         self._asr_chunk_seconds = self._asr_chunk_minutes * 60
         self._asr_request_timeout = self.__normalize_request_timeout(config.get('asr_request_timeout'), 300)
+        self._asr_channel_retries = self.__normalize_int(config.get('asr_channel_retries'), 1, 0, 5)
+        self._asr_max_channel_attempts = self.__normalize_int(config.get('asr_max_channel_attempts'), 6, 1, 30)
+        self._asr_error_cooldown_seconds = self.__normalize_int(config.get('asr_error_cooldown_minutes'), 5, 1, 120) * 60
+        self._asr_rate_limit_cooldown_seconds = self.__normalize_int(
+            config.get('asr_rate_limit_cooldown_minutes'), 10, 1, 240
+        ) * 60
+        self._asr_unavailable_cooldown_seconds = self.__normalize_int(
+            config.get('asr_unavailable_cooldown_minutes'), 30, 1, 1440
+        ) * 60
         asr_prompt = config.get('asr_prompt')
         if asr_prompt is None:
             asr_prompt = self.__default_asr_prompt()
         self._asr_prompt = str(asr_prompt or "").strip()
+        self._asr_channels = self.__normalize_asr_channels(config)
+        self._asr_api_model = self._asr_channels[0].model if self._asr_channels else self._asr_api_model
         self._translate_request_timeout = self.__normalize_request_timeout(config.get('translate_request_timeout'), 120)
         self._reuse_autosub_config = False
         self._auto_detect_language = config.get('auto_detect_language', False)
@@ -585,9 +884,11 @@ class AutoSubRemoteAsr(_PluginBase):
             self.stop_service()
             return
 
-        api_required = self._translate_zh or self._enable_asr
-        if api_required and not self.__resolve_openai_settings(config):
+        if self._translate_zh and not self.__resolve_openai_settings(config):
             logger.error("接口ASR或中文字幕翻译需要大模型接口配置，请在当前插件中维护接口地址和密钥")
+            return
+        if self._enable_asr and not self._asr_channels:
+            logger.error("接口ASR已启用，但未配置可用ASR通道")
             return
 
         if self._translate_zh:
@@ -1041,8 +1342,6 @@ class AutoSubRemoteAsr(_PluginBase):
                 return None
             if int(checkpoint.get("asr_chunk_seconds") or 0) != int(self._asr_chunk_seconds or 0):
                 return None
-            if checkpoint.get("asr_api_model") != self._asr_api_model:
-                return None
             if checkpoint.get("audio_lang") != audio_lang:
                 return None
             chunks = checkpoint.get("chunks") or {}
@@ -1072,7 +1371,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     "source_mtime": signature["mtime"],
                     "expected_chunks": int(expected_chunks or 0),
                     "asr_chunk_seconds": int(self._asr_chunk_seconds or 0),
-                    "asr_api_model": self._asr_api_model,
+                    "asr_api_model": self.__asr_models_label(),
                     "audio_lang": audio_lang,
                     "detected_lang": detected_lang,
                     "updated_at": now,
@@ -1909,12 +2208,14 @@ class AutoSubRemoteAsr(_PluginBase):
         )
 
     def __check_asr(self):
-        if not self._openai_api_key:
-            logger.warn("接口ASR缺少API密钥，不进行处理")
+        if not self._asr_channels:
+            logger.warn("接口ASR缺少可用通道，不进行处理")
             return False
-        if not self._asr_api_model:
-            logger.warn("接口ASR模型未配置，不进行处理")
-            return False
+        logger.info(
+            f"接口ASR通道配置：{len(self._asr_channels)} 个，"
+            f"模型 {self.__asr_models_label()}，通道重试 {self._asr_channel_retries}，"
+            f"单段最大尝试 {self._asr_max_channel_attempts}"
+        )
         return True
 
     @staticmethod
@@ -2301,11 +2602,12 @@ class AutoSubRemoteAsr(_PluginBase):
             return self.__is_chinese_language(value)
         return False
 
-    def __transcribe_audio_chunk(self, audio_file: str, audio_lang: str, use_prompt: bool = True) -> dict:
+    def __transcribe_audio_chunk(self, audio_file: str, audio_lang: str,
+                                 channel: AsrChannel, use_prompt: bool = True) -> dict:
         request_lang = self.__normalize_language_code(audio_lang, fallback="")
         data = {
-            "model": self._asr_api_model,
-            "response_format": "verbose_json",
+            "model": channel.model,
+            "response_format": channel.response_format or "verbose_json",
             "temperature": "0",
         }
         if request_lang:
@@ -2313,34 +2615,36 @@ class AutoSubRemoteAsr(_PluginBase):
         if use_prompt and self._asr_prompt:
             data["prompt"] = self._asr_prompt
 
-        url = f"{self.__get_openai_base_url()}/audio/transcriptions"
+        url = f"{self.__get_asr_base_url(channel)}/audio/transcriptions"
         try:
             audio_size = os.path.getsize(audio_file)
         except Exception:
             audio_size = -1
         if self._detailed_log:
             logger.info(
-                f"接口ASR请求：url={url} model={self._asr_api_model} timeout={self._asr_request_timeout}s "
+                f"接口ASR请求：channel={self.__asr_channel_label(channel)} url={url} "
+                f"timeout={channel.timeout}s "
                 f"file={os.path.basename(audio_file)} size={audio_size} data={_log_preview(data)}"
             )
         else:
             logger.info(
-                f"接口ASR请求：url={url} model={self._asr_api_model} timeout={self._asr_request_timeout}s "
+                f"接口ASR请求：channel={self.__asr_channel_label(channel)} url={url} "
+                f"timeout={channel.timeout}s "
                 f"file={os.path.basename(audio_file)} size={audio_size}"
             )
         started_at = time.time()
-        with self.__create_openai_http_client(timeout=self._asr_request_timeout) as client:
+        with self.__create_asr_http_client(channel, timeout=channel.timeout) as client:
             with open(audio_file, "rb") as file_obj:
                 try:
                     response = client.post(
                         url,
-                        headers={"Authorization": f"Bearer {self._openai_api_key}"},
+                        headers={"Authorization": f"Bearer {channel.key}"},
                         data=data,
                         files={"file": (os.path.basename(audio_file), file_obj, "audio/mpeg")},
                     )
                 except Exception as err:
                     logger.error(
-                        f"接口ASR请求异常：url={url} model={self._asr_api_model} "
+                        f"接口ASR请求异常：channel={self.__asr_channel_label(channel)} url={url} "
                         f"elapsed={time.time() - started_at:.2f}s error={err}"
                     )
                     raise
@@ -2361,12 +2665,24 @@ class AutoSubRemoteAsr(_PluginBase):
             retryable = status_code == 429 or status_code >= 500
             raise AsrRequestError(
                 f"接口ASR返回错误 {status_code}: {response.text[:500]}",
-                retryable=retryable
+                retryable=retryable,
+                status_code=status_code,
             ) from err
         try:
             return response.json()
         except ValueError as err:
             raise RuntimeError(f"接口ASR返回非JSON响应: {response.text[:500]}") from err
+
+    def __ensure_asr_channel_response(self, response: dict, channel: AsrChannel):
+        if not isinstance(response, dict):
+            raise AsrChannelIncompatible(f"{self.__asr_channel_label(channel)} 返回非JSON对象")
+        segments = response.get("segments")
+        if segments is not None and not isinstance(segments, list):
+            raise AsrChannelIncompatible(f"{self.__asr_channel_label(channel)} 返回 segments 格式异常")
+        if channel.require_segments and not segments:
+            raise AsrChannelIncompatible(
+                f"{self.__asr_channel_label(channel)} 未返回 segments，无法生成精确SRT时间轴"
+            )
 
     @staticmethod
     def __is_retryable_asr_error(err: Exception) -> bool:
@@ -2394,76 +2710,125 @@ class AutoSubRemoteAsr(_PluginBase):
     def __transcribe_audio_chunk_with_progress(self, audio_file: str, audio_lang: str, chunk_no: int,
                                                expected_chunks: int, task: Optional[TaskItem],
                                                base_progress: float, use_prompt: bool = True) -> dict:
-        max_attempts = max(1, int(self._asr_request_retries or 1))
+        channels = self.__ordered_asr_channels()
+        if not channels:
+            raise AsrTransientException(
+                f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段无可用ASR通道："
+                f"{self.__asr_channel_status_summary()}"
+            )
+
+        per_channel_attempts = max(1, int(self._asr_channel_retries or 0) + 1)
+        max_attempts = max(1, int(self._asr_max_channel_attempts or 6))
+        total_attempt = 0
         last_error = None
         last_traceback = ""
+        error_parts = []
 
-        for attempt in range(1, max_attempts + 1):
-            result = {}
-
-            def worker():
-                try:
-                    result["response"] = self.__transcribe_audio_chunk(audio_file, audio_lang, use_prompt=use_prompt)
-                except Exception as err:
-                    result["error"] = err
-                    result["traceback"] = traceback.format_exc()
-
-            thread = threading.Thread(
-                target=worker,
-                name=f"autosubremoteasr-asr-{chunk_no}-{attempt}",
-                daemon=True
-            )
-            started_at = time.time()
-            forced_timeout = max(15, int(self._asr_request_timeout or 300) + 5)
-            thread.start()
-            while thread.is_alive():
-                if self._event.is_set():
-                    raise UserInterruptException("用户中断当前任务")
-                elapsed = int(time.time() - started_at)
-                if elapsed >= forced_timeout:
-                    result["error"] = httpx.TimeoutException(
-                        f"接口ASR请求超过 {self._asr_request_timeout} 秒，已放弃本次请求"
-                    )
-                    result["traceback"] = ""
-                    logger.warn(
-                        f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段第 {attempt}/{max_attempts} 次"
-                        f"等待超过 {self._asr_request_timeout} 秒，强制进入重试"
-                    )
+        for channel in channels:
+            channel_label = self.__asr_channel_label(channel)
+            for attempt in range(1, per_channel_attempts + 1):
+                if total_attempt >= max_attempts:
                     break
-                self.__update_task_progress(
-                    task,
-                    base_progress,
-                    "提取并识别音频",
-                    f"第 {chunk_no}/{expected_chunks or '?'} 段上传ASR中，"
-                    f"第 {attempt}/{max_attempts} 次，已等待 {elapsed} 秒",
-                    force=True
+                total_attempt += 1
+                result = {}
+
+                def worker():
+                    try:
+                        response = self.__transcribe_audio_chunk(
+                            audio_file,
+                            audio_lang,
+                            channel,
+                            use_prompt=use_prompt,
+                        )
+                        self.__ensure_asr_channel_response(response, channel)
+                        result["response"] = response
+                    except Exception as err:
+                        result["error"] = err
+                        result["traceback"] = traceback.format_exc()
+
+                thread = threading.Thread(
+                    target=worker,
+                    name=f"autosubremoteasr-asr-{chunk_no}-{total_attempt}",
+                    daemon=True
                 )
-                thread.join(timeout=2)
+                started_at = time.time()
+                forced_timeout = max(15, int(channel.timeout or self._asr_request_timeout or 300) + 5)
+                thread.start()
+                while thread.is_alive():
+                    if self._event.is_set():
+                        raise UserInterruptException("用户中断当前任务")
+                    elapsed = int(time.time() - started_at)
+                    if elapsed >= forced_timeout:
+                        result["error"] = httpx.TimeoutException(
+                            f"接口ASR请求超过 {channel.timeout} 秒，已放弃本次请求"
+                        )
+                        result["traceback"] = ""
+                        logger.warn(
+                            f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段通道 {channel_label} "
+                            f"第 {attempt}/{per_channel_attempts} 次等待超过 {channel.timeout} 秒，切换重试"
+                        )
+                        break
+                    self.__update_task_progress(
+                        task,
+                        base_progress,
+                        "提取并识别音频",
+                        f"第 {chunk_no}/{expected_chunks or '?'} 段上传ASR中，通道 {channel_label}，"
+                        f"通道第 {attempt}/{per_channel_attempts} 次，总第 {total_attempt}/{max_attempts} 次，"
+                        f"已等待 {elapsed} 秒",
+                        force=True
+                    )
+                    thread.join(timeout=2)
 
-            if not result.get("error"):
-                if attempt > 1:
-                    logger.info(f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段第 {attempt} 次重试成功")
-                return result.get("response") or {}
+                if not result.get("error"):
+                    if total_attempt > 1:
+                        logger.info(
+                            f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段切换后成功："
+                            f"{channel_label}，总第 {total_attempt} 次"
+                        )
+                    self.__record_asr_channel_success(channel)
+                    return result.get("response") or {}
 
-            last_error = result["error"]
-            last_traceback = result.get("traceback") or ""
-            retryable = self.__is_retryable_asr_error(last_error)
-            if not retryable or attempt >= max_attempts:
+                last_error = result["error"]
+                last_traceback = result.get("traceback") or ""
+                error_parts.append(f"{channel_label}: {last_error}")
+                if isinstance(last_error, AsrChannelIncompatible):
+                    self.__record_asr_channel_failure(channel, last_error)
+                    break
+
+                retryable = self.__is_retryable_asr_error(last_error)
+                if not retryable:
+                    self.__record_asr_channel_failure(channel, last_error)
+                    break
+
+                if attempt < per_channel_attempts and total_attempt < max_attempts:
+                    delay = self._asr_retry_delays[min(attempt - 1, len(self._asr_retry_delays) - 1)]
+                    logger.warn(
+                        f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段通道 {channel_label} "
+                        f"第 {attempt}/{per_channel_attempts} 次失败，{delay} 秒后重试：{last_error}"
+                    )
+                    self.__wait_before_asr_retry(
+                        delay,
+                        task,
+                        chunk_no,
+                        expected_chunks,
+                        attempt,
+                        per_channel_attempts,
+                        base_progress,
+                    )
+                else:
+                    self.__record_asr_channel_failure(channel, last_error)
+                    break
+
+            if total_attempt >= max_attempts:
                 break
-
-            delay = self._asr_retry_delays[min(attempt - 1, len(self._asr_retry_delays) - 1)]
-            logger.warn(
-                f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段第 {attempt}/{max_attempts} 次失败，"
-                f"{delay} 秒后重试：{last_error}"
-            )
-            self.__wait_before_asr_retry(delay, task, chunk_no, expected_chunks, attempt, max_attempts, base_progress)
 
         if last_traceback:
             logger.error(last_traceback)
-        if last_error and self.__is_retryable_asr_error(last_error):
+        detail = "；".join(error_parts[-4:]) or str(last_error or "未知错误")
+        if last_error and (self.__is_retryable_asr_error(last_error) or isinstance(last_error, AsrChannelIncompatible)):
             raise AsrTransientException(
-                f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段网络异常，"
-                f"已重试 {max_attempts} 次：{last_error}"
+                f"接口ASR第 {chunk_no}/{expected_chunks or '?'} 段多通道均不可用，"
+                f"已尝试 {total_attempt}/{max_attempts} 次：{detail}"
             ) from last_error
         if last_error:
             raise last_error
@@ -3046,7 +3411,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 )
                 return True, lang, []
             self.__update_task_progress(task, 34, "接口语音识别",
-                                        f"模型：{self._asr_api_model}，语言：{lang}，预计 {expected_chunks} 段",
+                                        f"通道：{len(self._asr_channels or [])} 个，"
+                                        f"模型：{self.__asr_models_label()}，语言：{lang}，预计 {expected_chunks} 段",
                                         force=True)
             subs = []
             checkpoint = self.__get_asr_checkpoint(task, checkpoint_source, expected_chunks, lang)
@@ -3286,7 +3652,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 duration = media_duration
             expected_chunks = max(1, math.ceil(duration / self._asr_chunk_seconds)) if duration else 0
             logger.info(
-                f"开始接口ASR流水线，语言 {audio_lang}，模型 {self._asr_api_model}，"
+                f"开始接口ASR流水线，语言 {audio_lang}，通道 {len(self._asr_channels or [])} 个，"
+                f"模型 {self.__asr_models_label()}，"
                 f"分段 {self._asr_chunk_minutes} 分钟，预计 {expected_chunks or '?'} 段"
             )
             self.__update_task_progress(task, 24, "提取并识别音频",
@@ -4687,11 +5054,11 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__form_col(
                         self.__form_text(
                             "asr_api_model",
-                            "ASR模型",
+                            "默认ASR模型",
                             "whisper-1",
-                            "需要支持 verbose_json 和 segments",
+                            "ASR通道配置为空时使用；需要支持 verbose_json 和 segments",
                         ),
-                        md=3,
+                        md=4,
                     ),
                     self.__form_col(
                         self.__form_text(
@@ -4700,7 +5067,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "10",
                             "范围5-30；过短会增加接口调用",
                         ),
-                        md=3,
+                        md=4,
                     ),
                     self.__form_col(
                         self.__form_text(
@@ -4709,11 +5076,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "300",
                             "单段ASR请求超时后重试",
                         ),
-                        md=3,
-                    ),
-                    self.__form_col(
-                        self.__form_text("max_retries", "接口重试次数", "3"),
-                        md=3,
+                        md=4,
                     ),
                 ],
             },
@@ -4734,20 +5097,101 @@ class AutoSubRemoteAsr(_PluginBase):
             },
         ])
 
-        api_settings = self.__form_card("接口配置", "当前插件独立维护接口地址、密钥和模型", [
+        asr_channel_settings = self.__form_card("ASR通道池", "可以配置多个转写接口，单段失败时自动切换健康通道", [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_textarea(
+                            "asr_channels_json",
+                            "ASR通道配置",
+                            self.__asr_channels_example(),
+                            "支持JSON数组，也支持每行一个通道：名称|地址|密钥|模型|优先级|超时。留空时使用翻译接口生成默认ASR通道",
+                            rows=9,
+                        ),
+                        md=12,
+                    ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_channel_retries",
+                            "单通道重试",
+                            "1",
+                            "当前通道失败后重试次数；之后切换下一通道",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_max_channel_attempts",
+                            "单段最大尝试",
+                            "6",
+                            "同一音频分段跨所有通道的最大尝试次数",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_error_cooldown_minutes",
+                            "断连冷却分钟",
+                            "5",
+                            "超时、断连、5xx 后通道冷却时间",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_rate_limit_cooldown_minutes",
+                            "429冷却分钟",
+                            "10",
+                            "限流或负载饱和后通道冷却时间",
+                        ),
+                        md=3,
+                    ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_unavailable_cooldown_minutes",
+                            "无渠道冷却分钟",
+                            "30",
+                            "模型无可用渠道、上游不可用时的冷却时间",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        {
+                            "component": "VAlert",
+                            "props": {"type": "info", "variant": "tonal", "density": "compact"},
+                            "text": "通道默认要求返回 segments；gpt-4o-transcribe 这类只返回整段文本的模型会被自动标记为不兼容，避免生成错误时间轴。",
+                        },
+                        md=9,
+                    ),
+                ],
+            },
+        ])
+
+        api_settings = self.__form_card("翻译接口", "用于中文字幕翻译；ASR通道为空时也作为默认ASR接口", [
             {
                 "component": "VRow",
                 "content": [
                     self.__form_col(
                         self.__form_text(
                             "openai_url",
-                            "接口地址",
+                            "翻译接口地址",
                             "https://api.openai.com",
                             "填写 OpenAI 兼容接口根地址；带不带 /v1 都可以",
                         ),
                         md=4,
                     ),
-                    self.__form_col(self.__form_text("openai_key", "API密钥", "sk-xxx"), md=4),
+                    self.__form_col(self.__form_text("openai_key", "翻译API密钥", "sk-xxx"), md=4),
                     self.__form_col(
                         self.__form_text(
                             "openai_model",
@@ -4810,6 +5254,15 @@ class AutoSubRemoteAsr(_PluginBase):
                     ),
                     self.__form_col(self.__form_text("context_window", "上下文窗口", "5"), md=3),
                     self.__form_col(
+                        self.__form_text("max_retries", "翻译重试次数", "3"),
+                        md=3,
+                    ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
                         self.__form_switch(
                             "enable_merge",
                             "英文字幕合并整句",
@@ -4830,6 +5283,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     base_settings,
                     scan_settings,
                     subtitle_settings,
+                    asr_channel_settings,
                     api_settings,
                     translate_settings,
                 ],
@@ -4856,6 +5310,12 @@ class AutoSubRemoteAsr(_PluginBase):
             "enable_asr": True,
             "auto_detect_language": True,
             "asr_api_model": "whisper-1",
+            "asr_channels_json": "",
+            "asr_channel_retries": 1,
+            "asr_max_channel_attempts": 6,
+            "asr_error_cooldown_minutes": 5,
+            "asr_rate_limit_cooldown_minutes": 10,
+            "asr_unavailable_cooldown_minutes": 30,
             "asr_chunk_minutes": 10,
             "asr_request_timeout": 300,
             "asr_prompt": self.__default_asr_prompt(),
@@ -6235,7 +6695,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "props": {"type": "info", "variant": "tonal", "density": "compact"},
                             "text": f"最近任务更新时间：{self.__format_time(latest_update)}；"
                                     f"任务并行 {self._parallel_tasks}，翻译接口并发 {self._translate_concurrency}，"
-                                    f"每批 {self._batch_size} 行",
+                                    f"每批 {self._batch_size} 行；ASR通道：{self.__asr_channel_status_summary()}",
                         }
                     ],
                 },
