@@ -103,7 +103,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.32"
+    plugin_version = "1.0.33"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1655,82 +1655,326 @@ class AutoSubRemoteAsr(_PluginBase):
                 offsets.append(round(random.uniform(left, right), 2))
         return offsets
 
+    @staticmethod
+    def __safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def __clean_language_probe_text(text: str) -> str:
+        text = re.sub(r"\s+", "", text or "")
+        return re.sub(r"[，。！？、,.!?…~～ー\\/_\\-—\\[\\]（）()「」『』\"'`]+", "", text)
+
+    @staticmethod
+    def __probe_repetition_stats(text: str) -> Dict[str, float]:
+        chars = [char for char in AutoSubRemoteAsr.__clean_language_probe_text(text) if not char.isdigit()]
+        if not chars:
+            return {"length": 0, "unique_ratio": 0.0, "max_char_ratio": 1.0, "max_run_ratio": 1.0}
+        counts: Dict[str, int] = {}
+        max_run = 1
+        current_run = 1
+        previous = None
+        for char in chars:
+            counts[char] = counts.get(char, 0) + 1
+            if char == previous:
+                current_run += 1
+            else:
+                current_run = 1
+            previous = char
+            max_run = max(max_run, current_run)
+        length = len(chars)
+        return {
+            "length": length,
+            "unique_ratio": len(counts) / length,
+            "max_char_ratio": max(counts.values()) / length,
+            "max_run_ratio": max_run / length,
+        }
+
+    @staticmethod
+    def __language_script_score(text: str, language: str) -> float:
+        chars = [char for char in AutoSubRemoteAsr.__clean_language_probe_text(text) if char.isalpha()]
+        if not chars:
+            return 0.0
+
+        total = len(chars)
+        latin = 0
+        kana = 0
+        cjk = 0
+        hangul = 0
+        for char in chars:
+            code = ord(char)
+            if ("A" <= char <= "Z") or ("a" <= char <= "z"):
+                latin += 1
+            elif 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+                kana += 1
+            elif 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+                cjk += 1
+            elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:
+                hangul += 1
+
+        language = language or ""
+        if language == "ja":
+            kana_ratio = kana / total
+            if kana_ratio >= 0.08:
+                return min(1.0, (kana + cjk) / total)
+            if kana > 0:
+                return 0.65
+            return 0.35 if cjk / total >= 0.5 else 0.0
+        if language == "ko":
+            return hangul / total
+        if language == "zh":
+            if kana or hangul:
+                return 0.2
+            return cjk / total
+        if language == "en":
+            return latin / total
+        return max(latin, cjk, kana, hangul) / total
+
+    def __score_language_probe_response(self, response: dict, language: str) -> Dict[str, Any]:
+        text = (response or {}).get("text") or ""
+        segments = (response or {}).get("segments") or []
+        if not text and segments:
+            text = " ".join((segment.get("text") or "") for segment in segments)
+
+        avg_values = []
+        compression_values = []
+        no_speech_values = []
+        for segment in segments:
+            avg_logprob = self.__safe_float(segment.get("avg_logprob"))
+            compression_ratio = self.__safe_float(segment.get("compression_ratio"))
+            no_speech_prob = self.__safe_float(segment.get("no_speech_prob"))
+            if avg_logprob is not None:
+                avg_values.append(avg_logprob)
+            if compression_ratio is not None:
+                compression_values.append(compression_ratio)
+            if no_speech_prob is not None:
+                no_speech_values.append(no_speech_prob)
+
+        avg_logprob = sum(avg_values) / len(avg_values) if avg_values else None
+        compression_ratio = max(compression_values) if compression_values else None
+        no_speech_prob = max(no_speech_values) if no_speech_values else None
+        repeat_stats = self.__probe_repetition_stats(text)
+        script_score = self.__language_script_score(text, language)
+
+        reasons = []
+        if not language:
+            reasons.append("语言无效")
+        if repeat_stats["length"] < 4:
+            reasons.append("有效文本过短")
+        if compression_ratio is not None and compression_ratio > 2.4:
+            reasons.append(f"重复压缩比过高 {compression_ratio:.2f}")
+        if avg_logprob is not None and avg_logprob < -1.15:
+            reasons.append(f"置信度过低 {avg_logprob:.2f}")
+        if no_speech_prob is not None and no_speech_prob > 0.75:
+            reasons.append(f"静音概率过高 {no_speech_prob:.2f}")
+        if repeat_stats["length"] >= 20 and (
+                repeat_stats["max_char_ratio"] > 0.55
+                or repeat_stats["max_run_ratio"] > 0.25
+                or repeat_stats["unique_ratio"] < 0.08
+        ):
+            reasons.append("文本重复度过高")
+        if language in {"ja", "ko", "zh", "en"} and script_score <= 0.05:
+            reasons.append(f"字符集不匹配 {script_score:.2f}")
+
+        score = 1.0
+        if avg_logprob is not None:
+            if avg_logprob >= -0.35:
+                score *= 1.2
+            elif avg_logprob < -0.8:
+                score *= 0.55
+            elif avg_logprob < -0.55:
+                score *= 0.75
+        if no_speech_prob is not None:
+            if no_speech_prob > 0.55:
+                score *= 0.45
+            elif no_speech_prob > 0.35:
+                score *= 0.75
+        if compression_ratio is not None:
+            if compression_ratio > 2.0:
+                score *= 0.45
+            elif compression_ratio > 1.6:
+                score *= 0.75
+        if repeat_stats["length"] < 12:
+            score *= 0.55
+        if repeat_stats["length"] >= 20 and repeat_stats["unique_ratio"] < 0.16:
+            score *= 0.45
+        if language in {"ja", "ko", "zh", "en"}:
+            if script_score >= 0.6:
+                score *= 1.2
+            elif script_score < 0.25:
+                score *= 0.35
+
+        score = round(max(0.0, min(1.5, score)), 3)
+        if score < 0.25:
+            reasons.append(f"综合权重过低 {score:.2f}")
+
+        return {
+            "valid": not reasons,
+            "score": score,
+            "reason": "；".join(reasons),
+            "text_len": repeat_stats["length"],
+            "avg_logprob": avg_logprob,
+            "compression_ratio": compression_ratio,
+            "no_speech_prob": no_speech_prob,
+            "script_score": script_score,
+            "unique_ratio": repeat_stats["unique_ratio"],
+            "max_char_ratio": repeat_stats["max_char_ratio"],
+        }
+
+    @staticmethod
+    def __format_probe_metric(value: Optional[float]) -> str:
+        return "-" if value is None else f"{value:.2f}"
+
+    @staticmethod
+    def __select_language_probe_winner(scores: Dict[str, float], counts: Dict[str, int],
+                                       valid_count: int) -> Tuple[Optional[str], str]:
+        if valid_count < 3:
+            return None, f"有效样本不足 {valid_count}/3"
+        total_score = sum(scores.values())
+        if total_score <= 0:
+            return None, "有效样本总分为0"
+        ranking = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        language, score = ranking[0]
+        second_score = ranking[1][1] if len(ranking) > 1 else 0.0
+        share = score / total_score
+        ratio = score / second_score if second_score > 0 else 99.0
+        if counts.get(language, 0) < 2:
+            return None, f"最高语言 {language} 仅 {counts.get(language, 0)} 个有效样本"
+        if share < 0.60:
+            return None, f"最高语言 {language} 得分占比不足 {share:.2f}"
+        if second_score > 0 and ratio < 1.5 and score - second_score < 1.0:
+            return None, f"最高语言 {language} 与第二名差距不足，ratio={ratio:.2f}"
+        summary = ", ".join(
+            f"{lang}:{scores[lang]:.2f}/{counts.get(lang, 0)}"
+            for lang, _ in ranking
+        )
+        return language, f"score={summary}, share={share:.2f}, ratio={ratio:.2f}"
+
     def __detect_global_audio_language(self, video_file: str, audio_index: int, duration: float,
                                        audio_dir: str, task: Optional[TaskItem] = None) -> str:
         sample_seconds = 12
-        offsets = self.__build_language_probe_offsets(duration, sample_count=5, sample_seconds=sample_seconds)
-        if not offsets:
-            raise RuntimeError("auto模式全局语言探测失败：未读取到有效视频时长")
-
+        sample_count = 5
+        max_rounds = 3
         probe_dir = os.path.join(audio_dir, "language_probe")
-        votes: Dict[str, int] = {}
-        details = []
-        logger.info(
-            f"开始全局语言探测：避开开头结尾，随机抽取 {len(offsets)} 个 {sample_seconds} 秒音频小段"
-        )
-        self.__update_task_progress(task, 24, "全局语言检测",
-                                    f"随机抽取 {len(offsets)} 个音频小段判断语言", force=True)
+        scores: Dict[str, float] = {}
+        counts: Dict[str, int] = {}
+        valid_details = []
+        invalid_details = []
+        total_samples = 0
+        total_expected = sample_count * max_rounds
 
-        for index, offset in enumerate(offsets, 1):
-            if self._event.is_set():
-                raise UserInterruptException("用户中断当前任务")
-            sample_file = os.path.join(probe_dir, f"probe_{index:02d}.mp3")
-            ok, error = Ffmpeg().extract_audio_sample_from_video(
-                video_file,
-                sample_file,
-                audio_index=audio_index,
-                start_seconds=offset,
-                duration_seconds=sample_seconds,
-                stop_event=self._event,
-                threads=self._cpu_threads,
+        for round_no in range(1, max_rounds + 1):
+            offsets = self.__build_language_probe_offsets(
+                duration,
+                sample_count=sample_count,
+                sample_seconds=sample_seconds
             )
-            if self._event.is_set():
-                raise UserInterruptException("用户中断当前任务")
-            if not ok:
-                logger.warn(f"全局语言探测样本 {index}/{len(offsets)} 提取失败：{error}")
-                continue
-            try:
-                self.__validate_audio_chunk(sample_file, index, len(offsets), force=True)
-                self.__update_task_progress(task, 24, "全局语言检测",
-                                            f"样本 {index}/{len(offsets)} 上传ASR判断语言")
-                response = self.__transcribe_audio_chunk_with_progress(
+            if not offsets:
+                raise RuntimeError("auto模式全局语言探测失败：未读取到有效视频时长")
+
+            logger.info(
+                f"开始全局语言探测第 {round_no}/{max_rounds} 轮：避开开头结尾，"
+                f"随机抽取 {len(offsets)} 个 {sample_seconds} 秒音频小段"
+            )
+            self.__update_task_progress(task, 24, "全局语言检测",
+                                        f"第 {round_no}/{max_rounds} 轮随机抽取 {len(offsets)} 个音频小段",
+                                        force=True)
+
+            for index, offset in enumerate(offsets, 1):
+                total_samples += 1
+                if self._event.is_set():
+                    raise UserInterruptException("用户中断当前任务")
+                sample_file = os.path.join(probe_dir, f"probe_{total_samples:02d}.mp3")
+                ok, error = Ffmpeg().extract_audio_sample_from_video(
+                    video_file,
                     sample_file,
-                    "auto",
-                    index,
-                    len(offsets),
-                    task,
-                    24
+                    audio_index=audio_index,
+                    start_seconds=offset,
+                    duration_seconds=sample_seconds,
+                    stop_event=self._event,
+                    threads=self._cpu_threads,
                 )
-                raw_language = response.get("language")
-                language = self.__normalize_language_code(raw_language, fallback="")
-                if language and language != "und":
-                    votes[language] = votes.get(language, 0) + 1
-                    details.append(f"{index}:{language}")
-                    logger.info(
-                        f"全局语言探测样本 {index}/{len(offsets)}：offset={round(offset, 2)}s "
-                        f"language={raw_language} -> {language}"
-                    )
-                else:
-                    logger.warn(f"全局语言探测样本 {index}/{len(offsets)} 未返回有效语言：{raw_language}")
-            except Exception as err:
-                logger.warn(f"全局语言探测样本 {index}/{len(offsets)} 失败：{err}")
-            finally:
+                if self._event.is_set():
+                    raise UserInterruptException("用户中断当前任务")
+                if not ok:
+                    logger.warn(f"全局语言探测样本 {total_samples}/{total_expected} 提取失败：{error}")
+                    continue
                 try:
-                    os.remove(sample_file)
-                except Exception:
-                    pass
+                    self.__validate_audio_chunk(sample_file, total_samples, total_expected, force=True)
+                    self.__update_task_progress(task, 24, "全局语言检测",
+                                                f"样本 {total_samples}/{total_expected} 上传ASR判断语言")
+                    response = self.__transcribe_audio_chunk_with_progress(
+                        sample_file,
+                        "auto",
+                        total_samples,
+                        total_expected,
+                        task,
+                        24
+                    )
+                    raw_language = response.get("language")
+                    language = self.__normalize_language_code(raw_language, fallback="")
+                    quality = self.__score_language_probe_response(response, language)
+                    metric_text = (
+                        f"score={quality['score']:.2f} text_len={quality['text_len']} "
+                        f"avg={self.__format_probe_metric(quality['avg_logprob'])} "
+                        f"comp={self.__format_probe_metric(quality['compression_ratio'])} "
+                        f"nospeech={self.__format_probe_metric(quality['no_speech_prob'])} "
+                        f"script={quality['script_score']:.2f} unique={quality['unique_ratio']:.2f}"
+                    )
+                    if language and quality["valid"]:
+                        scores[language] = scores.get(language, 0.0) + quality["score"]
+                        counts[language] = counts.get(language, 0) + 1
+                        valid_details.append(f"{total_samples}:{language}/{quality['score']:.2f}")
+                        logger.info(
+                            f"全局语言探测样本 {total_samples}/{total_expected}：offset={round(offset, 2)}s "
+                            f"language={raw_language} -> {language} {metric_text}"
+                        )
+                    else:
+                        reason = quality["reason"] or "语言无效"
+                        invalid_details.append(f"{total_samples}:{raw_language or '-'}:{reason}")
+                        logger.warn(
+                            f"全局语言探测样本 {total_samples}/{total_expected} 无效："
+                            f"offset={round(offset, 2)}s language={raw_language} -> {language or '-'} "
+                            f"{metric_text} reason={reason}"
+                        )
+                except Exception as err:
+                    invalid_details.append(f"{total_samples}:error:{err}")
+                    logger.warn(f"全局语言探测样本 {total_samples}/{total_expected} 失败：{err}")
+                finally:
+                    try:
+                        os.remove(sample_file)
+                    except Exception:
+                        pass
 
-        if not votes:
-            raise RuntimeError("auto模式全局语言探测失败：5个随机样本均未得到有效语言")
+            winner, reason = self.__select_language_probe_winner(scores, counts, len(valid_details))
+            if winner:
+                logger.info(
+                    f"全局语言探测完成：language={winner}，{reason}，"
+                    f"valid={', '.join(valid_details)}，invalid={', '.join(invalid_details[-6:])}"
+                )
+                self.__update_task_progress(task, 24, "全局语言检测",
+                                            f"语言锁定为 {winner}，后续分段统一使用该语言", force=True)
+                return winner
 
-        language, count = sorted(votes.items(), key=lambda item: (-item[1], item[0]))[0]
-        logger.info(
-            f"全局语言探测完成：language={language}，投票 {count}/{len(details) or len(offsets)}，"
-            f"details={', '.join(details)}"
+            logger.warn(
+                f"全局语言探测第 {round_no}/{max_rounds} 轮未锁定：{reason}，"
+                f"valid={', '.join(valid_details) or '-'}"
+            )
+            self.__update_task_progress(task, 24, "全局语言检测",
+                                        f"第 {round_no}/{max_rounds} 轮未锁定：{reason}", force=True)
+
+        score_summary = ", ".join(
+            f"{lang}:{scores[lang]:.2f}/{counts.get(lang, 0)}"
+            for lang, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        ) or "-"
+        raise RuntimeError(
+            f"auto模式全局语言探测失败：最多 {total_samples} 个随机样本仍无法稳定判断，"
+            f"score={score_summary}"
         )
-        self.__update_task_progress(task, 24, "全局语言检测",
-                                    f"语言锁定为 {language}，后续分段统一使用该语言", force=True)
-        return language
 
     @staticmethod
     def __get_chunk_no(chunk_file: str) -> int:
