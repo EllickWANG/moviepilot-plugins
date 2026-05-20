@@ -98,13 +98,13 @@ class AutoSubRemoteAsr(_PluginBase):
     # 插件名称
     plugin_name = "AI字幕自动生成(接口ASR)"
     # 插件描述
-    plugin_desc = "使用远程语音识别接口生成字幕，并复用私有版接口配置翻译中文字幕。"
+    plugin_desc = "使用远程语音识别接口生成字幕，并通过当前插件接口配置翻译中文字幕。"
     # 插件图标
     plugin_icon = "mdi-subtitles-outline"
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.36"
+    plugin_version = "1.0.37"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -143,7 +143,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _asr_random_check_rate = 0.2
     _asr_request_retries = 3
     _asr_retry_delays = (10, 30, 60)
-    _reuse_autosub_config = True
+    _reuse_autosub_config = False
     _openai_api_key = None
     _openai_api_url = None
     _openai_api_proxy = False
@@ -286,7 +286,7 @@ class AutoSubRemoteAsr(_PluginBase):
             "url": source_config.get("openai_url") or "https://api.openai.com",
             "proxy": bool(source_config.get("openai_proxy", False)),
             "model": source_config.get("openai_model") or "gpt-3.5-turbo",
-            "compatible": bool(source_config.get("compatible", False)),
+            "compatible": False if source_name == "当前插件" else bool(source_config.get("compatible", False)),
             "source": source_name,
         }
 
@@ -297,10 +297,9 @@ class AutoSubRemoteAsr(_PluginBase):
         self._openai_api_compatible = False
         self._openai_model = None
 
-        sources = []
+        sources = [(config, "当前插件")]
         if self._reuse_autosub_config:
-            sources.append((self.get_config("AutoSubv2Plus"), "AI字幕自动生成(v2) 私有版"))
-        sources.append((config, "当前插件"))
+            sources.append((self.get_config("AutoSubv2Plus"), "AI字幕自动生成(v2) 私有版历史配置"))
 
         for source_config, source_name in sources:
             settings_data = self.__extract_openai_settings(source_config, source_name)
@@ -370,7 +369,7 @@ class AutoSubRemoteAsr(_PluginBase):
             asr_prompt = self.__default_asr_prompt()
         self._asr_prompt = str(asr_prompt or "").strip()
         self._translate_request_timeout = self.__normalize_request_timeout(config.get('translate_request_timeout'), 120)
-        self._reuse_autosub_config = bool(config.get('reuse_autosub_config', True))
+        self._reuse_autosub_config = bool(config.get('reuse_autosub_config', False))
         self._auto_detect_language = config.get('auto_detect_language', False)
         self._translate_zh = config.get('translate_zh', False)
         self._enable_batch = config.get('enable_batch', True)
@@ -391,7 +390,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
         api_required = self._translate_zh or self._enable_asr
         if api_required and not self.__resolve_openai_settings(config):
-            logger.error("接口ASR或中文字幕翻译需要大模型接口配置，请复用私有版配置或在当前插件中维护接口")
+            logger.error("接口ASR或中文字幕翻译需要大模型接口配置，请在当前插件中维护接口地址和密钥")
             return
 
         if self._translate_zh:
@@ -707,6 +706,14 @@ class AutoSubRemoteAsr(_PluginBase):
             return False
         text = f"{task.progress_stage or ''} {task.progress_detail or ''}"
         markers = ("已存在字幕", "已有字幕", "目标字幕已存在", "字幕文件已经存在", "外挂字幕", "内嵌字幕", "硬字幕")
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def __is_same_language_skip_task(task: TaskItem) -> bool:
+        if not task or task.status != TaskStatus.COMPLETED:
+            return False
+        text = f"{task.progress_stage or ''} {task.progress_detail or ''}"
+        markers = ("同语言跳过", "无需翻译", "原始语言已是中文", "源字幕语言已是中文", "字幕已是中文")
         return any(marker in text for marker in markers)
 
     def load_tasks(self) -> Dict[str, TaskItem]:
@@ -1249,7 +1256,16 @@ class AutoSubRemoteAsr(_PluginBase):
                 ] else None
                 if task.status == TaskStatus.COMPLETED:
                     self.__clear_task_checkpoints(task)
-                    self.__update_task_progress(task, 100, "处理完成", "字幕处理完成", force=True)
+                    if self.__is_same_language_skip_task(task):
+                        self.__update_task_progress(
+                            task,
+                            100,
+                            "同语言跳过",
+                            task.progress_detail or "字幕语言已是中文，无需生成机翻字幕",
+                            force=True,
+                        )
+                    else:
+                        self.__update_task_progress(task, 100, "处理完成", "字幕处理完成", force=True)
                 elif task.status == TaskStatus.IGNORED:
                     self.__clear_task_checkpoints(task)
                     ignored_stage = "已存在字幕" if self.__is_existing_subtitle_task(task) else "已忽略"
@@ -1540,7 +1556,7 @@ class AutoSubRemoteAsr(_PluginBase):
             if self._translate_zh:
                 if self.__is_chinese_language(lang):
                     logger.info(f"原始字幕语言已是中文（{lang}），跳过中文字幕翻译和机翻字幕生成")
-                    self.__update_task_progress(task, 98, "跳过翻译", f"原始语言已是中文：{lang}", force=True)
+                    self.__update_task_progress(task, 98, "同语言跳过", f"原始语言已是中文：{lang}", force=True)
                 else:
                     # 翻译字幕
                     logger.info(f"开始翻译字幕为中文 ...")
@@ -3067,7 +3083,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                 task: Optional[TaskItem] = None):
         if self.__is_chinese_language(source_lang):
             logger.info(f"源字幕语言已是中文（{source_lang}），跳过翻译，不生成机翻字幕：{dest_subtitle}")
-            self.__update_task_progress(task, 98, "跳过翻译", f"源字幕语言已是中文：{source_lang}", force=True)
+            self.__update_task_progress(task, 98, "同语言跳过", f"源字幕语言已是中文：{source_lang}", force=True)
             return True
 
         stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0, 'line_fail': 0}
@@ -3612,7 +3628,7 @@ class AutoSubRemoteAsr(_PluginBase):
         }
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        run_settings = self.__form_card("运行设置", "控制扫描入口和后台任务队列", [
+        base_settings = self.__form_card("基础开关", "插件是否运行，以及哪些入口可以创建任务", [
             {
                 "component": "VRow",
                 "content": [
@@ -3622,6 +3638,9 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__form_col(self.__form_switch("send_notify", "发送通知"), md=3),
                 ],
             },
+        ])
+
+        scan_settings = self.__form_card("扫描与队列", "控制扫描范围、定时周期和后台并行", [
             {
                 "component": "VRow",
                 "content": [
@@ -3642,7 +3661,21 @@ class AutoSubRemoteAsr(_PluginBase):
                             "*/10 * * * *",
                             "默认每10分钟扫描一次",
                         ),
-                        md=2,
+                        md=4,
+                    ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "parallel_tasks",
+                            "并行任务数",
+                            "1",
+                            "同一时间处理的视频数量",
+                        ),
+                        md=4,
                     ),
                     self.__form_col(
                         self.__form_text(
@@ -3651,18 +3684,27 @@ class AutoSubRemoteAsr(_PluginBase):
                             "10",
                             "文件未完整时等待后重新检查",
                         ),
-                        md=2,
+                        md=4,
+                    ),
+                    self.__form_col(
+                        self.__form_switch(
+                            "full_integrity_check",
+                            "完整解码校验",
+                            "高CPU，仅排查视频损坏时开启",
+                        ),
+                        md=4,
                     ),
                 ],
             },
         ])
 
-        process_settings = self.__form_card("处理策略", "控制字幕来源、任务并行和翻译批次", [
+        subtitle_settings = self.__form_card("字幕策略", "控制字幕来源、语言判断和 ASR 分段", [
             {
                 "component": "VRow",
                 "content": [
-                    self.__form_col(self.__form_switch("enable_asr", "允许从音轨生成字幕"), md=3),
+                    self.__form_col(self.__form_switch("enable_asr", "无字幕时调用ASR"), md=3),
                     self.__form_col(self.__form_switch("translate_zh", "翻译成中文"), md=3),
+                    self.__form_col(self.__form_switch("auto_detect_language", "ASR自动检测语言"), md=3),
                     self.__form_col(
                         self.__form_select(
                             "translate_preference",
@@ -3675,64 +3717,11 @@ class AutoSubRemoteAsr(_PluginBase):
                         ),
                         md=3,
                     ),
-                    self.__form_col(self.__form_switch("auto_detect_language", "ASR自动检测语言"), md=3),
                 ],
             },
             {
                 "component": "VRow",
                 "content": [
-                    self.__form_col(
-                        self.__form_text(
-                            "parallel_tasks",
-                            "并行任务数",
-                            "1",
-                            "同一时间处理的视频数量，接口不稳定时建议谨慎调高",
-                        ),
-                        md=4,
-                    ),
-                    self.__form_col(
-                        self.__form_text(
-                            "translate_concurrency",
-                            "翻译接口并发数",
-                            "1",
-                            "同一时间发起的翻译请求数量，接口不稳定时建议保持1",
-                        ),
-                        md=4,
-                    ),
-                    self.__form_col(
-                        self.__form_text(
-                            "batch_size",
-                            "每批翻译行数",
-                            "20",
-                            "建议20-25；接口稳定时再提高",
-                        ),
-                        md=4,
-                    ),
-                ],
-            },
-        ])
-
-        api_settings = self.__form_card("接口设置", "复用私有版配置，或为当前插件单独配置接口", [
-            {
-                "component": "VRow",
-                "content": [
-                    self.__form_col(
-                        self.__form_switch(
-                            "reuse_autosub_config",
-                            "复用私有版接口配置",
-                            "关闭后使用当前插件填写的接口地址、密钥和模型",
-                            color="primary",
-                        ),
-                        md=3,
-                    ),
-                    self.__form_col(
-                        self.__form_switch(
-                            "detailed_log",
-                            "详细接口日志",
-                            "开启后记录完整接口入参和返回，日志量很大，排查问题时再开启",
-                        ),
-                        md=3,
-                    ),
                     self.__form_col(
                         self.__form_text(
                             "asr_api_model",
@@ -3743,131 +3732,142 @@ class AutoSubRemoteAsr(_PluginBase):
                         md=3,
                     ),
                     self.__form_col(
-                        self.__form_text("openai_model", "翻译模型", "gpt-5-chat-latest",
-                                         props={"v-show": "!reuse_autosub_config"}),
+                        self.__form_text(
+                            "asr_chunk_minutes",
+                            "音频分段分钟",
+                            "10",
+                            "范围5-30；过短会增加接口调用",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "asr_request_timeout",
+                            "ASR超时秒",
+                            "300",
+                            "单段ASR请求超时后重试",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text("max_retries", "接口重试次数", "3"),
                         md=3,
                     ),
                 ],
             },
             {
                 "component": "VRow",
-                "props": {"v-show": "!reuse_autosub_config"},
                 "content": [
-                    self.__form_col(self.__form_text("openai_url", "接口地址", "https://api.openai.com"), md=4),
-                    self.__form_col(self.__form_text("openai_key", "API密钥", "sk-xxx"), md=4),
                     self.__form_col(
-                        [
-                            self.__form_switch("openai_proxy", "使用代理服务器"),
-                            self.__form_switch("compatible", "兼容模式"),
-                        ],
-                        md=4,
+                        self.__form_textarea(
+                            "asr_prompt",
+                            "ASR提示词",
+                            self.__default_asr_prompt(),
+                            "传给音频转写接口；用于固定原文转写风格，留空则不发送",
+                            rows=2,
+                        ),
+                        md=12,
                     ),
                 ],
             },
         ])
 
-        advanced_settings = {
-            "component": "VExpansionPanels",
-            "props": {"variant": "accordion"},
-            "content": [
-                {
-                    "component": "VExpansionPanel",
-                    "content": [
-                        {"component": "VExpansionPanelTitle", "text": "高级设置"},
-                        {
-                            "component": "VExpansionPanelText",
-                            "content": [
-                                {
-                                    "component": "VRow",
-                                    "content": [
-                                        self.__form_col(
-                                            self.__form_text(
-                                                "asr_chunk_minutes",
-                                                "音频分段分钟",
-                                                "10",
-                                                "范围5-30，建议10-15；过短会增加接口调用次数",
-                                            ),
-                                            md=4,
-                                        ),
-                                        self.__form_col(
-                                            self.__form_text(
-                                                "asr_request_timeout",
-                                                "ASR超时秒",
-                                                "300",
-                                                "单段ASR请求超过此时间会放弃并重试",
-                                            ),
-                                            md=4,
-                                        ),
-                                        self.__form_col(
-                                            self.__form_text(
-                                                "translate_request_timeout",
-                                                "翻译超时秒",
-                                                "120",
-                                                "单次翻译请求超过此时间会放弃并重试",
-                                            ),
-                                            md=4,
-                                        ),
-                                    ],
-                                },
-                                {
-                                    "component": "VRow",
-                                    "content": [
-                                        self.__form_col(
-                                            self.__form_textarea(
-                                                "asr_prompt",
-                                                "ASR提示词",
-                                                self.__default_asr_prompt(),
-                                                "传给音频转写接口；用于固定原文转写风格，留空则不发送",
-                                                rows=2,
-                                            ),
-                                            md=12,
-                                        ),
-                                    ],
-                                },
-                                {
-                                    "component": "VRow",
-                                    "content": [
-                                        self.__form_col(
-                                            self.__form_text("context_window", "上下文窗口", "5"),
-                                            md=4,
-                                        ),
-                                        self.__form_col(
-                                            self.__form_text("max_retries", "接口重试次数", "3"),
-                                            md=4,
-                                        ),
-                                        self.__form_col(
-                                            self.__form_switch(
-                                                "enable_merge",
-                                                "翻译英文时合并整句",
-                                                "仅英文字幕需要时开启",
-                                            ),
-                                            md=4,
-                                        ),
-                                        self.__form_col(
-                                            self.__form_switch(
-                                                "full_integrity_check",
-                                                "完整解码校验",
-                                                "高CPU，仅排查视频损坏时开启",
-                                            ),
-                                            md=4,
-                                        ),
-                                    ],
-                                }
-                            ],
-                        },
-                    ],
-                }
-            ],
-        }
+        api_settings = self.__form_card("接口配置", "当前插件独立维护接口地址、密钥和模型", [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "openai_url",
+                            "接口地址",
+                            "https://api.openai.com",
+                            "填写 OpenAI 兼容接口根地址；带不带 /v1 都可以",
+                        ),
+                        md=4,
+                    ),
+                    self.__form_col(self.__form_text("openai_key", "API密钥", "sk-xxx"), md=4),
+                    self.__form_col(
+                        self.__form_text(
+                            "openai_model",
+                            "翻译模型",
+                            "gpt-5-chat-latest",
+                            "只用于中文字幕翻译，不影响ASR模型",
+                        ),
+                        md=4,
+                    ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "translate_request_timeout",
+                            "翻译超时秒",
+                            "120",
+                            "单次翻译请求超时后重试",
+                        ),
+                        md=4,
+                    ),
+                    self.__form_col(
+                        [
+                            self.__form_switch("openai_proxy", "使用代理服务器"),
+                            self.__form_switch(
+                                "detailed_log",
+                                "详细接口日志",
+                                "记录完整接口入参和返回，排查问题时再开启",
+                            ),
+                        ],
+                        md=8,
+                    ),
+                ],
+            },
+        ])
+
+        translate_settings = self.__form_card("翻译参数", "控制字幕翻译批次、上下文和并发", [
+            {
+                "component": "VRow",
+                "content": [
+                    self.__form_col(
+                        self.__form_text(
+                            "translate_concurrency",
+                            "翻译接口并发数",
+                            "1",
+                            "同一时间发起的翻译请求数量",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "batch_size",
+                            "每批翻译行数",
+                            "20",
+                            "建议20-25；接口稳定时再提高",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(self.__form_text("context_window", "上下文窗口", "5"), md=3),
+                    self.__form_col(
+                        self.__form_switch(
+                            "enable_merge",
+                            "英文字幕合并整句",
+                            "仅英文字幕需要时开启",
+                        ),
+                        md=3,
+                    ),
+                ],
+            },
+        ])
 
         return [
             {
                 "component": "VForm",
                 "content": [
-                    run_settings,
-                    process_settings,
+                    base_settings,
+                    scan_settings,
+                    subtitle_settings,
                     api_settings,
-                    advanced_settings,
+                    translate_settings,
                 ],
             }
         ], {
@@ -3889,15 +3889,12 @@ class AutoSubRemoteAsr(_PluginBase):
             "translate_zh": True,
             "enable_asr": True,
             "auto_detect_language": True,
-            "reuse_autosub_config": True,
             "asr_api_model": "whisper-1",
             "asr_chunk_minutes": 10,
             "asr_request_timeout": 300,
             "asr_prompt": self.__default_asr_prompt(),
             "translate_request_timeout": 120,
-            "use_chatgpt": False,
             "openai_proxy": False,
-            "compatible": False,
             "openai_url": "https://api.openai.com",
             "openai_key": None,
             "openai_model": "gpt-5-chat-latest",
@@ -4675,7 +4672,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def api_page_tab(self, payload: Optional[Dict[str, Any]] = None) -> schemas.Response:
         tab = (payload or {}).get("tab") or "queue"
-        if tab not in {"queue", "waiting_file", "existing_subtitle"}:
+        if tab not in {"queue", "waiting_file", "existing_subtitle", "same_language"}:
             tab = "queue"
         self.save_data("page_tab", tab)
         return schemas.Response(success=True, message="已切换任务页签")
@@ -5008,8 +5005,13 @@ class AutoSubRemoteAsr(_PluginBase):
         for task in task_list[:200]:
             filename = os.path.basename(task.video_file) or task.video_file
             existing_subtitle = self.__is_existing_subtitle_task(task)
-            status_label = "已存在字幕" if existing_subtitle else self.__status_label(task.status)
-            status_color = "success" if existing_subtitle else self.__status_color(task.status)
+            same_language = self.__is_same_language_skip_task(task)
+            status_label = (
+                "已存在字幕" if existing_subtitle
+                else "无需翻译" if same_language
+                else self.__status_label(task.status)
+            )
+            status_color = "success" if existing_subtitle or same_language else self.__status_color(task.status)
             rows.append({
                 "component": "tr",
                 "content": [
@@ -5115,11 +5117,13 @@ class AutoSubRemoteAsr(_PluginBase):
         }
 
     def __task_tabs(self, queue_tasks: List[TaskItem], waiting_file_tasks: List[TaskItem],
-                    existing_subtitle_tasks: List[TaskItem], selected_tab: str) -> dict:
+                    existing_subtitle_tasks: List[TaskItem], same_language_tasks: List[TaskItem],
+                    selected_tab: str) -> dict:
         tab_data = {
             "queue": (queue_tasks, "暂无处理队列任务"),
             "waiting_file": (waiting_file_tasks, "暂无等待文件完整任务"),
             "existing_subtitle": (existing_subtitle_tasks, "暂无已存在字幕任务"),
+            "same_language": (same_language_tasks, "暂无无需翻译任务"),
         }
         selected_tab = selected_tab if selected_tab in tab_data else "queue"
         active_tasks, empty_text = tab_data[selected_tab]
@@ -5149,6 +5153,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                         self.__task_tab("waiting_file", f"等待文件完整 ({len(waiting_file_tasks)})"),
                                         self.__task_tab("existing_subtitle",
                                                         f"已存在字幕 ({len(existing_subtitle_tasks)})"),
+                                        self.__task_tab("same_language", f"无需翻译 ({len(same_language_tasks)})"),
                                     ],
                                 },
                                 {"component": "VDivider"},
@@ -5174,9 +5179,12 @@ class AutoSubRemoteAsr(_PluginBase):
         processing_tasks = [task for task in tasks if task.status == TaskStatus.IN_PROGRESS]
         waiting_file_tasks = [task for task in tasks if self.__is_waiting_file_task(task)]
         existing_subtitle_tasks = [task for task in tasks if self.__is_existing_subtitle_task(task)]
+        same_language_tasks = [task for task in tasks if self.__is_same_language_skip_task(task)]
         queue_tasks = [
             task for task in tasks
-            if not self.__is_waiting_file_task(task) and not self.__is_existing_subtitle_task(task)
+            if not self.__is_waiting_file_task(task)
+            and not self.__is_existing_subtitle_task(task)
+            and not self.__is_same_language_skip_task(task)
         ]
         selected_tab = self.get_data("page_tab") or "queue"
         latest_update = None
@@ -5214,6 +5222,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 self.__page_metric("失败", counts.get(TaskStatus.FAILED, 0), "error"),
                 self.__page_metric("已完成", counts.get(TaskStatus.COMPLETED, 0), "success"),
                 self.__page_metric("已存在字幕", len(existing_subtitle_tasks), "success"),
+                self.__page_metric("无需翻译", len(same_language_tasks), "success"),
                 self.__page_metric("其他忽略", max(0, counts.get(TaskStatus.IGNORED, 0) - len(existing_subtitle_tasks)),
                                    "grey"),
                 {
@@ -5258,7 +5267,13 @@ class AutoSubRemoteAsr(_PluginBase):
             ],
         }
 
-        task_table = self.__task_tabs(queue_tasks, waiting_file_tasks, existing_subtitle_tasks, selected_tab)
+        task_table = self.__task_tabs(
+            queue_tasks,
+            waiting_file_tasks,
+            existing_subtitle_tasks,
+            same_language_tasks,
+            selected_tab,
+        )
 
         return [action_row, summary, processing_section, task_table]
 
