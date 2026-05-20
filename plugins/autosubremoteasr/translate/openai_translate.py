@@ -72,6 +72,12 @@ class OpenAi:
         if model:
             self._model = model
 
+    def close(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
     @staticmethod
     def __save_session(session_id: str, message: str):
         """

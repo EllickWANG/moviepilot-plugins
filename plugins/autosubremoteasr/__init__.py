@@ -64,8 +64,10 @@ class AsrChannel:
     url: str
     key: str
     model: str
+    translate_model: str = ""
     priority: int = 100
     timeout: int = 300
+    translate_timeout: int = 120
     proxy: bool = False
     enabled: bool = True
     response_format: str = "verbose_json"
@@ -129,7 +131,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.57"
+    plugin_version = "1.0.58"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -167,9 +169,15 @@ class AutoSubRemoteAsr(_PluginBase):
     _translate_request_timeout = 120
     _asr_random_check_rate = 0.2
     _asr_retry_delays = (10, 30, 60)
+    _api_channels: List[AsrChannel] = None
     _asr_channels: List[AsrChannel] = None
     _asr_channel_states: Dict[str, dict] = None
     _asr_last_success_channel_id = None
+    _translate_channels: List[AsrChannel] = None
+    _translate_channel_states: Dict[str, dict] = None
+    _translate_last_success_channel_id = None
+    _translate_channel_retries = 1
+    _translate_max_channel_attempts = 6
     _asr_channel_retries = 1
     _asr_max_channel_attempts = 6
     _asr_error_cooldown_seconds = 5 * 60
@@ -225,6 +233,8 @@ class AutoSubRemoteAsr(_PluginBase):
             self._translate_lock = threading.Semaphore(1)
         if self._asr_channel_states is None:
             self._asr_channel_states = {}
+        if self._translate_channel_states is None:
+            self._translate_channel_states = {}
 
     @staticmethod
     def __normalize_parallel_tasks(value) -> int:
@@ -297,7 +307,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 "name": "主接口",
                 "url": "https://api.openai.com",
                 "key": "sk-xxx",
-                "model": "whisper-1",
+                "asr_model": "whisper-1",
+                "translate_model": "gpt-5-chat-latest",
                 "priority": 1,
                 "timeout": 300,
                 "proxy": False
@@ -306,7 +317,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 "name": "备用接口",
                 "url": "https://api.groq.com/openai/v1",
                 "key": "gsk-xxx",
-                "model": "whisper-large-v3-turbo",
+                "asr_model": "whisper-large-v3-turbo",
+                "translate_model": "gpt-4o-mini",
                 "priority": 2,
                 "timeout": 180,
                 "proxy": False
@@ -584,36 +596,61 @@ class AutoSubRemoteAsr(_PluginBase):
                 client_kwargs["proxies"] = proxy_url
         return httpx.Client(**client_kwargs)
 
-    def __build_asr_channel(self, item: dict, index: int) -> Optional[AsrChannel]:
+    def __build_api_channel(self, item: dict, index: int, config: Optional[dict] = None) -> Optional[AsrChannel]:
         if not isinstance(item, dict):
             return None
+        config = config or {}
         key = self.__pick_first_key(item.get("key") or item.get("openai_key") or item.get("api_key"))
         url = str(item.get("url") or item.get("openai_url") or item.get("api_url") or "").strip()
-        model = str(item.get("model") or item.get("asr_api_model") or "").strip()
-        if not key or not url or not model:
+        asr_model = None
+        for model_key in ("asr_model", "asr_api_model", "model"):
+            if model_key in item:
+                asr_model = str(item.get(model_key) or "").strip()
+                break
+        if asr_model is None:
+            asr_model = str(config.get("asr_api_model") or "").strip()
+        translate_model = None
+        for model_key in ("translate_model", "openai_model", "chat_model"):
+            if model_key in item:
+                translate_model = str(item.get(model_key) or "").strip()
+                break
+        if translate_model is None:
+            translate_model = str(config.get("openai_model") or "").strip()
+        if not key or not url or not (asr_model or translate_model):
             return None
-        name = str(item.get("name") or item.get("title") or f"ASR通道{index}").strip()
+        name = str(item.get("name") or item.get("title") or f"接口{index}").strip()
         priority = self.__normalize_int(item.get("priority"), index, 1, 999)
-        timeout = self.__normalize_request_timeout(item.get("timeout"), self._asr_request_timeout or 300)
+        timeout = self.__normalize_request_timeout(
+            item.get("asr_timeout") or item.get("timeout"),
+            self._asr_request_timeout or 300
+        )
+        translate_timeout = self.__normalize_request_timeout(
+            item.get("translate_timeout") or item.get("timeout"),
+            self._translate_request_timeout or 120
+        )
         response_format = str(item.get("response_format") or "verbose_json").strip() or "verbose_json"
         raw_id = str(item.get("id") or item.get("channel_id") or "").strip()
         if not raw_id:
-            raw_id = hashlib.sha1(f"{name}|{url}|{model}|{priority}".encode("utf-8")).hexdigest()[:12]
+            raw_id = hashlib.sha1(
+                f"{name}|{url}|{asr_model}|{translate_model}|{priority}".encode("utf-8")
+            ).hexdigest()[:12]
         return AsrChannel(
             channel_id=raw_id,
             name=name,
             url=url,
             key=key,
-            model=model,
+            model=asr_model,
+            translate_model=translate_model,
             priority=priority,
             timeout=timeout,
+            translate_timeout=translate_timeout,
             proxy=self.__normalize_bool(item.get("proxy"), False),
             enabled=self.__normalize_bool(item.get("enabled"), True),
             response_format=response_format,
             require_segments=self.__normalize_bool(item.get("require_segments"), True),
         )
 
-    def __parse_asr_channels_raw(self, raw_value: Any) -> List[dict]:
+    def __parse_api_channels_raw(self, raw_value: Any) -> List[dict]:
         if not raw_value:
             return []
         if isinstance(raw_value, list):
@@ -647,40 +684,49 @@ class AutoSubRemoteAsr(_PluginBase):
                 pass
             parts = [part.strip() for part in line.split("|")]
             if len(parts) >= 4:
-                items.append({
+                item = {
                     "name": parts[0],
                     "url": parts[1],
                     "key": parts[2],
-                    "model": parts[3],
-                    "priority": parts[4] if len(parts) >= 5 else len(items) + 1,
-                    "timeout": parts[5] if len(parts) >= 6 else self._asr_request_timeout,
-                })
+                    "asr_model": parts[3],
+                    "priority": parts[5] if len(parts) >= 6 else len(items) + 1,
+                    "timeout": parts[6] if len(parts) >= 7 else self._asr_request_timeout,
+                }
+                if len(parts) >= 5:
+                    item["translate_model"] = parts[4]
+                items.append(item)
         return items
 
-    def __normalize_asr_channels(self, config: dict) -> List[AsrChannel]:
-        raw_items = self.__parse_asr_channels_raw(
-            config.get("asr_channels") or config.get("asr_channels_json")
+    def __normalize_api_channels(self, config: dict) -> List[AsrChannel]:
+        raw_items = self.__parse_api_channels_raw(
+            config.get("api_channels")
+            or config.get("api_channels_json")
+            or config.get("asr_channels")
+            or config.get("asr_channels_json")
         )
         channels = []
         for index, item in enumerate(raw_items, 1):
-            channel = self.__build_asr_channel(item, index)
+            channel = self.__build_api_channel(item, index, config)
             if channel:
                 channels.append(channel)
 
         if not channels:
             fallback_key = self.__pick_first_key(config.get("asr_openai_key") or config.get("openai_key"))
             fallback_url = config.get("asr_openai_url") or config.get("openai_url") or "https://api.openai.com"
-            fallback_model = config.get("asr_api_model") or "whisper-1"
-            if fallback_key and fallback_url and fallback_model:
-                channel = self.__build_asr_channel({
-                    "name": "默认ASR接口",
+            fallback_asr_model = config.get("asr_api_model") or "whisper-1"
+            fallback_translate_model = config.get("openai_model") or "gpt-5-chat-latest"
+            if fallback_key and fallback_url and (fallback_asr_model or fallback_translate_model):
+                channel = self.__build_api_channel({
+                    "name": "默认接口",
                     "url": fallback_url,
                     "key": fallback_key,
-                    "model": fallback_model,
+                    "asr_model": fallback_asr_model,
+                    "translate_model": fallback_translate_model,
                     "priority": 1,
-                    "timeout": self._asr_request_timeout,
+                    "asr_timeout": self._asr_request_timeout,
+                    "translate_timeout": self._translate_request_timeout,
                     "proxy": config.get("openai_proxy", False),
-                }, 1)
+                }, 1, config)
                 if channel:
                     channels.append(channel)
 
@@ -691,9 +737,19 @@ class AutoSubRemoteAsr(_PluginBase):
     def __asr_channel_label(channel: AsrChannel) -> str:
         return f"{channel.name}/{channel.model}" if channel else "-"
 
+    @staticmethod
+    def __translate_channel_label(channel: AsrChannel) -> str:
+        return f"{channel.name}/{channel.translate_model}" if channel else "-"
+
     def __asr_models_label(self) -> str:
         models = list(dict.fromkeys([channel.model for channel in self._asr_channels or [] if channel.model]))
         return ", ".join(models) if models else self._asr_api_model or "-"
+
+    def __translate_models_label(self) -> str:
+        models = list(dict.fromkeys([
+            channel.translate_model for channel in self._translate_channels or [] if channel.translate_model
+        ]))
+        return ", ".join(models) if models else self._openai_model or "-"
 
     def __get_asr_base_url(self, channel: AsrChannel) -> str:
         base_url = channel.url.rstrip("/") if channel and channel.url else "https://api.openai.com"
@@ -804,6 +860,93 @@ class AutoSubRemoteAsr(_PluginBase):
             parts.append(f"{channel.name}({channel.model}) {status}")
         return "；".join(parts) if parts else "未配置ASR通道"
 
+    def __translate_channel_state(self, channel: AsrChannel) -> dict:
+        self.__ensure_runtime_state()
+        return self._translate_channel_states.setdefault(channel.channel_id, {})
+
+    def __translate_channel_available(self, channel: AsrChannel, now: Optional[datetime] = None) -> bool:
+        state = self.__translate_channel_state(channel)
+        if state.get("incompatible"):
+            return False
+        cooldown_until = state.get("cooldown_until")
+        if cooldown_until:
+            now = now or datetime.now()
+            try:
+                if datetime.fromisoformat(cooldown_until) > now:
+                    return False
+            except Exception:
+                state.pop("cooldown_until", None)
+        return True
+
+    def __ordered_translate_channels(self) -> List[AsrChannel]:
+        now = datetime.now()
+        channels = [
+            channel for channel in self._translate_channels or []
+            if channel.translate_model and self.__translate_channel_available(channel, now)
+        ]
+        if self._translate_last_success_channel_id:
+            preferred = [channel for channel in channels if channel.channel_id == self._translate_last_success_channel_id]
+            others = [channel for channel in channels if channel.channel_id != self._translate_last_success_channel_id]
+            if preferred:
+                channels = preferred + others
+        return channels
+
+    @staticmethod
+    def __is_translate_incompatible_error(err: Exception) -> bool:
+        text = str(err or "").lower()
+        return any(token in text for token in (
+            "unsupported_value",
+            "unsupported model",
+            "invalid model",
+            "model_not_found",
+            "does not exist",
+            "not compatible",
+            "response_format",
+        ))
+
+    def __record_translate_channel_success(self, channel: AsrChannel):
+        state = self.__translate_channel_state(channel)
+        state["failures"] = 0
+        state.pop("cooldown_until", None)
+        state.pop("last_error", None)
+        state["last_success"] = datetime.now().isoformat()
+        self._translate_last_success_channel_id = channel.channel_id
+
+    def __record_translate_channel_failure(self, channel: AsrChannel, err: Exception):
+        state = self.__translate_channel_state(channel)
+        state["failures"] = int(state.get("failures") or 0) + 1
+        state["last_error"] = str(err)[:300]
+        state["last_failure"] = datetime.now().isoformat()
+        if self.__is_translate_incompatible_error(err):
+            state["incompatible"] = True
+            logger.warn(f"翻译通道已标记不兼容：{self.__translate_channel_label(channel)} - {err}")
+            return
+        cooldown = self.__asr_channel_cooldown_seconds(err)
+        if cooldown > 0:
+            state["cooldown_until"] = (datetime.now() + timedelta(seconds=cooldown)).isoformat()
+            logger.warn(
+                f"翻译通道进入冷却 {round(cooldown / 60, 1)} 分钟："
+                f"{self.__translate_channel_label(channel)} - {err}"
+            )
+
+    def __translate_channel_status_summary(self) -> str:
+        parts = []
+        now = datetime.now()
+        for channel in self._translate_channels or []:
+            state = self.__translate_channel_state(channel)
+            if state.get("incompatible"):
+                status = "不兼容"
+            elif state.get("cooldown_until"):
+                try:
+                    cooldown_until = datetime.fromisoformat(state.get("cooldown_until"))
+                    status = f"冷却至 {cooldown_until.strftime('%H:%M:%S')}" if cooldown_until > now else "健康"
+                except Exception:
+                    status = "健康"
+            else:
+                status = "健康"
+            parts.append(f"{channel.name}({channel.translate_model}) {status}")
+        return "；".join(parts) if parts else "未配置翻译通道"
+
     def init_plugin(self, config=None):
         # 如果没有配置信息， 则不处理
         if not config:
@@ -857,9 +1000,18 @@ class AutoSubRemoteAsr(_PluginBase):
         if asr_prompt is None:
             asr_prompt = self.__default_asr_prompt()
         self._asr_prompt = str(asr_prompt or "").strip()
-        self._asr_channels = self.__normalize_asr_channels(config)
-        self._asr_api_model = self._asr_channels[0].model if self._asr_channels else self._asr_api_model
         self._translate_request_timeout = self.__normalize_request_timeout(config.get('translate_request_timeout'), 120)
+        self._translate_channel_retries = self.__normalize_int(
+            config.get('translate_channel_retries'), config.get('max_retries') or 1, 0, 5
+        )
+        self._translate_max_channel_attempts = self.__normalize_int(
+            config.get('translate_max_channel_attempts'), 6, 1, 30
+        )
+        self._api_channels = self.__normalize_api_channels(config)
+        self._asr_channels = [channel for channel in self._api_channels if channel.model]
+        self._translate_channels = [channel for channel in self._api_channels if channel.translate_model]
+        self._asr_api_model = self._asr_channels[0].model if self._asr_channels else self._asr_api_model
+        self._openai_model = self._translate_channels[0].translate_model if self._translate_channels else config.get('openai_model')
         self._reuse_autosub_config = False
         self._auto_detect_language = config.get('auto_detect_language', False)
         self._translate_zh = config.get('translate_zh', False)
@@ -884,18 +1036,12 @@ class AutoSubRemoteAsr(_PluginBase):
             self.stop_service()
             return
 
-        if self._translate_zh and not self.__resolve_openai_settings(config):
-            logger.error("接口ASR或中文字幕翻译需要大模型接口配置，请在当前插件中维护接口地址和密钥")
+        if self._translate_zh and not self._translate_channels:
+            logger.error("中文字幕翻译已启用，但未配置可用翻译通道")
             return
         if self._enable_asr and not self._asr_channels:
             logger.error("接口ASR已启用，但未配置可用ASR通道")
             return
-
-        if self._translate_zh:
-            self._openai = OpenAi(api_key=self._openai_api_key, api_url=self._openai_api_url,
-                                  proxy=settings.PROXY if self._openai_api_proxy else None,
-                                  model=self._openai_model, compatible=bool(self._openai_api_compatible),
-                                  timeout=self._translate_request_timeout, detailed_log=self._detailed_log)
 
         if self._enabled:
             alive_threads = [thread for thread in self._consumer_threads.values() if thread and thread.is_alive()]
@@ -904,6 +1050,8 @@ class AutoSubRemoteAsr(_PluginBase):
             logger.info("AI生成字幕服务已启动")
             # asr 配置检查
             if self._enable_asr and not self.__check_asr():
+                return
+            if self._translate_zh and not self.__check_translate():
                 return
 
             started_now = False
@@ -2215,6 +2363,17 @@ class AutoSubRemoteAsr(_PluginBase):
             f"接口ASR通道配置：{len(self._asr_channels)} 个，"
             f"模型 {self.__asr_models_label()}，通道重试 {self._asr_channel_retries}，"
             f"单段最大尝试 {self._asr_max_channel_attempts}"
+        )
+        return True
+
+    def __check_translate(self):
+        if not self._translate_channels:
+            logger.warn("中文字幕翻译缺少可用通道，不进行处理")
+            return False
+        logger.info(
+            f"翻译通道配置：{len(self._translate_channels)} 个，"
+            f"模型 {self.__translate_models_label()}，通道重试 {self._translate_channel_retries}，"
+            f"单次最大尝试 {self._translate_max_channel_attempts}"
         )
         return True
 
@@ -3943,7 +4102,18 @@ class AutoSubRemoteAsr(_PluginBase):
             return self.__process_batch(all_subs, items, stats)
         return [self.__process_single(all_subs, item, stats) for item in items]
 
-    def __run_translate_request(self, request_func):
+    def __create_translate_openai(self, channel: AsrChannel) -> OpenAi:
+        return OpenAi(
+            api_key=channel.key,
+            api_url=channel.url,
+            proxy=settings.PROXY if channel.proxy else None,
+            model=channel.translate_model,
+            compatible=False,
+            timeout=channel.translate_timeout or self._translate_request_timeout,
+            detailed_log=self._detailed_log,
+        )
+
+    def __run_translate_request(self, request_func, channel: AsrChannel):
         """执行一次翻译接口请求，超时只约束本次 HTTP 请求。"""
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
@@ -3953,16 +4123,22 @@ class AutoSubRemoteAsr(_PluginBase):
         lock_wait_started = time.time()
 
         def worker():
+            openai_client = None
             try:
-                result["value"] = request_func()
+                openai_client = self.__create_translate_openai(channel)
+                result["value"] = request_func(openai_client)
             except Exception as err:
                 result["error"] = err
                 result["traceback"] = traceback.format_exc()
+            finally:
+                if openai_client:
+                    openai_client.close()
 
-        logger.info(f"接口翻译准备请求：request_id={request_id} 等待并发锁")
+        channel_label = self.__translate_channel_label(channel)
+        logger.info(f"接口翻译准备请求：request_id={request_id} channel={channel_label} 等待并发锁")
         with self._translate_lock:
             logger.info(
-                f"接口翻译获得并发锁：request_id={request_id} "
+                f"接口翻译获得并发锁：request_id={request_id} channel={channel_label} "
                 f"wait={time.time() - lock_wait_started:.2f}s"
             )
             thread = threading.Thread(
@@ -3971,20 +4147,21 @@ class AutoSubRemoteAsr(_PluginBase):
                 daemon=True,
             )
             started_at = time.time()
-            forced_timeout = max(15, int(self._translate_request_timeout or 60) + 5)
+            timeout = channel.translate_timeout or self._translate_request_timeout
+            forced_timeout = max(15, int(timeout or 60) + 5)
             thread.start()
             while thread.is_alive():
                 if self._event.is_set():
                     raise UserInterruptException("用户中断当前任务")
                 elapsed = int(time.time() - started_at)
                 if elapsed >= forced_timeout:
-                    logger.warn(f"翻译请求等待超过 {self._translate_request_timeout} 秒，强制放弃本次请求")
+                    logger.warn(f"翻译请求 {channel_label} 等待超过 {timeout} 秒，强制放弃本次请求")
                     raise httpx.TimeoutException(
-                        f"翻译请求超过 {self._translate_request_timeout} 秒，已放弃本次请求"
+                        f"翻译请求超过 {timeout} 秒，已放弃本次请求"
                     )
                 thread.join(timeout=1)
             logger.info(
-                f"接口翻译请求线程结束：request_id={request_id} "
+                f"接口翻译请求线程结束：request_id={request_id} channel={channel_label} "
                 f"elapsed={time.time() - started_at:.2f}s"
             )
 
@@ -4002,36 +4179,60 @@ class AutoSubRemoteAsr(_PluginBase):
             time.sleep(min(0.5, max(0.05, end_time - time.time())))
 
     def __run_translate_with_retries(self, request_func, label: str):
-        max_attempts = max(1, int(self._max_retries or 0) + 1)
+        channels = self.__ordered_translate_channels()
+        if not channels:
+            raise RuntimeError(f"{label}无可用翻译通道：{self.__translate_channel_status_summary()}")
+        per_channel_attempts = max(1, int(self._translate_channel_retries or 0) + 1)
+        max_attempts = max(1, int(self._translate_max_channel_attempts or 6))
+        total_attempt = 0
         last_error = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                return self.__run_translate_request(request_func)
-            except UserInterruptException:
-                raise
-            except Exception as err:
-                last_error = err
-                if attempt >= max_attempts:
+        error_parts = []
+        for channel in channels:
+            channel_label = self.__translate_channel_label(channel)
+            for attempt in range(1, per_channel_attempts + 1):
+                if total_attempt >= max_attempts:
+                    break
+                total_attempt += 1
+                try:
+                    result = self.__run_translate_request(request_func, channel)
+                    if total_attempt > 1:
+                        logger.info(f"{label}切换后成功：{channel_label}，总第 {total_attempt} 次")
+                    self.__record_translate_channel_success(channel)
+                    return result
+                except UserInterruptException:
                     raise
-                sleep_time = (2 ** (attempt - 1)) + random.uniform(0.1, 0.9)
-                logger.warn(
-                    f"{label}请求失败（第 {attempt}/{max_attempts} 次）：{err}，"
-                    f"{sleep_time:.1f} 秒后重试"
-                )
-                self.__sleep_for_translate_retry(sleep_time)
+                except Exception as err:
+                    last_error = err
+                    error_parts.append(f"{channel_label}: {err}")
+                    if self.__is_translate_incompatible_error(err):
+                        self.__record_translate_channel_failure(channel, err)
+                        break
+                    if attempt < per_channel_attempts and total_attempt < max_attempts:
+                        sleep_time = (2 ** (attempt - 1)) + random.uniform(0.1, 0.9)
+                        logger.warn(
+                            f"{label}请求失败（通道 {channel_label} 第 {attempt}/{per_channel_attempts} 次，"
+                            f"总第 {total_attempt}/{max_attempts} 次）：{err}，{sleep_time:.1f} 秒后重试"
+                        )
+                        self.__sleep_for_translate_retry(sleep_time)
+                    else:
+                        self.__record_translate_channel_failure(channel, err)
+                        break
+            if total_attempt >= max_attempts:
+                break
         if last_error:
-            raise last_error
+            detail = "；".join(error_parts[-4:]) or str(last_error)
+            raise RuntimeError(f"{label}多通道均不可用，已尝试 {total_attempt}/{max_attempts} 次：{detail}") from last_error
         raise RuntimeError(f"{label}请求失败")
 
     def __translate_to_zh(self, text: str, context: str = None) -> str:
         return self.__run_translate_with_retries(
-            lambda: self._openai.translate_to_zh(text, context, max_retries=0),
+            lambda openai_client: openai_client.translate_to_zh(text, context, max_retries=0),
             "单行翻译"
         )
 
     def __translate_subtitle_items_to_zh(self, items: List[dict], context: str = None):
         return self.__run_translate_with_retries(
-            lambda: self._openai.translate_subtitle_items_to_zh(items, context, max_retries=0),
+            lambda openai_client: openai_client.translate_subtitle_items_to_zh(items, context, max_retries=0),
             "批量字幕翻译"
         )
 
@@ -5088,38 +5289,16 @@ class AutoSubRemoteAsr(_PluginBase):
             },
         ])
 
-        asr_channel_settings = self.__form_card("ASR通道池", "可以配置多个转写接口，单段失败时自动切换健康通道", [
-            {
-                "component": "VRow",
-                "content": [
-                    self.__form_col(
-                        self.__form_text(
-                            "asr_api_model",
-                            "默认ASR模型",
-                            "whisper-1",
-                            "ASR通道配置为空时使用；需要支持 verbose_json 和 segments",
-                        ),
-                        md=4,
-                    ),
-                    self.__form_col(
-                        {
-                            "component": "VAlert",
-                            "props": {"type": "info", "variant": "tonal", "density": "compact"},
-                            "text": "通道池为空时，会使用翻译接口地址、翻译API密钥和这里的默认ASR模型创建单个ASR通道。",
-                        },
-                        md=8,
-                    ),
-                ],
-            },
+        api_channel_settings = self.__form_card("接口池", "统一维护多个接口地址和密钥，ASR与翻译分别使用各自模型并自动切换", [
             {
                 "component": "VRow",
                 "content": [
                     self.__form_col(
                         self.__form_textarea(
-                            "asr_channels_json",
-                            "ASR通道配置",
+                            "api_channels_json",
+                            "接口池配置",
                             self.__asr_channels_example(),
-                            "支持JSON数组，也支持每行一个通道：名称|地址|密钥|模型|优先级|超时。留空时使用翻译接口生成默认ASR通道",
+                            "支持JSON数组，也支持每行一个通道：名称|地址|密钥|ASR模型|翻译模型|优先级|超时。某能力不用可留空，如：主接口|url|key||gpt-5-chat-latest",
                             rows=9,
                         ),
                         md=12,
@@ -5132,21 +5311,44 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__form_col(
                         self.__form_text(
                             "asr_channel_retries",
-                            "单通道重试",
+                            "ASR单通道重试",
                             "1",
-                            "当前通道失败后重试次数；之后切换下一通道",
+                            "当前接口ASR失败后的重试次数；之后切换下一接口",
                         ),
                         md=3,
                     ),
                     self.__form_col(
                         self.__form_text(
                             "asr_max_channel_attempts",
-                            "单段最大尝试",
+                            "ASR单段最大尝试",
                             "6",
                             "同一音频分段跨所有通道的最大尝试次数",
                         ),
                         md=3,
                     ),
+                    self.__form_col(
+                        self.__form_text(
+                            "translate_channel_retries",
+                            "翻译单通道重试",
+                            "1",
+                            "当前接口翻译失败后的重试次数；之后切换下一接口",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "translate_max_channel_attempts",
+                            "翻译最大尝试",
+                            "6",
+                            "单次翻译跨所有通道的最大尝试次数",
+                        ),
+                        md=3,
+                    ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
                     self.__form_col(
                         self.__form_text(
                             "asr_error_cooldown_minutes",
@@ -5165,11 +5367,6 @@ class AutoSubRemoteAsr(_PluginBase):
                         ),
                         md=3,
                     ),
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
                     self.__form_col(
                         self.__form_text(
                             "asr_unavailable_cooldown_minutes",
@@ -5180,63 +5377,36 @@ class AutoSubRemoteAsr(_PluginBase):
                         md=3,
                     ),
                     self.__form_col(
-                        {
-                            "component": "VAlert",
-                            "props": {"type": "info", "variant": "tonal", "density": "compact"},
-                            "text": "通道默认要求返回 segments；gpt-4o-transcribe 这类只返回整段文本的模型会被自动标记为不兼容，避免生成错误时间轴。",
-                        },
-                        md=9,
-                    ),
-                ],
-            },
-        ])
-
-        api_settings = self.__form_card("翻译接口", "用于中文字幕翻译；ASR通道为空时也作为默认ASR接口", [
-            {
-                "component": "VRow",
-                "content": [
-                    self.__form_col(
-                        self.__form_text(
-                            "openai_url",
-                            "翻译接口地址",
-                            "https://api.openai.com",
-                            "填写 OpenAI 兼容接口根地址；带不带 /v1 都可以",
-                        ),
-                        md=4,
-                    ),
-                    self.__form_col(self.__form_text("openai_key", "翻译API密钥", "sk-xxx"), md=4),
-                    self.__form_col(
-                        self.__form_text(
-                            "openai_model",
-                            "翻译模型",
-                            "gpt-5-chat-latest",
-                            "只用于中文字幕翻译，不影响ASR模型",
-                        ),
-                        md=4,
-                    ),
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    self.__form_col(
                         self.__form_text(
                             "translate_request_timeout",
                             "翻译超时秒",
                             "120",
                             "单次翻译请求超时后重试",
                         ),
-                        md=4,
+                        md=3,
                     ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
                     self.__form_col(
                         [
-                            self.__form_switch("openai_proxy", "使用代理服务器"),
+                            self.__form_switch("openai_proxy", "旧配置默认使用代理"),
                             self.__form_switch(
                                 "detailed_log",
                                 "详细接口日志",
                                 "记录完整接口入参和返回，排查问题时再开启",
                             ),
                         ],
+                        md=4,
+                    ),
+                    self.__form_col(
+                        {
+                            "component": "VAlert",
+                            "props": {"type": "info", "variant": "tonal", "density": "compact"},
+                            "text": "ASR模型必须返回 segments；只返回整段文本的模型会被标记为ASR不兼容，但仍可作为翻译模型使用。",
+                        },
                         md=8,
                     ),
                 ],
@@ -5296,8 +5466,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     base_settings,
                     scan_settings,
                     subtitle_settings,
-                    asr_channel_settings,
-                    api_settings,
+                    api_channel_settings,
                     translate_settings,
                 ],
             }
@@ -5322,10 +5491,13 @@ class AutoSubRemoteAsr(_PluginBase):
             "translate_zh": True,
             "enable_asr": True,
             "auto_detect_language": True,
+            "api_channels_json": "",
             "asr_api_model": "whisper-1",
             "asr_channels_json": "",
             "asr_channel_retries": 1,
             "asr_max_channel_attempts": 6,
+            "translate_channel_retries": 1,
+            "translate_max_channel_attempts": 6,
             "asr_error_cooldown_minutes": 5,
             "asr_rate_limit_cooldown_minutes": 10,
             "asr_unavailable_cooldown_minutes": 30,
@@ -6708,7 +6880,9 @@ class AutoSubRemoteAsr(_PluginBase):
                             "props": {"type": "info", "variant": "tonal", "density": "compact"},
                             "text": f"最近任务更新时间：{self.__format_time(latest_update)}；"
                                     f"任务并行 {self._parallel_tasks}，翻译接口并发 {self._translate_concurrency}，"
-                                    f"每批 {self._batch_size} 行；ASR通道：{self.__asr_channel_status_summary()}",
+                                    f"每批 {self._batch_size} 行；"
+                                    f"ASR：{self.__asr_channel_status_summary()}；"
+                                    f"翻译：{self.__translate_channel_status_summary()}",
                         }
                     ],
                 },
