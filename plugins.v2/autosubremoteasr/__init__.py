@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.44"
+    plugin_version = "1.0.45"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -5244,6 +5244,11 @@ class AutoSubRemoteAsr(_PluginBase):
         return value.strftime("%Y-%m-%d %H:%M:%S") if value else "-"
 
     @staticmethod
+    def __task_recent_time(task: TaskItem) -> datetime:
+        values = [value for value in (task.progress_updated, task.complete_time, task.add_time) if value]
+        return max(values) if values else datetime.min
+
+    @staticmethod
     def __task_source_label(source: TaskSource) -> str:
         return {
             TaskSource.MANUAL: "手动添加",
@@ -5351,7 +5356,7 @@ class AutoSubRemoteAsr(_PluginBase):
             pending = task.status == TaskStatus.PENDING and not waiting_check
             status_label = (
                 "已存在字幕" if existing_subtitle
-                else "无需翻译" if same_language
+                else "同语言跳过" if same_language
                 else "已生成字幕" if generated_subtitle
                 else "待检测" if waiting_check
                 else "待处理" if pending
@@ -5522,7 +5527,7 @@ class AutoSubRemoteAsr(_PluginBase):
         self.__repair_queue_state("页面刷新")
         tasks = sorted(
             self.load_tasks().values(),
-            key=lambda item: item.add_time,
+            key=self.__task_recent_time,
             reverse=True,
         )
         counts = {status: 0 for status in TaskStatus}
