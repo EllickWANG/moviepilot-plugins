@@ -50,7 +50,7 @@
   "AutoSubRemoteAsr": {
     "name": "AI字幕ASR",
     "description": "使用远程ASR接口生成带时间轴字幕，并通过当前插件接口配置翻译中文字幕。",
-    "version": "1.0.45",
+    "version": "1.0.46",
     "icon": "mdi-cloud-upload-outline",
     "author": "Ellick",
     "level": 2

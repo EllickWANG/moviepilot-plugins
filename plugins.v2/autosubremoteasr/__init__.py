@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.45"
+    plugin_version = "1.0.46"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -5367,6 +5367,17 @@ class AutoSubRemoteAsr(_PluginBase):
                 else "info" if pending or waiting_check
                 else self.__status_color(task.status)
             )
+            terminal = task.status in [TaskStatus.COMPLETED, TaskStatus.IGNORED, TaskStatus.FAILED]
+            if terminal and task.complete_time:
+                time_content = [
+                    {"component": "div", "props": {"class": "text-caption"}, "text": f"完成 {self.__format_time(task.complete_time)}"},
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"添加 {self.__format_time(task.add_time)}"},
+                ]
+            else:
+                time_content = [
+                    {"component": "div", "props": {"class": "text-caption"}, "text": f"添加 {self.__format_time(task.add_time)}"},
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"完成 {self.__format_time(task.complete_time)}"},
+                ]
             rows.append({
                 "component": "tr",
                 "content": [
@@ -5402,10 +5413,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     {"component": "td", "content": self.__progress_block(task)},
                     {
                         "component": "td",
-                        "content": [
-                            {"component": "div", "props": {"class": "text-caption"}, "text": f"添加 {self.__format_time(task.add_time)}"},
-                            {"component": "div", "props": {"class": "text-caption"}, "text": f"完成 {self.__format_time(task.complete_time)}"},
-                        ],
+                        "content": time_content,
                     },
                 ],
             })
