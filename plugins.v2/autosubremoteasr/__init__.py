@@ -78,6 +78,10 @@ class TaskStatus(Enum):
     FAILED = "failed"
 
 
+class ExcludedPathException(Exception):
+    pass
+
+
 @dataclass
 class TaskItem:
     task_id: str
@@ -104,7 +108,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.47"
+    plugin_version = "1.0.48"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -275,6 +279,135 @@ class AutoSubRemoteAsr(_PluginBase):
     def __is_excluded_path(self, path: str) -> bool:
         return self.__path_matches_excludes(path, self._exclude_path_list)
 
+    def __auto_excluded_reason(self, path: str) -> str:
+        if self.__is_excluded_path(path):
+            return "配置命中排除路径"
+        return ""
+
+    @staticmethod
+    def __bdmv_disc_root(path: str) -> Optional[str]:
+        if not path:
+            return None
+        try:
+            current = Path(path).resolve()
+        except Exception:
+            current = Path(str(path))
+        candidates = [current]
+        candidates.extend(current.parents)
+        for candidate in candidates:
+            if candidate.name.lower() == "bdmv":
+                return str(candidate.parent)
+            if candidate.is_dir() and (candidate / "BDMV" / "STREAM").is_dir():
+                return str(candidate)
+        return None
+
+    def __normalize_media_task_path(self, path: str) -> str:
+        bdmv_root = self.__bdmv_disc_root(path)
+        if bdmv_root and self.__select_bdmv_stream_files(bdmv_root):
+            return bdmv_root
+        return path
+
+    @staticmethod
+    def __subtitle_base_path(video_file: str) -> str:
+        if video_file and os.path.isdir(video_file):
+            base_name = os.path.basename(os.path.normpath(video_file))
+            return os.path.join(video_file, base_name)
+        return os.path.splitext(video_file)[0]
+
+    @staticmethod
+    def __escape_ffconcat_path(path: str) -> str:
+        return str(path).replace("\\", "\\\\").replace("'", "\\'")
+
+    @staticmethod
+    def __parse_mpls_clip_ids(mpls_path: Path) -> List[str]:
+        try:
+            data = mpls_path.read_bytes()
+        except Exception:
+            return []
+        clip_ids = []
+        for match in re.finditer(rb"(\d{5})M2TS", data):
+            clip_id = match.group(1).decode("ascii", errors="ignore")
+            if clip_id and (not clip_ids or clip_ids[-1] != clip_id):
+                clip_ids.append(clip_id)
+        return clip_ids
+
+    def __select_bdmv_stream_files(self, disc_root: str) -> List[str]:
+        if not disc_root:
+            return []
+        bdmv_dir = Path(disc_root) / "BDMV"
+        stream_dir = bdmv_dir / "STREAM"
+        if not stream_dir.is_dir():
+            return []
+        playlist_dir = bdmv_dir / "PLAYLIST"
+        best_streams = []
+        best_size = 0
+        if playlist_dir.is_dir():
+            for mpls_path in sorted(playlist_dir.glob("*.mpls")):
+                clip_ids = self.__parse_mpls_clip_ids(mpls_path)
+                streams = []
+                for clip_id in clip_ids:
+                    stream_path = stream_dir / f"{clip_id}.m2ts"
+                    if stream_path.is_file():
+                        streams.append(str(stream_path))
+                if not streams:
+                    continue
+                total_size = sum(os.path.getsize(stream) for stream in streams if os.path.exists(stream))
+                if total_size > best_size:
+                    best_size = total_size
+                    best_streams = streams
+        if best_streams:
+            logger.info(
+                f"BDMV主影片匹配：{disc_root}，片段 {len(best_streams)}，"
+                f"大小 {round(best_size / 1024 / 1024 / 1024, 2)} GB"
+            )
+            return best_streams
+
+        streams = sorted(
+            (path for path in stream_dir.glob("*.m2ts") if path.is_file()),
+            key=lambda item: item.name,
+        )
+        if not streams:
+            return []
+        large_streams = [path for path in streams if path.stat().st_size >= 200 * 1024 * 1024]
+        if large_streams:
+            return [str(path) for path in large_streams]
+        largest = max(streams, key=lambda item: item.stat().st_size)
+        return [str(largest)]
+
+    def __prepare_bdmv_input(self, disc_root: str) -> Optional[dict]:
+        streams = self.__select_bdmv_stream_files(disc_root)
+        if not streams:
+            return None
+        temp_dir = tempfile.TemporaryDirectory(prefix="autosubremoteasr-bdmv-")
+        concat_path = os.path.join(temp_dir.name, "main.ffconcat")
+        with open(concat_path, "w", encoding="utf-8") as file_obj:
+            file_obj.write("ffconcat version 1.0\n")
+            for stream in streams:
+                file_obj.write(f"file '{self.__escape_ffconcat_path(stream)}'\n")
+                try:
+                    meta = Ffmpeg().get_video_metadata(stream, stop_event=self._event)
+                    duration = self.__get_video_duration(meta)
+                    if duration > 0:
+                        file_obj.write(f"duration {duration:.3f}\n")
+                except Exception:
+                    pass
+        return {
+            "input_file": concat_path,
+            "cleanup": temp_dir,
+            "streams": streams,
+        }
+
+    def __prepare_media_input(self, video_file: str) -> dict:
+        disc_root = self.__bdmv_disc_root(video_file)
+        if not disc_root:
+            return {"input_file": video_file, "cleanup": None, "bdmv": False, "streams": []}
+        prepared = self.__prepare_bdmv_input(disc_root)
+        if not prepared:
+            raise RuntimeError("BDMV未找到可用主影片片段")
+        prepared["bdmv"] = True
+        prepared["display_file"] = disc_root
+        return prepared
+
     @staticmethod
     def __pick_first_key(key_value: Optional[str]) -> Optional[str]:
         if not key_value:
@@ -419,6 +552,9 @@ class AutoSubRemoteAsr(_PluginBase):
             config['clear_history'] = False
             self.update_config(config)
             self.reset_tasks()
+
+        self.__reconcile_bdmv_tasks("配置加载")
+        self.__reconcile_excluded_tasks("配置加载")
 
         if not self._enabled and not self._run_now:
             self.stop_service()
@@ -745,6 +881,14 @@ class AutoSubRemoteAsr(_PluginBase):
         return any(marker in text for marker in markers)
 
     @staticmethod
+    def __is_excluded_task(task: TaskItem) -> bool:
+        if not task or task.status != TaskStatus.IGNORED:
+            return False
+        text = f"{task.progress_stage or ''} {task.progress_detail or ''}"
+        markers = ("已排除", "排除路径", "BDMV/STREAM")
+        return any(marker in text for marker in markers)
+
+    @staticmethod
     def __is_same_language_skip_task(task: TaskItem) -> bool:
         if not task or task.status != TaskStatus.COMPLETED:
             return False
@@ -910,6 +1054,19 @@ class AutoSubRemoteAsr(_PluginBase):
     @staticmethod
     def __video_file_signature(video_file: str) -> Dict[str, int]:
         try:
+            if video_file and os.path.isdir(video_file):
+                stream_dir = Path(video_file) / "BDMV" / "STREAM"
+                if stream_dir.is_dir():
+                    size = 0
+                    mtime = 0
+                    for stream in stream_dir.glob("*.m2ts"):
+                        try:
+                            stat = stream.stat()
+                            size += int(stat.st_size)
+                            mtime = max(mtime, int(stat.st_mtime))
+                        except Exception:
+                            continue
+                    return {"size": size, "mtime": mtime}
             stat = os.stat(video_file)
             return {"size": int(stat.st_size), "mtime": int(stat.st_mtime)}
         except Exception:
@@ -1123,6 +1280,13 @@ class AutoSubRemoteAsr(_PluginBase):
             task = next(iter(self._current_processing_tasks.values()))
         if not task:
             return
+        excluded_reason = self.__auto_excluded_reason(task.video_file)
+        if (
+            excluded_reason
+            and task.status == TaskStatus.IN_PROGRESS
+            and stage not in {"已排除", "排除路径待停止"}
+        ):
+            raise ExcludedPathException(excluded_reason)
         with self._tasks_lock:
             if progress is not None:
                 task.progress = self.__clip_progress(progress)
@@ -1145,6 +1309,7 @@ class AutoSubRemoteAsr(_PluginBase):
         :param video_file: 视频文件路径
         :param source: 任务来源（手动/事件）
         """
+        video_file = self.__normalize_media_task_path(video_file)
         task = TaskItem(
             task_id=str(uuid4()),
             video_file=video_file,
@@ -1223,6 +1388,98 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def clear_tasks(self) -> int:
         return self.reset_tasks()
+
+    def __reconcile_bdmv_tasks(self, reason: str = "BDMV结构更新") -> int:
+        self.__ensure_runtime_state()
+        removed_task_ids = set()
+        root_sources: Dict[str, TaskSource] = {}
+        now = datetime.now()
+        with self._tasks_lock:
+            tasks = self._tasks or {}
+            existing_paths = {task.video_file for task in tasks.values()}
+            for task_id, task in list(tasks.items()):
+                normalized = self.__normalize_media_task_path(task.video_file)
+                if not normalized or normalized == task.video_file:
+                    continue
+                if task.status == TaskStatus.IN_PROGRESS:
+                    task.progress_stage = "BDMV结构待重算"
+                    task.progress_detail = "任务完成后将按BDMV主影片重新处理"
+                    task.progress_updated = now
+                    tasks[task_id] = task
+                    if normalized not in existing_paths and normalized not in root_sources:
+                        root_sources[normalized] = task.source
+                    continue
+                removed_task_ids.add(task_id)
+                tasks.pop(task_id, None)
+                if self._queued_task_ids is not None:
+                    self._queued_task_ids.discard(task_id)
+                if self._scheduled_retry_tasks is not None:
+                    self._scheduled_retry_tasks.pop(task_id, None)
+                if normalized not in existing_paths and normalized not in root_sources:
+                    root_sources[normalized] = task.source
+            for root_path, source in root_sources.items():
+                task = TaskItem(
+                    task_id=str(uuid4()),
+                    video_file=root_path,
+                    source=source,
+                    add_time=now,
+                    status=TaskStatus.PENDING,
+                    progress=0.0,
+                    progress_stage="等待中",
+                    progress_detail="BDMV结构已归并为主影片任务",
+                    progress_updated=now,
+                )
+                tasks[task.task_id] = task
+                existing_paths.add(root_path)
+            if removed_task_ids or root_sources:
+                self._tasks = tasks
+                self.save_tasks()
+        keep_task_ids = set((self._tasks or {}).keys())
+        removed_from_queue = self.__drain_task_queue(keep_task_ids) if removed_task_ids else 0
+        changed = len(removed_task_ids) + len(root_sources) + removed_from_queue
+        if changed:
+            logger.info(
+                f"AI字幕{reason}已重算BDMV任务：移除碎片任务 {len(removed_task_ids)}，"
+                f"新增主影片任务 {len(root_sources)}，队列移除 {removed_from_queue}"
+            )
+        return changed
+
+    def __reconcile_excluded_tasks(self, reason: str = "排除路径更新") -> int:
+        self.__ensure_runtime_state()
+        removed_task_ids = set()
+        stopping = 0
+        now = datetime.now()
+        with self._tasks_lock:
+            tasks = self._tasks or {}
+            for task_id, task in list(tasks.items()):
+                excluded_reason = self.__auto_excluded_reason(task.video_file)
+                if not excluded_reason:
+                    continue
+                if task.status in [TaskStatus.PENDING, TaskStatus.WAITING_FILE, TaskStatus.FAILED]:
+                    removed_task_ids.add(task_id)
+                    tasks.pop(task_id, None)
+                    if self._queued_task_ids is not None:
+                        self._queued_task_ids.discard(task_id)
+                    if self._scheduled_retry_tasks is not None:
+                        self._scheduled_retry_tasks.pop(task_id, None)
+                elif task.status == TaskStatus.IN_PROGRESS:
+                    task.progress_stage = "排除路径待停止"
+                    task.progress_detail = excluded_reason
+                    task.progress_updated = now
+                    tasks[task_id] = task
+                    stopping += 1
+            if removed_task_ids or stopping:
+                self._tasks = tasks
+                self.save_tasks()
+        keep_task_ids = set((self._tasks or {}).keys())
+        removed_from_queue = self.__drain_task_queue(keep_task_ids) if removed_task_ids else 0
+        changed = len(removed_task_ids) + stopping + removed_from_queue
+        if changed:
+            logger.info(
+                f"AI字幕{reason}已重算排除命中：移除任务 {len(removed_task_ids)}，"
+                f"队列移除 {removed_from_queue}，等待停止 {stopping}"
+            )
+        return changed
 
     def retry_failed_tasks_once(self) -> int:
         self.__ensure_runtime_state()
@@ -1355,7 +1612,11 @@ class AutoSubRemoteAsr(_PluginBase):
                         self.__update_task_progress(task, 100, "处理完成", "字幕处理完成", force=True)
                 elif task.status == TaskStatus.IGNORED:
                     self.__clear_task_checkpoints(task)
-                    ignored_stage = "已存在字幕" if self.__is_existing_subtitle_task(task) else "已忽略"
+                    ignored_stage = (
+                        "已存在字幕" if self.__is_existing_subtitle_task(task)
+                        else "已排除" if self.__is_excluded_task(task)
+                        else "已忽略"
+                    )
                     self.__update_task_progress(task, 100, ignored_stage, task.progress_detail or "任务已忽略", force=True)
                 elif task.status == TaskStatus.FAILED:
                     self.__update_task_progress(task, task.progress, "处理失败",
@@ -1456,9 +1717,10 @@ class AutoSubRemoteAsr(_PluginBase):
                     stats["invalid"] += 1
                     logger.warn(f"AI字幕扫描路径无效，跳过：{path}")
                     continue
-                if self.__is_excluded_path(path):
+                excluded_reason = self.__auto_excluded_reason(path)
+                if excluded_reason:
                     stats["excluded"] += 1
-                    logger.info(f"AI字幕扫描路径命中排除规则，跳过：{path}")
+                    logger.info(f"AI字幕扫描路径命中排除规则，跳过：{path} - {excluded_reason}")
                     continue
                 try:
                     video_files = self.__get_library_files(path, self._exclude_path_list)
@@ -1489,8 +1751,10 @@ class AutoSubRemoteAsr(_PluginBase):
             )
 
     def __scan_video_file_for_task(self, video_file: str, source: TaskSource = TaskSource.AUTO_SCAN) -> str:
-        if self.__is_excluded_path(video_file):
-            logger.info(f"AI字幕扫描文件命中排除规则，跳过：{video_file}")
+        video_file = self.__normalize_media_task_path(video_file)
+        excluded_reason = self.__auto_excluded_reason(video_file)
+        if excluded_reason:
+            logger.info(f"AI字幕扫描文件命中排除规则，跳过：{video_file} - {excluded_reason}")
             return "excluded"
         now = datetime.now()
         latest_task = self.__find_latest_task_by_video_file(video_file)
@@ -1545,9 +1809,10 @@ class AutoSubRemoteAsr(_PluginBase):
                 stats["invalid"] += 1
                 logger.warn(f"目录/文件无效，不进行处理:{path}")
                 continue
-            if self.__is_excluded_path(path):
+            excluded_reason = self.__auto_excluded_reason(path)
+            if excluded_reason:
                 stats["excluded"] += 1
-                logger.info(f"手动扫描路径命中排除规则，跳过：{path}")
+                logger.info(f"手动扫描路径命中排除规则，跳过：{path} - {excluded_reason}")
                 continue
             if os.path.isdir(path):
                 for video_file in self.__get_library_files(path, self._exclude_path_list):
@@ -1687,21 +1952,34 @@ class AutoSubRemoteAsr(_PluginBase):
             return TaskStatus.FAILED
 
         start_time = time.time()
-        file_path, file_ext = os.path.splitext(video_file)
-        file_name = os.path.basename(video_file)
+        media_input = None
+        file_path = self.__subtitle_base_path(video_file)
+        file_name = os.path.basename(os.path.normpath(video_file))
 
         try:
             logger.info(f"开始处理文件：{video_file} ...")
+            excluded_reason = self.__auto_excluded_reason(video_file)
+            if excluded_reason:
+                logger.info(f"任务命中排除规则，不进行处理：{video_file} - {excluded_reason}")
+                self.__update_task_progress(task, 100, "已排除", excluded_reason, force=True)
+                return TaskStatus.IGNORED
+            media_input = self.__prepare_media_input(video_file)
+            process_file = media_input["input_file"]
+            if media_input.get("bdmv"):
+                logger.info(
+                    f"BDMV按主影片整体处理：{video_file}，"
+                    f"片段 {len(media_input.get('streams') or [])}"
+                )
             self.__update_task_progress(task, 3, "准备处理", "正在检查字幕和媒体信息", force=True)
             # 判断目的字幕（和内嵌）是否已存在
-            subtitle_reason = self.__target_subtitle_reason(video_file)
+            subtitle_reason = self.__target_subtitle_reason(video_file, process_file)
             if subtitle_reason:
                 logger.warn(f"字幕已经存在，不进行处理：{subtitle_reason}")
                 self.__update_task_progress(task, 100, "已存在字幕", subtitle_reason, force=True)
                 return TaskStatus.IGNORED
-            if not self.__check_video_integrity(video_file, task):
+            if not self.__check_video_integrity(process_file, task):
                 return TaskStatus.WAITING_FILE if task and task.status == TaskStatus.WAITING_FILE else TaskStatus.FAILED
-            target_lang = self.__detect_target_language_before_hard_subtitle(video_file, task)
+            target_lang = self.__detect_target_language_before_hard_subtitle(process_file, task)
             if target_lang:
                 self.__update_task_progress(
                     task,
@@ -1711,13 +1989,20 @@ class AutoSubRemoteAsr(_PluginBase):
                     force=True,
                 )
                 return TaskStatus.COMPLETED
-            hard_subtitle_reason = self.__hard_subtitle_reason(video_file, task=task)
+            hard_subtitle_reason = self.__hard_subtitle_reason(process_file, task=task)
             if hard_subtitle_reason:
                 logger.warn(f"检测到硬字幕，不进行处理：{hard_subtitle_reason}")
                 self.__update_task_progress(task, 100, "已存在字幕", hard_subtitle_reason, force=True)
                 return TaskStatus.IGNORED
             # 生成字幕
-            ret, lang, gen_sub_path = self.__generate_subtitle(video_file, file_path, self._enable_asr, task)
+            ret, lang, gen_sub_path = self.__generate_subtitle(
+                process_file,
+                file_path,
+                self._enable_asr,
+                task,
+                subtitle_lookup_file=video_file,
+                checkpoint_file=video_file,
+            )
             if not ret:
                 if task and task.status == TaskStatus.WAITING_FILE:
                     return TaskStatus.WAITING_FILE
@@ -1758,6 +2043,20 @@ class AutoSubRemoteAsr(_PluginBase):
             if self._send_notify:
                 self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
             return TaskStatus.COMPLETED
+        except ExcludedPathException as e:
+            reason = str(e) or "配置命中排除路径"
+            logger.info(f"任务命中排除规则，中断处理：{video_file} - {reason}")
+            if task:
+                task.status = TaskStatus.IGNORED
+                task.complete_time = datetime.now()
+                task.progress = 100.0
+                task.progress_stage = "已排除"
+                task.progress_detail = reason
+                task.progress_updated = datetime.now()
+                with self._tasks_lock:
+                    self._tasks[task.task_id] = task
+                    self.save_tasks()
+            return TaskStatus.IGNORED
         except UserInterruptException:
             logger.info(f"插件停止或重载，中断当前任务，后续将从断点恢复：{video_file}")
             if task:
@@ -1777,6 +2076,13 @@ class AutoSubRemoteAsr(_PluginBase):
             logger.error(traceback.format_exc())
             self.__update_task_progress(task, task.progress if task else 0, "处理异常", str(e)[:120], force=True)
             return TaskStatus.FAILED
+        finally:
+            cleanup = (media_input or {}).get("cleanup") if isinstance(media_input, dict) else None
+            if cleanup:
+                try:
+                    cleanup.cleanup()
+                except Exception:
+                    pass
 
     @staticmethod
     def __normalize_language_code(value: Optional[str], fallback: str = "und") -> str:
@@ -2514,13 +2820,15 @@ class AutoSubRemoteAsr(_PluginBase):
         ))
 
     def __do_speech_recognition(self, video_file: str, audio_index: int, audio_lang: str, audio_dir: str,
-                                expected_chunks: int, task: Optional[TaskItem] = None, duration: float = 0):
+                                expected_chunks: int, task: Optional[TaskItem] = None, duration: float = 0,
+                                checkpoint_file: Optional[str] = None):
         """
         流水线调用远程语音识别接口生成字幕。
         :param audio_lang:
         :return:
         """
         lang = audio_lang
+        checkpoint_source = checkpoint_file or video_file
         try:
             if lang == "auto":
                 lang = self.__detect_global_audio_language(
@@ -2533,7 +2841,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 logger.info(f"auto模式全局语言探测已锁定 ASR 语言：{lang}")
             if self.__is_target_language(lang):
                 logger.info(f"音轨语言已匹配目标翻译语言（{lang}），跳过ASR分段识别和字幕文件生成")
-                self.__clear_asr_checkpoint(task, video_file)
+                self.__clear_asr_checkpoint(task, checkpoint_source)
                 self.__update_task_progress(
                     task,
                     98,
@@ -2546,7 +2854,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                         f"模型：{self._asr_api_model}，语言：{lang}，预计 {expected_chunks} 段",
                                         force=True)
             subs = []
-            checkpoint = self.__get_asr_checkpoint(task, video_file, expected_chunks, lang)
+            checkpoint = self.__get_asr_checkpoint(task, checkpoint_source, expected_chunks, lang)
             checkpoint_chunks = (checkpoint or {}).get("chunks") or {}
             detected_lang = lang
             processed_chunks = 0
@@ -2596,7 +2904,7 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__mark_waiting_file(task, str(err))
                     raise
                 self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
-                self.__save_asr_chunk_checkpoint(task, video_file, expected_chunks, lang,
+                self.__save_asr_chunk_checkpoint(task, checkpoint_source, expected_chunks, lang,
                                                  chunk_no, response, detected_lang)
                 offset = (chunk_no - 1) * self._asr_chunk_seconds
                 self.__append_asr_response_subs(subs, response, offset, chunk_file)
@@ -2636,7 +2944,7 @@ class AutoSubRemoteAsr(_PluginBase):
             if not subs:
                 logger.info("音频文件中未检测到任何语言内容，生成空字幕文件以避免重复处理")
             self.__update_task_progress(task, 72, "语音识别完成", f"识别到 {len(subs)} 条字幕", force=True)
-            self.__clear_asr_checkpoint(task, video_file)
+            self.__clear_asr_checkpoint(task, checkpoint_source)
             logger.info("接口音轨转字幕完成")
             return True, final_lang, subs
         except UserInterruptException:
@@ -2646,13 +2954,16 @@ class AutoSubRemoteAsr(_PluginBase):
             logger.error(traceback.format_exc())
             return False, None, []
 
-    def __generate_subtitle(self, video_file, subtitle_file, enable_asr=True, task: Optional[TaskItem] = None):
+    def __generate_subtitle(self, video_file, subtitle_file, enable_asr=True, task: Optional[TaskItem] = None,
+                            subtitle_lookup_file: Optional[str] = None, checkpoint_file: Optional[str] = None):
         """
         生成字幕
         :param video_file: 视频文件
         :param subtitle_file: 字幕文件, 不包含后缀
         :return: 生成成功返回True，字幕语言,字幕路径，否则返回False, None, None
         """
+        lookup_file = subtitle_lookup_file or video_file
+        checkpoint_source = checkpoint_file or video_file
         # 获取文件元数据
         self.__update_task_progress(task, 6, "读取媒体信息", "正在读取视频元数据", force=True)
         video_meta = Ffmpeg().get_video_metadata(video_file, stop_event=self._event)
@@ -2695,7 +3006,7 @@ class AutoSubRemoteAsr(_PluginBase):
         # 获取外挂字幕
         self.__update_task_progress(task, 12, "匹配字幕", "正在匹配外挂字幕", force=True)
         logger.info(f"使用 {prefer_subtitle_langs} 匹配已有外挂字幕文件 ...")
-        external_sub_exist, external_sub_lang, exist_sub_name = self.__external_subtitle_exists(video_file,
+        external_sub_exist, external_sub_lang, exist_sub_name = self.__external_subtitle_exists(lookup_file,
                                                                                                 prefer_subtitle_langs,
                                                                                                 only_srt=True,
                                                                                                 strict=strict)
@@ -2708,7 +3019,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
         # 优先返回符合语言要求的外部字幕
         def get_sub_path():
-            video_dir, _ = os.path.split(video_file)
+            video_dir, _ = self.__subtitle_lookup_parts(lookup_file)
             return os.path.join(video_dir, exist_sub_name)
 
         extract_subtitle = False
@@ -2779,7 +3090,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 audio_dir,
                 expected_chunks,
                 task,
-                duration=duration
+                duration=duration,
+                checkpoint_file=checkpoint_source
             )
             if ret:
                 if self.__is_target_language(lang):
@@ -2802,6 +3114,12 @@ class AutoSubRemoteAsr(_PluginBase):
         获取目录媒体文件列表
         """
         exclude_paths = AutoSubRemoteAsr.__normalize_path_list(exclude_path)
+        yielded = set()
+        bdmv_root = AutoSubRemoteAsr.__bdmv_disc_root(in_path)
+        if bdmv_root and not AutoSubRemoteAsr.__path_matches_excludes(bdmv_root, exclude_paths):
+            yielded.add(bdmv_root)
+            yield bdmv_root
+            return
         if not os.path.isdir(in_path):
             if AutoSubRemoteAsr.__path_matches_excludes(in_path, exclude_paths):
                 return
@@ -2810,6 +3128,15 @@ class AutoSubRemoteAsr(_PluginBase):
 
         for root, dirs, files in os.walk(in_path):
             if AutoSubRemoteAsr.__path_matches_excludes(root, exclude_paths):
+                dirs[:] = []
+                continue
+            if "BDMV" in dirs and os.path.isdir(os.path.join(root, "BDMV", "STREAM")):
+                if root not in yielded:
+                    yielded.add(root)
+                    yield root
+                dirs[:] = [dirname for dirname in dirs if dirname.lower() != "bdmv"]
+                continue
+            if os.path.basename(root).lower() == "bdmv":
                 dirs[:] = []
                 continue
             dirs[:] = [
@@ -3382,6 +3709,12 @@ class AutoSubRemoteAsr(_PluginBase):
         return failed == len(subs) or failed / len(subs) >= 0.8
 
     @staticmethod
+    def __subtitle_lookup_parts(video_file: str) -> Tuple[str, str]:
+        if video_file and os.path.isdir(video_file):
+            return video_file, os.path.basename(os.path.normpath(video_file))
+        return os.path.split(video_file)
+
+    @staticmethod
     def __external_subtitle_exists(video_file, prefer_langs=None, only_srt=False, strict=True):
         """
         外部字幕文件是否存在,支持多种格式及扩展需求。
@@ -3391,7 +3724,9 @@ class AutoSubRemoteAsr(_PluginBase):
         :param strict: 是否严格匹配偏好语言.当不存在偏好语言字幕但存在其他语言字幕时,是否返回其他字幕
         :return: 元组 (是否存在, 检测到的语言, 文件名)
         """
-        video_dir, video_name = os.path.split(video_file)
+        video_dir, video_name = AutoSubRemoteAsr.__subtitle_lookup_parts(video_file)
+        if not video_dir or not os.path.isdir(video_dir):
+            return False, None, None
         video_name, video_ext = os.path.splitext(video_name)
 
         if prefer_langs and type(prefer_langs) == str:
@@ -3422,11 +3757,11 @@ class AutoSubRemoteAsr(_PluginBase):
                     cur_metadata.append(part)
                 elif cur_subtitle_lang is None:
                     try:
-                        iso639.to_iso639_1(part)
-                    except iso639.NonExistentLanguageError:
+                        normalized_lang = iso639.to_iso639_1(part)
+                    except (iso639.NonExistentLanguageError, ValueError, TypeError):
                         continue
                     else:
-                        cur_subtitle_lang = iso639.to_iso639_1(part)  # 记录最后一个语言标记
+                        cur_subtitle_lang = normalized_lang  # 记录最后一个语言标记
 
             return cur_subtitle_lang, cur_metadata
 
@@ -3468,7 +3803,7 @@ class AutoSubRemoteAsr(_PluginBase):
             return True, second_lang, second_file
         return False, None, None
 
-    def __target_subtitle_reason(self, video_file) -> str:
+    def __target_subtitle_reason(self, video_file, media_input_file: Optional[str] = None) -> str:
         """
         目标软字幕文件是否存在
         :param video_file:
@@ -3492,7 +3827,7 @@ class AutoSubRemoteAsr(_PluginBase):
         if exist:
             return f"外挂字幕已存在：{name or '-'}（{lang or '未知'}）"
 
-        video_meta = Ffmpeg().get_video_metadata(video_file)
+        video_meta = Ffmpeg().get_video_metadata(media_input_file or video_file)
         if not video_meta:
             return ""
         ret, subtitle_index, subtitle_lang = self.__get_video_prefer_subtitle(video_meta, prefer_lang=prefer_langs,
@@ -3944,8 +4279,11 @@ class AutoSubRemoteAsr(_PluginBase):
                     font-size: .82rem !important;
                 }
                 .autosub-asr-task-scroll {
-                    max-height: 60vh !important;
+                    max-height: 68vh !important;
                     overflow-x: hidden !important;
+                }
+                .autosub-asr-table {
+                    background: transparent !important;
                 }
                 .autosub-asr-table table,
                 .autosub-asr-table thead,
@@ -3959,24 +4297,42 @@ class AutoSubRemoteAsr(_PluginBase):
                     display: none;
                 }
                 .autosub-asr-table tr {
-                    margin: 10px 8px;
-                    padding: 10px;
-                    border: 1px solid rgba(128, 128, 128, .24);
+                    margin: 8px;
+                    padding: 10px 12px;
+                    border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
                     border-radius: 8px;
+                    background: rgba(var(--v-theme-surface), .92);
                 }
                 .autosub-asr-table td {
                     border-bottom: 0 !important;
-                    padding: 4px 0 !important;
+                    padding: 5px 0 !important;
                 }
+                .autosub-asr-table td:first-child .text-body-2 {
+                    font-size: .9rem !important;
+                    line-height: 1.35 !important;
+                    white-space: normal !important;
+                    word-break: break-word;
+                }
+                .autosub-asr-table td:first-child .text-caption {
+                    display: block;
+                    max-width: 100% !important;
+                    line-height: 1.35 !important;
+                    white-space: normal !important;
+                    word-break: break-all;
+                }
+                .autosub-asr-table td:nth-child(1)::before,
                 .autosub-asr-table td:nth-child(2)::before,
                 .autosub-asr-table td:nth-child(3)::before,
                 .autosub-asr-table td:nth-child(4)::before,
                 .autosub-asr-table td:nth-child(5)::before {
                     display: block;
                     margin-bottom: 2px;
-                    color: rgba(128, 128, 128, .92);
+                    color: rgba(var(--v-theme-on-surface), .58);
                     font-size: .72rem;
                     line-height: 1.2;
+                }
+                .autosub-asr-table td:nth-child(1)::before {
+                    content: "文件";
                 }
                 .autosub-asr-table td:nth-child(2)::before {
                     content: "来源";
@@ -3991,17 +4347,21 @@ class AutoSubRemoteAsr(_PluginBase):
                     content: "时间";
                 }
                 .autosub-asr-progress .v-progress-linear {
-                    min-width: 96px !important;
+                    min-width: 0 !important;
                     max-width: none !important;
                     flex: 1 1 auto;
                 }
                 .autosub-asr-progress-detail {
                     max-width: none !important;
+                    line-height: 1.35 !important;
                 }
             }
             @media (max-width: 380px) {
                 .autosub-asr-actions-col {
                     grid-template-columns: 1fr;
+                }
+                .autosub-asr-tabs .v-tab {
+                    flex-basis: 100%;
                 }
             }
             """
@@ -5411,12 +5771,14 @@ class AutoSubRemoteAsr(_PluginBase):
         for task in task_list[:200]:
             filename = os.path.basename(task.video_file) or task.video_file
             existing_subtitle = self.__is_existing_subtitle_task(task)
+            excluded_task = self.__is_excluded_task(task)
             same_language = self.__is_same_language_skip_task(task)
             generated_subtitle = task.status == TaskStatus.COMPLETED and not same_language
             waiting_check = self.__is_waiting_file_task(task)
             pending = task.status == TaskStatus.PENDING and not waiting_check
             status_label = (
                 "已存在字幕" if existing_subtitle
+                else "已排除" if excluded_task
                 else "同语言跳过" if same_language
                 else "已生成字幕" if generated_subtitle
                 else "待检测" if waiting_check
@@ -5425,6 +5787,7 @@ class AutoSubRemoteAsr(_PluginBase):
             )
             status_color = (
                 "success" if existing_subtitle or same_language or generated_subtitle
+                else "grey" if excluded_task
                 else "info" if pending or waiting_check
                 else self.__status_color(task.status)
             )
@@ -5613,7 +5976,9 @@ class AutoSubRemoteAsr(_PluginBase):
         failed_tasks = [task for task in tasks if task.status == TaskStatus.FAILED]
         completed_tasks = [
             task for task in tasks
-            if task.status == TaskStatus.COMPLETED or self.__is_existing_subtitle_task(task)
+            if task.status == TaskStatus.COMPLETED
+            or self.__is_existing_subtitle_task(task)
+            or self.__is_excluded_task(task)
         ]
         selected_tab = self.get_data("page_tab") or "processing"
         latest_update = None

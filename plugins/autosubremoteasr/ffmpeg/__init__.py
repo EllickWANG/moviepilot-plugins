@@ -8,6 +8,12 @@ import time
 
 class Ffmpeg:
     @staticmethod
+    def _input_args(video_path):
+        if str(video_path or "").lower().endswith(".ffconcat"):
+            return ["-f", "concat", "-safe", "0", "-i", video_path]
+        return ["-i", video_path]
+
+    @staticmethod
     def _run_command(command, stop_event=None, progress_callback=None, duration=None):
         process = None
         try:
@@ -71,7 +77,7 @@ class Ffmpeg:
             'ffmpeg', "-hide_banner", "-nostats", "-v", "error", "-xerror",
             "-threads", str(max(1, int(threads or 1))),
             "-progress", "pipe:1",
-            "-i", video_path,
+        ] + Ffmpeg._input_args(video_path) + [
             "-map", "0:v:0",
             "-map", "0:a?",
             "-f", "null", "-"
@@ -101,7 +107,8 @@ class Ffmpeg:
         command = [
             'ffmpeg', "-hide_banner", "-loglevel", "warning",
             "-threads", str(max(1, int(threads or 1))),
-            '-y', '-i', video_path,
+            '-y',
+        ] + Ffmpeg._input_args(video_path) + [
             '-map', f'0:a:{audio_stream_index}',
             '-vn', '-sn', '-dn',
             '-ac', '1', '-ar', '24000', '-b:a', '64k',
@@ -207,7 +214,8 @@ class Ffmpeg:
             "-threads", str(max(1, int(threads or 1))),
             "-ss", str(max(0, float(start_seconds or 0))),
             "-t", str(max(3, float(duration_seconds or 12))),
-            '-y', '-i', video_path,
+            '-y',
+        ] + Ffmpeg._input_args(video_path) + [
             '-map', f'0:a:{audio_stream_index}',
             '-vn', '-sn', '-dn',
             '-ac', '1', '-ar', '24000', '-b:a', '64k',
@@ -293,7 +301,7 @@ class Ffmpeg:
             'ffmpeg', "-hide_banner", "-loglevel", "error",
             "-threads", str(max(1, int(threads or 1))),
             "-ss", str(max(0, float(start_seconds or 0))),
-            "-i", video_path,
+        ] + Ffmpeg._input_args(video_path) + [
             "-map", "0:v:0",
             "-frames:v", "1",
             "-vf", f"scale={width}:{height}:flags=bicubic,format=gray",
@@ -351,7 +359,9 @@ class Ffmpeg:
             return False
 
         try:
-            command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', video_path]
+            command = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams'
+            ] + Ffmpeg._input_args(video_path)
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
             if stop_event and stop_event.is_set():
                 return None
@@ -369,13 +379,13 @@ class Ffmpeg:
         if not video_path or not subtitle_path:
             return False
 
-        if subtitle_index:
+        if subtitle_index is not None:
             command = ['ffmpeg', "-hide_banner", "-loglevel", "warning", "-threads", str(max(1, int(threads or 1))),
-                       '-y', '-i', video_path,
+                       '-y'] + Ffmpeg._input_args(video_path) + [
                        '-map', f'0:s:{subtitle_index}',
                        subtitle_path]
         else:
             command = ['ffmpeg', "-hide_banner", "-loglevel", "warning", "-threads", str(max(1, int(threads or 1))),
-                       '-y', '-i', video_path, subtitle_path]
+                       '-y'] + Ffmpeg._input_args(video_path) + [subtitle_path]
         ok, _ = Ffmpeg._run_command(command, stop_event=stop_event)
         return ok
