@@ -104,7 +104,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.43"
+    plugin_version = "1.0.44"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -155,7 +155,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _running = False
     _event = Event()
     _enabled = None
-    _clear_history = None
+    _reset_tasks = None
     _listen_transfer_event = None
     _send_notify = None
     _detailed_log = False
@@ -351,7 +351,7 @@ class AutoSubRemoteAsr(_PluginBase):
         self._tasks = self.load_tasks()
         self._progress_save_at = {}
         self._enabled = config.get('enabled', False)
-        self._clear_history = config.get('clear_history', False)
+        self._reset_tasks = bool(config.get('reset_tasks', False) or config.get('clear_history', False))
         self._listen_transfer_event = config.get('listen_transfer_event', True)
         self._run_now = config.get('run_now')
         self._retry_failed_once = config.get('retry_failed_once')
@@ -388,10 +388,11 @@ class AutoSubRemoteAsr(_PluginBase):
         self._enable_merge = config.get('enable_merge', False)
         self._openai = None
 
-        if self._clear_history:
+        if self._reset_tasks:
+            config['reset_tasks'] = False
             config['clear_history'] = False
             self.update_config(config)
-            self.clear_tasks()
+            self.reset_tasks()
 
         if not self._enabled and not self._run_now:
             self.stop_service()
@@ -1142,16 +1143,60 @@ class AutoSubRemoteAsr(_PluginBase):
         logger.info(f"加入任务队列: {video_file}")
         return True
 
-    def clear_tasks(self):
+    def __drain_task_queue(self, keep_task_ids: Optional[set] = None) -> int:
+        if not self._task_queue:
+            return 0
+        kept_tasks = []
+        removed = 0
+        while True:
+            try:
+                queued_task = self._task_queue.get_nowait()
+            except queue.Empty:
+                break
+            if queued_task is not None and (keep_task_ids is None or queued_task.task_id in keep_task_ids):
+                kept_tasks.append(queued_task)
+            else:
+                removed += 1
+            self.__safe_task_done()
+        for queued_task in kept_tasks:
+            self._task_queue.put(queued_task)
+        return removed
+
+    def reset_tasks(self) -> int:
         self.__ensure_runtime_state()
         with self._tasks_lock:
-            self._tasks = {task_id: task for task_id, task in self._tasks.items() if task.status in [
-                TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.WAITING_FILE
-            ]}
+            tasks = self._tasks or {}
+            keep_task_ids = {
+                task_id
+                for task_id, task in tasks.items()
+                if task.status == TaskStatus.IN_PROGRESS
+            }
+            removed_task_ids = set(tasks.keys()) - keep_task_ids
+            self._tasks = {
+                task_id: task
+                for task_id, task in tasks.items()
+                if task_id in keep_task_ids
+            }
+            self._queued_task_ids = {
+                task_id
+                for task_id in (self._queued_task_ids or set())
+                if task_id in keep_task_ids
+            }
+            for task_id in removed_task_ids:
+                self._scheduled_retry_tasks.pop(task_id, None)
             self.save_tasks()
             self.save_data("asr_checkpoints", {})
             self.save_data("translate_checkpoints", {})
-        logger.info("插件历史任务已清除")
+        removed_from_queue = self.__drain_task_queue(keep_task_ids)
+        removed = len(removed_task_ids)
+        logger.info(
+            f"插件任务已重置：移除记录 {removed} 条，清空待处理队列 {removed_from_queue} 条，"
+            "保留正在处理任务"
+        )
+        return removed
+
+    def clear_tasks(self) -> int:
+        return self.reset_tasks()
 
     def retry_failed_tasks_once(self) -> int:
         self.__ensure_runtime_state()
@@ -1245,6 +1290,12 @@ class AutoSubRemoteAsr(_PluginBase):
                     continue
                 with self._tasks_lock:
                     self._queued_task_ids.discard(task.task_id)
+                    latest_task = (self._tasks or {}).get(task.task_id)
+                    if not latest_task or latest_task.status not in [TaskStatus.PENDING, TaskStatus.WAITING_FILE]:
+                        logger.info(f"跳过已清理或非待处理任务：{task.video_file}")
+                        self.__safe_task_done()
+                        continue
+                    task = latest_task
                     self._current_processing_task = task if worker_index == 1 else self._current_processing_task
                     self._current_processing_tasks[task.task_id] = task
                 logger.info(f"工作线程 {worker_index} 开始处理任务 {task.task_id}: {task.video_file}")
@@ -4153,6 +4204,7 @@ class AutoSubRemoteAsr(_PluginBase):
             }
         ], {
             "enabled": False,
+            "reset_tasks": False,
             "clear_history": False,
             "send_notify": False,
             "detailed_log": False,
@@ -4218,8 +4270,8 @@ class AutoSubRemoteAsr(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'clear_history',
-                                            'label': '清理历史记录',
+                                            'model': 'reset_tasks',
+                                            'label': '重置任务记录',
                                         }
                                     }
                                 ]
@@ -4814,6 +4866,7 @@ class AutoSubRemoteAsr(_PluginBase):
             }
         ], {
             "enabled": False,
+            "reset_tasks": False,
             "clear_history": False,
             "send_notify": False,
             "detailed_log": False,
@@ -4874,12 +4927,20 @@ class AutoSubRemoteAsr(_PluginBase):
                 "description": "清理已完成和已忽略任务记录。",
             },
             {
-                "path": "/clear_history",
-                "endpoint": self.api_clear_history,
+                "path": "/reset_tasks",
+                "endpoint": self.api_reset_tasks,
                 "methods": ["POST"],
                 "auth": "bear",
-                "summary": "清理历史任务",
-                "description": "清理已完成、已忽略和失败任务记录，保留等待中和处理中任务。",
+                "summary": "重置任务记录",
+                "description": "清理待处理、待检测、已完成、已忽略和失败任务记录，保留正在处理任务。",
+            },
+            {
+                "path": "/clear_history",
+                "endpoint": self.api_reset_tasks,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "重置任务记录（兼容旧接口）",
+                "description": "兼容旧按钮地址，行为同重置任务记录。",
             },
             {
                 "path": "/page_tab",
@@ -4945,11 +5006,9 @@ class AutoSubRemoteAsr(_PluginBase):
         removed = self.__clear_tasks_by_status([TaskStatus.COMPLETED, TaskStatus.IGNORED])
         return schemas.Response(success=True, message=f"已清理 {removed} 条已完成/已忽略记录")
 
-    def api_clear_history(self) -> schemas.Response:
-        before = len(self._tasks or {})
-        self.clear_tasks()
-        after = len(self._tasks or {})
-        return schemas.Response(success=True, message=f"已清理 {max(0, before - after)} 条历史记录")
+    def api_reset_tasks(self) -> schemas.Response:
+        removed = self.reset_tasks()
+        return schemas.Response(success=True, message=f"已重置任务记录，移除 {removed} 条，保留正在处理任务")
 
     def api_page_tab(self, payload: Optional[Dict[str, Any]] = None) -> schemas.Response:
         tab = (payload or {}).get("tab") or "queue"
@@ -5503,8 +5562,8 @@ class AutoSubRemoteAsr(_PluginBase):
                                                   "plugin/AutoSubRemoteAsr/retry_failed"),
                         self.__page_action_button("清理已完成", "mdi-check-circle-outline", "secondary",
                                                   "plugin/AutoSubRemoteAsr/clear_completed"),
-                        self.__page_action_button("清理历史", "mdi-delete-sweep-outline", "error",
-                                                  "plugin/AutoSubRemoteAsr/clear_history"),
+                        self.__page_action_button("重置", "mdi-restore", "error",
+                                                  "plugin/AutoSubRemoteAsr/reset_tasks"),
                     ],
                 }
             ],
