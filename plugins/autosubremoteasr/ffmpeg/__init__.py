@@ -103,7 +103,7 @@ class Ffmpeg:
             '-y', '-i', video_path,
             '-map', f'0:a:{audio_stream_index}',
             '-vn', '-sn', '-dn',
-            '-ac', '1', '-ar', '16000', '-b:a', '48k',
+            '-ac', '1', '-ar', '24000', '-b:a', '64k',
             '-f', 'segment',
             '-segment_time', str(segment_seconds),
             '-reset_timestamps', '1',
