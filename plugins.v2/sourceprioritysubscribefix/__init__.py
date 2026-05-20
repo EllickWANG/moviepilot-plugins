@@ -49,9 +49,9 @@ from app.utils.dom import DomUtils
 
 class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
-    plugin_desc = "订阅时有 doubanid/bangumiid 则直接使用对应来源详情，避免强制转 TMDB。"
+    plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.44"
+    plugin_version = "1.0.45"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -145,7 +145,7 @@ class sourceprioritysubscribefix(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "启用后，订阅携带 doubanid 或 bangumiid 时会优先使用对应来源详情，避免强制转换到 TMDB。",
+                                            "text": "启用后，订阅携带 doubanid 时优先使用豆瓣详情；只有没有 TMDB/豆瓣、仅有 Bangumi ID 的订阅才使用 Bangumi 详情。",
                                         },
                                     }
                                 ],
@@ -540,6 +540,12 @@ def _title_candidates_from_text(text: Any) -> set[str]:
 
 def _is_bangumi_only_subscribe(subscribe: Optional[Subscribe]) -> bool:
     return bool(subscribe and subscribe.bangumiid and not subscribe.tmdbid and not subscribe.doubanid)
+
+
+def _ids_target_bangumi_only(tmdbid: Optional[int] = None,
+                             doubanid: Optional[str] = None,
+                             bangumiid: Optional[int] = None) -> bool:
+    return bool(_int_or_none(bangumiid) and not tmdbid and not doubanid)
 
 
 def _source_only_subscribes() -> list[Subscribe]:
@@ -2944,7 +2950,10 @@ def _download_entries(downloads: list[DownloadHistory]) -> tuple[list[dict], lis
 
 def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
     plugin_id = plugin.__class__.__name__
-    failed_histories = _page_db_items(TransferHistory, status=False, limit=20)
+    failed_histories = [
+        history for history in _page_db_items(TransferHistory, status=False, limit=100)
+        if _history_has_bangumi_source(history)
+    ][:20]
     source_download_items = _source_downloads(limit=12)
     bangumi_subscribes = _bangumi_only_subscribes_for_page(limit=20)
     enabled_text = "已启用" if plugin.get_state() else "已停用"
@@ -3122,11 +3131,12 @@ async def _patched_subscribe_cache_calendar(self: SubscribeChain):
             continue
 
         if mtype == MediaType.MOVIE:
+            bangumi_only = _is_bangumi_only_subscribe(subscribe)
             mediainfo = await self.async_recognize_media(
                 mtype=mtype,
-                tmdbid=None if (subscribe.doubanid or subscribe.bangumiid) else subscribe.tmdbid,
+                tmdbid=None if (subscribe.doubanid or bangumi_only) else subscribe.tmdbid,
                 doubanid=subscribe.doubanid,
-                bangumiid=subscribe.bangumiid,
+                bangumiid=subscribe.bangumiid if bangumi_only else None,
                 episode_group=subscribe.episode_group,
                 cache=False,
             )
@@ -3137,12 +3147,13 @@ async def _patched_subscribe_cache_calendar(self: SubscribeChain):
                 )
             continue
 
-        if subscribe.doubanid or subscribe.bangumiid:
+        bangumi_only = _is_bangumi_only_subscribe(subscribe)
+        if subscribe.doubanid or bangumi_only:
             mediainfo = await self.async_recognize_media(
                 mtype=mtype,
                 tmdbid=None,
                 doubanid=subscribe.doubanid,
-                bangumiid=subscribe.bangumiid,
+                bangumiid=subscribe.bangumiid if bangumi_only else None,
                 episode_group=subscribe.episode_group,
                 cache=False,
             )
@@ -3327,20 +3338,20 @@ async def _patched_search_by_id_stream(request: Request,
     return StreamingResponse(_stream_search_events(request, event_source()), media_type="text/event-stream")
 
 
-def _explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
+def _explicit_source_media(chain: SubscribeChain, tmdbid: Optional[int], doubanid: Optional[str], bangumiid: Optional[int],
                            mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
         return _media_from_douban(chain, doubanid, mtype)
-    if bangumiid:
+    if _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
         return _media_from_bangumi(chain, bangumiid)
     return None
 
 
-async def _async_explicit_source_media(chain: SubscribeChain, doubanid: Optional[str], bangumiid: Optional[int],
+async def _async_explicit_source_media(chain: SubscribeChain, tmdbid: Optional[int], doubanid: Optional[str], bangumiid: Optional[int],
                                        mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     if doubanid:
         return await _async_media_from_douban(chain, doubanid, mtype)
-    if bangumiid:
+    if _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
         return await _async_media_from_bangumi(chain, bangumiid)
     return None
 
@@ -3359,11 +3370,12 @@ def _fill_total_episode(chain: SubscribeChain, mediainfo: MediaInfo, title: str,
     season = 1 if season is None else season
     if not kwargs.get("total_episode"):
         if not mediainfo.seasons or episode_group:
+            bangumi_only = _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid)
             mediainfo = chain.recognize_media(
                 mtype=mediainfo.type,
                 tmdbid=None,
                 doubanid=mediainfo.douban_id or doubanid,
-                bangumiid=mediainfo.bangumi_id or bangumiid,
+                bangumiid=(mediainfo.bangumi_id or bangumiid) if bangumi_only else None,
                 episode_group=episode_group,
                 cache=False,
             )
@@ -3391,11 +3403,12 @@ async def _async_fill_total_episode(chain: SubscribeChain, mediainfo: MediaInfo,
     season = 1 if season is None else season
     if not kwargs.get("total_episode"):
         if not mediainfo.seasons or episode_group:
+            bangumi_only = _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid)
             mediainfo = await chain.async_recognize_media(
                 mtype=mediainfo.type,
                 tmdbid=None,
                 doubanid=mediainfo.douban_id or doubanid,
-                bangumiid=mediainfo.bangumi_id or bangumiid,
+                bangumiid=(mediainfo.bangumi_id or bangumiid) if bangumi_only else None,
                 episode_group=episode_group,
                 cache=False,
             )
@@ -3424,7 +3437,7 @@ def _patched_subscribe_add(self: SubscribeChain, title: str, year: str, mtype: M
                            message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                            **kwargs) -> Tuple[Optional[int], str]:
     try:
-        if not doubanid and not bangumiid:
+        if not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
             return sourceprioritysubscribefix._originals["subscribe_add"](
                 self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
                 season, channel, source, userid, username, message, exist_ok, **kwargs
@@ -3439,7 +3452,7 @@ def _patched_subscribe_add(self: SubscribeChain, title: str, year: str, mtype: M
             metainfo.type = MediaType.TV
             metainfo.begin_season = season
 
-        mediainfo = _explicit_source_media(self, doubanid, bangumiid, mtype)
+        mediainfo = _explicit_source_media(self, tmdbid, doubanid, bangumiid, mtype)
         if not mediainfo:
             logger.warn(f"未识别到媒体信息，标题：{title}，doubanid：{doubanid}，bangumiid：{bangumiid}")
             return None, "未识别到媒体信息"
@@ -3469,7 +3482,7 @@ async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: s
                                        message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                                        **kwargs) -> Tuple[Optional[int], str]:
     try:
-        if not doubanid and not bangumiid:
+        if not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
             return await sourceprioritysubscribefix._originals["subscribe_async_add"](
                 self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
                 season, channel, source, userid, username, message, exist_ok, **kwargs
@@ -3484,7 +3497,7 @@ async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: s
             metainfo.type = MediaType.TV
             metainfo.begin_season = season
 
-        mediainfo = await _async_explicit_source_media(self, doubanid, bangumiid, mtype)
+        mediainfo = await _async_explicit_source_media(self, tmdbid, doubanid, bangumiid, mtype)
         if not mediainfo:
             logger.warn(f"未识别到媒体信息，标题：{title}，doubanid：{doubanid}，bangumiid：{bangumiid}")
             return None, "未识别到媒体信息"
