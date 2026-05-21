@@ -130,7 +130,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.62"
+    plugin_version = "1.0.63"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2643,20 +2643,24 @@ class AutoSubRemoteAsr(_PluginBase):
                 logger.info(f"原始语言已匹配目标翻译语言（{lang}），任务完成，不生成字幕文件")
                 self.__update_task_progress(task, 98, "同语言跳过", f"原始语言已匹配目标翻译语言：{lang}", force=True)
             else:
+                final_subtitle_name = Path(gen_sub_path).name if gen_sub_path else ""
                 self.__update_task_progress(task, 75 if self._translate_zh else 95, "字幕已生成",
-                                            f"原始语言：{lang}", force=True)
+                                            f"已生成：{final_subtitle_name}；原始语言：{lang}", force=True)
                 if self._translate_zh:
                     # 翻译字幕
                     logger.info(f"开始翻译字幕为中文 ...")
-                    if not self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt", task):
+                    translated_sub_path = f"{file_path}.zh.机翻.srt"
+                    if not self.__translate_zh_subtitle(lang, gen_sub_path, translated_sub_path, task):
                         message = f" 媒体: {file_name}\n 翻译字幕失败，跳过完成标记"
                         if self._send_notify:
                             self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
                         self.__update_task_progress(task, task.progress if task else 0, "处理失败",
                                                     "中文字幕翻译失败", force=True)
                         return TaskStatus.FAILED
-                    logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
-                    self.__update_task_progress(task, 98, "翻译完成", "中文字幕已生成", force=True)
+                    translated_subtitle_name = Path(translated_sub_path).name
+                    logger.info(f"翻译字幕完成：{translated_subtitle_name}")
+                    self.__update_task_progress(task, 98, "翻译完成",
+                                                f"已生成：{translated_subtitle_name}", force=True)
 
             end_time = time.time()
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
@@ -2875,9 +2879,18 @@ class AutoSubRemoteAsr(_PluginBase):
         segments = response.get("segments")
         if segments is not None and not isinstance(segments, list):
             raise AsrChannelIncompatible(f"{self.__asr_channel_label(channel)} 返回 segments 格式异常")
-        if require_segments and channel.require_segments and not segments:
+        if require_segments and channel.require_segments and segments is None:
             raise AsrChannelIncompatible(
                 f"{self.__asr_channel_label(channel)} 未返回 segments，无法生成精确SRT时间轴"
+            )
+        if (
+                require_segments
+                and channel.require_segments
+                and segments == []
+                and (response.get("text") or "").strip()
+        ):
+            raise AsrChannelIncompatible(
+                f"{self.__asr_channel_label(channel)} 返回文本但未返回 segments，无法生成精确SRT时间轴"
             )
 
     @staticmethod
@@ -3589,14 +3602,27 @@ class AutoSubRemoteAsr(_PluginBase):
         checkpoint_source = checkpoint_file or video_file
         try:
             if lang == "auto":
-                lang = self.__detect_global_audio_language(
-                    video_file,
-                    audio_index,
-                    duration,
-                    audio_dir,
-                    task
-                )
-                logger.info(f"auto模式全局语言探测已锁定 ASR 语言：{lang}")
+                try:
+                    lang = self.__detect_global_audio_language(
+                        video_file,
+                        audio_index,
+                        duration,
+                        audio_dir,
+                        task
+                    )
+                    logger.info(f"auto模式全局语言探测已锁定 ASR 语言：{lang}")
+                except UserInterruptException:
+                    raise
+                except Exception as err:
+                    logger.warn(f"auto模式全局语言探测未锁定，改为ASR接口自动识别：{err}")
+                    self.__update_task_progress(
+                        task,
+                        24,
+                        "全局语言检测",
+                        f"未锁定语言，改为ASR自动识别：{str(err)[:90]}",
+                        force=True,
+                    )
+                    lang = "auto"
             if self.__is_target_language(lang):
                 logger.info(f"音轨语言已匹配目标翻译语言（{lang}），跳过ASR分段识别和字幕文件生成")
                 self.__clear_asr_checkpoint(task, checkpoint_source)
@@ -3632,6 +3658,9 @@ class AutoSubRemoteAsr(_PluginBase):
                     try:
                         response = copy.deepcopy(cached_response)
                         self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
+                        response_lang = self.__normalize_language_code(response.get("language"), fallback="")
+                        if response_lang:
+                            detected_lang = response_lang
                         offset = (chunk_no - 1) * self._asr_chunk_seconds
                         self.__append_asr_response_subs(subs, response, offset, chunk_file)
                         processed_chunks += 1
@@ -3663,6 +3692,9 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__mark_waiting_file(task, str(err))
                     raise
                 self.__validate_asr_response(response, chunk_no, expected_chunks, checked=checked)
+                response_lang = self.__normalize_language_code(response.get("language"), fallback="")
+                if response_lang:
+                    detected_lang = response_lang
                 self.__save_asr_chunk_checkpoint(task, checkpoint_source, expected_chunks, lang,
                                                  chunk_no, response, detected_lang)
                 offset = (chunk_no - 1) * self._asr_chunk_seconds
@@ -3699,12 +3731,14 @@ class AutoSubRemoteAsr(_PluginBase):
                     self.__mark_waiting_file(task, error or "提取音频失败，可能文件仍未完整")
                 return False, None, []
             if chunk_count <= 0:
-                logger.error("接口ASR没有可识别的音频分段")
-                self.__update_task_progress(task, task.progress if task else 0, "接口语音识别失败",
-                                            "没有可识别的音频分段", force=True)
-                return False, None, []
+                final_lang = self.__normalize_language_code(detected_lang or lang, fallback="und")
+                logger.info("接口ASR没有可识别的音频分段，按空字幕完成")
+                self.__clear_asr_checkpoint(task, checkpoint_source)
+                self.__update_task_progress(task, 72, "语音识别完成",
+                                            "未检测到可识别音频，生成空字幕", force=True)
+                return True, final_lang, []
 
-            final_lang = self.__normalize_language_code(lang, fallback="und")
+            final_lang = self.__normalize_language_code(detected_lang or lang, fallback="und")
             if not subs:
                 logger.info("音频文件中未检测到任何语言内容，生成空字幕文件以避免重复处理")
             self.__update_task_progress(task, 72, "语音识别完成", f"识别到 {len(subs)} 条字幕", force=True)
@@ -3876,7 +3910,8 @@ class AutoSubRemoteAsr(_PluginBase):
                 gen_subtitle_path = Path(f"{subtitle_file}.{lang}.srt")
                 self.__save_srt(gen_subtitle_path, subs)
                 logger.info(f"保存字幕文件：{gen_subtitle_path}")
-                self.__update_task_progress(task, 74, "保存字幕", f"字幕语言：{lang}", force=True)
+                self.__update_task_progress(task, 74, "保存字幕",
+                                            f"已生成：{gen_subtitle_path.name}；字幕语言：{lang}", force=True)
                 return ret, lang, gen_subtitle_path
             else:
                 logger.error("生成字幕失败")
