@@ -130,7 +130,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.63"
+    plugin_version = "1.0.64"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -6624,12 +6624,53 @@ class AutoSubRemoteAsr(_PluginBase):
             ],
         }
 
+    def __generated_subtitle_name_for_task(self, task: TaskItem) -> str:
+        if (
+                not task
+                or task.status != TaskStatus.COMPLETED
+                or self.__is_same_language_skip_task(task)
+                or self.__is_existing_subtitle_task(task)
+        ):
+            return ""
+        try:
+            base_path = Path(self.__subtitle_base_path(task.video_file))
+            parent = base_path.parent
+            prefix = f"{base_path.name}."
+            candidates = []
+            for name in os.listdir(parent):
+                if name.startswith(prefix) and name.lower().endswith(".srt"):
+                    full_path = parent / name
+                    try:
+                        mtime = full_path.stat().st_mtime
+                    except Exception:
+                        mtime = 0
+                    priority = 0 if name.endswith(".zh.机翻.srt") else 1
+                    candidates.append((priority, -mtime, name))
+            if not candidates:
+                return ""
+            candidates.sort()
+            return candidates[0][2]
+        except Exception:
+            return ""
+
+    def __task_progress_detail_for_display(self, task: TaskItem) -> str:
+        detail = (task.progress_detail or "").strip()
+        if detail and "已生成：" in detail:
+            return detail
+        subtitle_name = self.__generated_subtitle_name_for_task(task)
+        if not subtitle_name:
+            return detail
+        if detail:
+            return f"{detail}；已生成：{subtitle_name}"
+        return f"已生成：{subtitle_name}"
+
     def __progress_block(self, task: TaskItem) -> List[dict]:
         progress = self.__clip_progress(task.progress)
         color = self.__status_color(task.status)
         detail_parts = [task.progress_stage or self.__status_label(task.status)]
-        if task.progress_detail and task.progress_detail not in detail_parts:
-            detail_parts.append(task.progress_detail)
+        progress_detail = self.__task_progress_detail_for_display(task)
+        if progress_detail and progress_detail not in detail_parts:
+            detail_parts.append(progress_detail)
         waiting_hint = self.__task_waiting_hint(task)
         if waiting_hint:
             detail_parts.append(waiting_hint)
