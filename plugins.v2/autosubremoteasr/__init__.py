@@ -130,7 +130,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.59"
+    plugin_version = "1.0.60"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -307,18 +307,14 @@ class AutoSubRemoteAsr(_PluginBase):
                 "url": "https://api.openai.com",
                 "key": "sk-xxx",
                 "asr_model": "whisper-1",
-                "translate_model": "gpt-5-chat-latest",
-                "priority": 1,
-                "timeout": 300
+                "translate_model": "gpt-5-chat-latest"
             },
             {
                 "name": "备用接口",
                 "url": "https://api.groq.com/openai/v1",
                 "key": "gsk-xxx",
                 "asr_model": "whisper-large-v3-turbo",
-                "translate_model": "gpt-4o-mini",
-                "priority": 2,
-                "timeout": 180
+                "translate_model": "gpt-4o-mini"
             }
         ], ensure_ascii=False, indent=2)
 
@@ -616,15 +612,9 @@ class AutoSubRemoteAsr(_PluginBase):
         if not key or not url or not (asr_model or translate_model):
             return None
         name = str(item.get("name") or item.get("title") or f"接口{index}").strip()
-        priority = self.__normalize_int(item.get("priority"), index, 1, 999)
-        timeout = self.__normalize_request_timeout(
-            item.get("asr_timeout") or item.get("timeout"),
-            self._asr_request_timeout or 300
-        )
-        translate_timeout = self.__normalize_request_timeout(
-            item.get("translate_timeout") or item.get("timeout"),
-            self._translate_request_timeout or 120
-        )
+        priority = index
+        timeout = self._asr_request_timeout or 300
+        translate_timeout = self._translate_request_timeout or 120
         response_format = str(item.get("response_format") or "verbose_json").strip() or "verbose_json"
         raw_id = str(item.get("id") or item.get("channel_id") or "").strip()
         if not raw_id:
@@ -685,8 +675,6 @@ class AutoSubRemoteAsr(_PluginBase):
                     "url": parts[1],
                     "key": parts[2],
                     "asr_model": parts[3],
-                    "priority": parts[5] if len(parts) >= 6 else len(items) + 1,
-                    "timeout": parts[6] if len(parts) >= 7 else self._asr_request_timeout,
                 }
                 if len(parts) >= 5:
                     item["translate_model"] = parts[4]
@@ -718,9 +706,6 @@ class AutoSubRemoteAsr(_PluginBase):
                     "key": fallback_key,
                     "asr_model": fallback_asr_model,
                     "translate_model": fallback_translate_model,
-                    "priority": 1,
-                    "asr_timeout": self._asr_request_timeout,
-                    "translate_timeout": self._translate_request_timeout,
                 }, 1, config)
                 if channel:
                     channels.append(channel)
@@ -5255,16 +5240,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "10",
                             "范围5-30；过短会增加接口调用",
                         ),
-                        md=6,
-                    ),
-                    self.__form_col(
-                        self.__form_text(
-                            "asr_request_timeout",
-                            "ASR超时秒",
-                            "300",
-                            "单段ASR请求超时后重试",
-                        ),
-                        md=6,
+                        md=12,
                     ),
                 ],
             },
@@ -5294,7 +5270,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "api_channels_json",
                             "接口池配置",
                             self.__asr_channels_example(),
-                            "支持JSON数组，也支持每行一个通道：名称|地址|密钥|ASR模型|翻译模型|优先级|超时。某能力不用可留空，如：主接口|url|key||gpt-5-chat-latest",
+                            "支持JSON数组，也支持每行一个通道：名称|地址|密钥|ASR模型|翻译模型。通道顺序就是切换优先级；超时、重试和冷却在下方统一维护。某能力不用可留空，如：主接口|url|key||gpt-5-chat-latest",
                             rows=9,
                         ),
                         md=12,
@@ -5347,6 +5323,24 @@ class AutoSubRemoteAsr(_PluginBase):
                 "content": [
                     self.__form_col(
                         self.__form_text(
+                            "asr_request_timeout",
+                            "ASR超时秒",
+                            "300",
+                            "单段ASR请求超时后重试",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
+                            "translate_request_timeout",
+                            "翻译超时秒",
+                            "120",
+                            "单次翻译请求超时后重试",
+                        ),
+                        md=3,
+                    ),
+                    self.__form_col(
+                        self.__form_text(
                             "asr_error_cooldown_minutes",
                             "断连冷却分钟",
                             "5",
@@ -5363,6 +5357,11 @@ class AutoSubRemoteAsr(_PluginBase):
                         ),
                         md=3,
                     ),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
                     self.__form_col(
                         self.__form_text(
                             "asr_unavailable_cooldown_minutes",
@@ -5373,20 +5372,6 @@ class AutoSubRemoteAsr(_PluginBase):
                         md=3,
                     ),
                     self.__form_col(
-                        self.__form_text(
-                            "translate_request_timeout",
-                            "翻译超时秒",
-                            "120",
-                            "单次翻译请求超时后重试",
-                        ),
-                        md=3,
-                    ),
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    self.__form_col(
                         [
                             self.__form_switch("openai_proxy", "接口请求使用代理"),
                             self.__form_switch(
@@ -5395,7 +5380,7 @@ class AutoSubRemoteAsr(_PluginBase):
                                 "记录完整接口入参和返回，排查问题时再开启",
                             ),
                         ],
-                        md=4,
+                        md=3,
                     ),
                     self.__form_col(
                         {
@@ -5403,7 +5388,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             "props": {"type": "info", "variant": "tonal", "density": "compact"},
                             "text": "ASR模型必须返回 segments；只返回整段文本的模型会被标记为ASR不兼容，但仍可作为翻译模型使用。",
                         },
-                        md=8,
+                        md=6,
                     ),
                 ],
             },
