@@ -68,7 +68,6 @@ class AsrChannel:
     priority: int = 100
     timeout: int = 300
     translate_timeout: int = 120
-    proxy: bool = False
     enabled: bool = True
     response_format: str = "verbose_json"
     require_segments: bool = True
@@ -131,7 +130,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.58"
+    plugin_version = "1.0.59"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -310,8 +309,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 "asr_model": "whisper-1",
                 "translate_model": "gpt-5-chat-latest",
                 "priority": 1,
-                "timeout": 300,
-                "proxy": False
+                "timeout": 300
             },
             {
                 "name": "备用接口",
@@ -320,8 +318,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 "asr_model": "whisper-large-v3-turbo",
                 "translate_model": "gpt-4o-mini",
                 "priority": 2,
-                "timeout": 180,
-                "proxy": False
+                "timeout": 180
             }
         ], ensure_ascii=False, indent=2)
 
@@ -644,7 +641,6 @@ class AutoSubRemoteAsr(_PluginBase):
             priority=priority,
             timeout=timeout,
             translate_timeout=translate_timeout,
-            proxy=self.__normalize_bool(item.get("proxy"), False),
             enabled=self.__normalize_bool(item.get("enabled"), True),
             response_format=response_format,
             require_segments=self.__normalize_bool(item.get("require_segments"), True),
@@ -725,7 +721,6 @@ class AutoSubRemoteAsr(_PluginBase):
                     "priority": 1,
                     "asr_timeout": self._asr_request_timeout,
                     "translate_timeout": self._translate_request_timeout,
-                    "proxy": config.get("openai_proxy", False),
                 }, 1, config)
                 if channel:
                     channels.append(channel)
@@ -759,7 +754,7 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def __create_asr_http_client(self, channel: AsrChannel, timeout: Optional[int] = None) -> httpx.Client:
         proxy_url = None
-        if channel and channel.proxy:
+        if self._openai_api_proxy:
             proxy_config = settings.PROXY or {}
             proxy_url = proxy_config.get("https") or proxy_config.get("http")
         client_kwargs = {"timeout": timeout or (channel.timeout if channel else self._asr_request_timeout)}
@@ -1000,6 +995,7 @@ class AutoSubRemoteAsr(_PluginBase):
         if asr_prompt is None:
             asr_prompt = self.__default_asr_prompt()
         self._asr_prompt = str(asr_prompt or "").strip()
+        self._openai_api_proxy = self.__normalize_bool(config.get('openai_proxy'), False)
         self._translate_request_timeout = self.__normalize_request_timeout(config.get('translate_request_timeout'), 120)
         self._translate_channel_retries = self.__normalize_int(
             config.get('translate_channel_retries'), config.get('max_retries') or 1, 0, 5
@@ -4106,7 +4102,7 @@ class AutoSubRemoteAsr(_PluginBase):
         return OpenAi(
             api_key=channel.key,
             api_url=channel.url,
-            proxy=settings.PROXY if channel.proxy else None,
+            proxy=settings.PROXY if self._openai_api_proxy else None,
             model=channel.translate_model,
             compatible=False,
             timeout=channel.translate_timeout or self._translate_request_timeout,
@@ -5392,7 +5388,7 @@ class AutoSubRemoteAsr(_PluginBase):
                 "content": [
                     self.__form_col(
                         [
-                            self.__form_switch("openai_proxy", "旧配置默认使用代理"),
+                            self.__form_switch("openai_proxy", "接口请求使用代理"),
                             self.__form_switch(
                                 "detailed_log",
                                 "详细接口日志",
