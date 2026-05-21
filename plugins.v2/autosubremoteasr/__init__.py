@@ -130,7 +130,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.61"
+    plugin_version = "1.0.62"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -2869,13 +2869,13 @@ class AutoSubRemoteAsr(_PluginBase):
         except ValueError as err:
             raise RuntimeError(f"接口ASR返回非JSON响应: {response.text[:500]}") from err
 
-    def __ensure_asr_channel_response(self, response: dict, channel: AsrChannel):
+    def __ensure_asr_channel_response(self, response: dict, channel: AsrChannel, require_segments: bool = True):
         if not isinstance(response, dict):
             raise AsrChannelIncompatible(f"{self.__asr_channel_label(channel)} 返回非JSON对象")
         segments = response.get("segments")
         if segments is not None and not isinstance(segments, list):
             raise AsrChannelIncompatible(f"{self.__asr_channel_label(channel)} 返回 segments 格式异常")
-        if channel.require_segments and not segments:
+        if require_segments and channel.require_segments and not segments:
             raise AsrChannelIncompatible(
                 f"{self.__asr_channel_label(channel)} 未返回 segments，无法生成精确SRT时间轴"
             )
@@ -2905,7 +2905,8 @@ class AutoSubRemoteAsr(_PluginBase):
 
     def __transcribe_audio_chunk_with_progress(self, audio_file: str, audio_lang: str, chunk_no: int,
                                                expected_chunks: int, task: Optional[TaskItem],
-                                               base_progress: float, use_prompt: bool = True) -> dict:
+                                               base_progress: float, use_prompt: bool = True,
+                                               require_segments: bool = True) -> dict:
         channels = self.__ordered_asr_channels()
         if not channels:
             raise AsrTransientException(
@@ -2936,7 +2937,7 @@ class AutoSubRemoteAsr(_PluginBase):
                             channel,
                             use_prompt=use_prompt,
                         )
-                        self.__ensure_asr_channel_response(response, channel)
+                        self.__ensure_asr_channel_response(response, channel, require_segments=require_segments)
                         result["response"] = response
                     except Exception as err:
                         result["error"] = err
@@ -3386,7 +3387,8 @@ class AutoSubRemoteAsr(_PluginBase):
                         total_expected,
                         task,
                         24,
-                        use_prompt=False
+                        use_prompt=False,
+                        require_segments=False
                     )
                     raw_language = response.get("language")
                     language = self.__normalize_language_code(raw_language, fallback="")
