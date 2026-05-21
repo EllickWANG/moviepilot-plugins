@@ -130,7 +130,7 @@ class AutoSubRemoteAsr(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.60"
+    plugin_version = "1.0.61"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -172,6 +172,7 @@ class AutoSubRemoteAsr(_PluginBase):
     _asr_channels: List[AsrChannel] = None
     _asr_channel_states: Dict[str, dict] = None
     _asr_last_success_channel_id = None
+    _asr_unsupported_request_languages = None
     _translate_channels: List[AsrChannel] = None
     _translate_channel_states: Dict[str, dict] = None
     _translate_last_success_channel_id = None
@@ -232,6 +233,8 @@ class AutoSubRemoteAsr(_PluginBase):
             self._translate_lock = threading.Semaphore(1)
         if self._asr_channel_states is None:
             self._asr_channel_states = {}
+        if self._asr_unsupported_request_languages is None:
+            self._asr_unsupported_request_languages = set()
         if self._translate_channel_states is None:
             self._translate_channel_states = {}
 
@@ -2742,9 +2745,20 @@ class AutoSubRemoteAsr(_PluginBase):
             return self.__is_chinese_language(value)
         return False
 
+    @staticmethod
+    def __is_asr_unsupported_language_error(text: str) -> bool:
+        normalized = str(text or "").lower()
+        return (
+                "unsupported_language" in normalized
+                or ("language" in normalized and "not supported" in normalized)
+        )
+
     def __transcribe_audio_chunk(self, audio_file: str, audio_lang: str,
                                  channel: AsrChannel, use_prompt: bool = True) -> dict:
         request_lang = self.__normalize_language_code(audio_lang, fallback="")
+        if request_lang and request_lang in (self._asr_unsupported_request_languages or set()):
+            logger.info(f"ASR语言 {request_lang} 已记录为接口不支持，本次请求改为自动检测")
+            request_lang = ""
         data = {
             "model": channel.model,
             "response_format": channel.response_format or "verbose_json",
@@ -2772,22 +2786,25 @@ class AutoSubRemoteAsr(_PluginBase):
                 f"timeout={channel.timeout}s "
                 f"file={os.path.basename(audio_file)} size={audio_size}"
             )
-        started_at = time.time()
-        with self.__create_asr_http_client(channel, timeout=channel.timeout) as client:
-            with open(audio_file, "rb") as file_obj:
-                try:
-                    response = client.post(
+        def post_asr_request(payload: dict):
+            with self.__create_asr_http_client(channel, timeout=channel.timeout) as client:
+                with open(audio_file, "rb") as file_obj:
+                    return client.post(
                         url,
                         headers={"Authorization": f"Bearer {channel.key}"},
-                        data=data,
+                        data=payload,
                         files={"file": (os.path.basename(audio_file), file_obj, "audio/mpeg")},
                     )
-                except Exception as err:
-                    logger.error(
-                        f"接口ASR请求异常：channel={self.__asr_channel_label(channel)} url={url} "
-                        f"elapsed={time.time() - started_at:.2f}s error={err}"
-                    )
-                    raise
+
+        started_at = time.time()
+        try:
+            response = post_asr_request(data)
+        except Exception as err:
+            logger.error(
+                f"接口ASR请求异常：channel={self.__asr_channel_label(channel)} url={url} "
+                f"elapsed={time.time() - started_at:.2f}s error={err}"
+            )
+            raise
         if self._detailed_log:
             logger.info(
                 f"接口ASR响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
@@ -2798,6 +2815,45 @@ class AutoSubRemoteAsr(_PluginBase):
                 f"接口ASR响应：status={response.status_code} elapsed={time.time() - started_at:.2f}s "
                 f"body_chars={len(response.text or '')}"
             )
+
+        unsupported_lang = data.get("language")
+        if (
+                response.status_code == 400
+                and unsupported_lang
+                and self.__is_asr_unsupported_language_error(response.text)
+        ):
+            self._asr_unsupported_request_languages.add(unsupported_lang)
+            retry_data = dict(data)
+            retry_data.pop("language", None)
+            logger.warn(
+                f"接口ASR不支持 language={unsupported_lang}，本次改为不指定语言重试："
+                f"{self.__asr_channel_label(channel)}"
+            )
+            if self._detailed_log:
+                logger.info(
+                    f"接口ASR重试请求：channel={self.__asr_channel_label(channel)} url={url} "
+                    f"timeout={channel.timeout}s "
+                    f"file={os.path.basename(audio_file)} size={audio_size} data={_log_preview(retry_data)}"
+                )
+            retry_started_at = time.time()
+            try:
+                response = post_asr_request(retry_data)
+            except Exception as err:
+                logger.error(
+                    f"接口ASR重试请求异常：channel={self.__asr_channel_label(channel)} url={url} "
+                    f"elapsed={time.time() - retry_started_at:.2f}s error={err}"
+                )
+                raise
+            if self._detailed_log:
+                logger.info(
+                    f"接口ASR重试响应：status={response.status_code} "
+                    f"elapsed={time.time() - retry_started_at:.2f}s body={_log_preview(response.text)}"
+                )
+            else:
+                logger.info(
+                    f"接口ASR重试响应：status={response.status_code} "
+                    f"elapsed={time.time() - retry_started_at:.2f}s body_chars={len(response.text or '')}"
+                )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as err:
