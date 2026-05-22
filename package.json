@@ -38,7 +38,7 @@
   "FlowBrush": {
     "name": "刷流",
     "description": "自动托管站点刷流。",
-    "version": "4.3.5.3",
+    "version": "4.3.5.4",
     "icon": "mdi-brush",
     "author": "Ellick",
     "level": 2,

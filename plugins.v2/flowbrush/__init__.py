@@ -263,7 +263,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.5.3"
+    plugin_version = "4.3.5.4"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1863,25 +1863,25 @@ class FlowBrush(_PluginBase):
         # 表格标题
         headers = [
             {'title': '任务创建时间', 'key': 'created_at', 'sortable': True},
+            {'title': '状态', 'key': 'status', 'sortable': True},
             {'title': '站点', 'key': 'site', 'sortable': True},
             {'title': '标题', 'key': 'title', 'sortable': True},
             {'title': '大小', 'key': 'size', 'sortable': True},
             {'title': '上传量', 'key': 'uploaded', 'sortable': True},
             {'title': '下载量', 'key': 'downloaded', 'sortable': True},
             {'title': '分享率', 'key': 'ratio', 'sortable': True},
-            {'title': '状态', 'key': 'status', 'sortable': True},
         ]
         # 种子数据明细
         items = [
             {
                 'created_at': self.__format_brush_created_time(data.get("time")),
+                'status': "已删除" if data.get("deleted") else "正常",
                 'site': data.get("site_name"),
                 'title': data.get("title"),
                 'size': StringUtils.str_filesize(data.get("size")),
                 'uploaded': StringUtils.str_filesize(data.get("uploaded") or 0),
                 'downloaded': StringUtils.str_filesize(data.get("downloaded") or 0),
                 'ratio': round(data.get('ratio') or 0, 2),
-                'status': "已删除" if data.get("deleted") else "正常"
             } for data in data_list
         ]
 
