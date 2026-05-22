@@ -263,7 +263,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.5.2"
+    plugin_version = "4.3.5.3"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1862,8 +1862,8 @@ class FlowBrush(_PluginBase):
 
         # 表格标题
         headers = [
+            {'title': '任务创建时间', 'key': 'created_at', 'sortable': True},
             {'title': '站点', 'key': 'site', 'sortable': True},
-            {'title': '创建时间', 'key': 'created_at', 'sortable': True},
             {'title': '标题', 'key': 'title', 'sortable': True},
             {'title': '大小', 'key': 'size', 'sortable': True},
             {'title': '上传量', 'key': 'uploaded', 'sortable': True},
@@ -1874,8 +1874,8 @@ class FlowBrush(_PluginBase):
         # 种子数据明细
         items = [
             {
+                'created_at': self.__format_brush_created_time(data.get("time")),
                 'site': data.get("site_name"),
-                'created_at': self.__format_torrent_created_time(data.get("pubdate")),
                 'title': data.get("title"),
                 'size': StringUtils.str_filesize(data.get("size")),
                 'uploaded': StringUtils.str_filesize(data.get("uploaded") or 0),
@@ -1930,9 +1930,13 @@ class FlowBrush(_PluginBase):
         ]
 
     @staticmethod
-    def __format_torrent_created_time(value: Any) -> str:
+    def __format_brush_created_time(value: Any) -> str:
         if not value:
             return "-"
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError, OSError):
+            pass
         text = str(value).strip().replace("T", " ").replace("Z", "")
         if "." in text:
             text = text.split(".", 1)[0]
