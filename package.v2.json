@@ -31,6 +31,14 @@
     "author": "Ellick",
     "level": 1
   },
+  "FlowBrush": {
+    "name": "刷流",
+    "description": "自动托管站点刷流。",
+    "version": "4.3.5.1",
+    "icon": "mdi-brush",
+    "author": "Ellick",
+    "level": 2
+  },
   "AutoSignIn": {
     "name": "站点自动签到",
     "description": "自动模拟登录、签到站点；私有修复 HDCity 签到识别和馒头登录状态误报。",
