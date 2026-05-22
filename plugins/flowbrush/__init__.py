@@ -263,7 +263,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.5.4"
+    plugin_version = "4.3.5.5"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1860,16 +1860,36 @@ class FlowBrush(_PluginBase):
             # 按time倒序排序
             data_list = sorted(data_list, key=lambda x: x.get("time") or 0, reverse=True)
 
+        compact_cell_props = {
+            'style': 'white-space: nowrap;'
+        }
+        title_cell_props = {
+            'style': (
+                'width: 28rem; max-width: 28rem; white-space: nowrap; '
+                'overflow: hidden; text-overflow: ellipsis;'
+            )
+        }
+        title_header_props = {
+            'style': 'width: 28rem; max-width: 28rem; white-space: nowrap;'
+        }
         # 表格标题
         headers = [
-            {'title': '任务创建时间', 'key': 'created_at', 'sortable': True},
-            {'title': '状态', 'key': 'status', 'sortable': True},
-            {'title': '站点', 'key': 'site', 'sortable': True},
-            {'title': '标题', 'key': 'title', 'sortable': True},
-            {'title': '大小', 'key': 'size', 'sortable': True},
-            {'title': '上传量', 'key': 'uploaded', 'sortable': True},
-            {'title': '下载量', 'key': 'downloaded', 'sortable': True},
-            {'title': '分享率', 'key': 'ratio', 'sortable': True},
+            {'title': '任务创建时间', 'key': 'created_at', 'sortable': True, 'width': 136, 'nowrap': True,
+             'cellProps': compact_cell_props, 'headerProps': compact_cell_props},
+            {'title': '状态', 'key': 'status', 'sortable': True, 'width': 72, 'nowrap': True,
+             'cellProps': compact_cell_props, 'headerProps': compact_cell_props},
+            {'title': '站点', 'key': 'site', 'sortable': True, 'width': 108, 'nowrap': True,
+             'cellProps': compact_cell_props, 'headerProps': compact_cell_props},
+            {'title': '标题', 'key': 'title', 'sortable': True, 'width': '28rem', 'maxWidth': '28rem',
+             'nowrap': True, 'cellProps': title_cell_props, 'headerProps': title_header_props},
+            {'title': '大小', 'key': 'size', 'sortable': True, 'width': 96, 'nowrap': True,
+             'cellProps': compact_cell_props, 'headerProps': compact_cell_props},
+            {'title': '上传量', 'key': 'uploaded', 'sortable': True, 'width': 96, 'nowrap': True,
+             'cellProps': compact_cell_props, 'headerProps': compact_cell_props},
+            {'title': '下载量', 'key': 'downloaded', 'sortable': True, 'width': 96, 'nowrap': True,
+             'cellProps': compact_cell_props, 'headerProps': compact_cell_props},
+            {'title': '分享率', 'key': 'ratio', 'sortable': True, 'width': 80, 'nowrap': True,
+             'cellProps': compact_cell_props, 'headerProps': compact_cell_props},
         ]
         # 种子数据明细
         items = [
