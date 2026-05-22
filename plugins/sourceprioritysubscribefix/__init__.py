@@ -13,6 +13,7 @@ from xml.dom import minidom
 from fastapi import BackgroundTasks, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import schemas
 from app.api.endpoints.search import _stream_search_events
@@ -29,7 +30,7 @@ from app.core.context import Context, MediaInfo
 from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo, MetaInfoPath
 from app.core.security import verify_resource_token, verify_token
-from app.db import async_db_query, db_query
+from app.db import async_db_query, db_query, get_async_db
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.models.downloadhistory import DownloadHistory
 from app.db.models.subscribe import Subscribe
@@ -45,13 +46,14 @@ from app.schemas.types import ContentType, EventType, ModuleType, NotificationTy
 from app.helper.subscribe import SubscribeHelper
 from app.helper.torrent import TorrentHelper
 from app.utils.dom import DomUtils
+from app.utils.http import AsyncRequestUtils, RequestUtils
 
 
 class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.46"
+    plugin_version = "1.0.47"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -66,9 +68,15 @@ class sourceprioritysubscribefix(_PluginBase):
     _original_search_route_indexes: dict[str, int] = {}
     _original_search_endpoints: dict[str, Any] = {}
     _plugin_search_route_registered = False
+    _original_subscribe_list_routes: list[Any] = []
+    _original_subscribe_list_route_index: Optional[int] = None
+    _plugin_subscribe_list_route_registered = False
     _original_subscribe_search_routes: list[Any] = []
     _original_subscribe_search_route_index: Optional[int] = None
     _plugin_subscribe_search_route_registered = False
+    _original_tmdb_episode_routes: list[Any] = []
+    _original_tmdb_episode_route_index: Optional[int] = None
+    _plugin_tmdb_episode_route_registered = False
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -176,6 +184,7 @@ class sourceprioritysubscribefix(_PluginBase):
             "subscribe_add": SubscribeChain.add,
             "subscribe_async_add": SubscribeChain.async_add,
             "subscribe_cache_calendar": SubscribeChain.cache_calendar,
+            "subscribe_files_info": SubscribeChain.subscribe_files_info,
             "subscribe_exists": SubscribeChain.__dict__["exists"],
             "subscribe_recognize_media": SubscribeChain.recognize_media,
             "subscribe_async_recognize_media": SubscribeChain.async_recognize_media,
@@ -203,6 +212,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SubscribeChain.add = _patched_subscribe_add
         SubscribeChain.async_add = _patched_subscribe_async_add
         SubscribeChain.cache_calendar = _patched_subscribe_cache_calendar
+        SubscribeChain.subscribe_files_info = _patched_subscribe_files_info
         SubscribeChain.exists = staticmethod(_patched_subscribe_exists)
         SubscribeChain.recognize_media = _patched_subscribe_recognize_media
         SubscribeChain.async_recognize_media = _patched_subscribe_async_recognize_media
@@ -227,6 +237,8 @@ class sourceprioritysubscribefix(_PluginBase):
         if "transfer_redo_transfer_history" in cls._originals:
             TransferChain.redo_transfer_history = _patched_transfer_redo_transfer_history
         cls._patch_media_seasons_route()
+        cls._patch_subscribe_list_route()
+        cls._patch_tmdb_episode_route()
         cls._patch_search_routes()
         cls._patch_subscribe_search_route()
         cls._patched = True
@@ -239,6 +251,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SubscribeChain.add = cls._originals["subscribe_add"]
         SubscribeChain.async_add = cls._originals["subscribe_async_add"]
         SubscribeChain.cache_calendar = cls._originals["subscribe_cache_calendar"]
+        SubscribeChain.subscribe_files_info = cls._originals["subscribe_files_info"]
         SubscribeChain.exists = cls._originals["subscribe_exists"]
         SubscribeChain.recognize_media = cls._originals["subscribe_recognize_media"]
         SubscribeChain.async_recognize_media = cls._originals["subscribe_async_recognize_media"]
@@ -264,6 +277,8 @@ class sourceprioritysubscribefix(_PluginBase):
             TransferChain.redo_transfer_history = cls._originals["transfer_redo_transfer_history"]
         cls._restore_subscribe_search_route()
         cls._restore_search_routes()
+        cls._restore_tmdb_episode_route()
+        cls._restore_subscribe_list_route()
         cls._restore_media_seasons_route()
         cls._originals = {}
         cls._patched = False
@@ -401,6 +416,121 @@ class sourceprioritysubscribefix(_PluginBase):
         cls._plugin_search_route_registered = False
 
     @classmethod
+    def _patch_subscribe_list_route(cls):
+        """
+        给 Bangumi-only 订阅列表响应临时补一个日历可用的 tmdbid。
+
+        MoviePilot 前端日历只会对有 tmdbid 的剧集订阅请求 /tmdb/{tmdbid}/{season}，
+        所以这里只改 API 响应，不回写数据库。
+        """
+        if cls._plugin_subscribe_list_route_registered:
+            return
+        path = f"{settings.API_V1_STR}/subscribe/"
+        remaining_routes = []
+        cls._original_subscribe_list_routes = []
+        cls._original_subscribe_list_route_index = None
+        for route in app.routes:
+            if getattr(route, "path", None) == path and "GET" in getattr(route, "methods", set()):
+                if cls._original_subscribe_list_route_index is None:
+                    cls._original_subscribe_list_route_index = len(remaining_routes)
+                cls._original_subscribe_list_routes.append(route)
+                continue
+            remaining_routes.append(route)
+        app.routes[:] = remaining_routes
+        route_count = len(app.routes)
+        app.add_api_route(
+            path,
+            _patched_read_subscribes,
+            methods=["GET"],
+            response_model=List[schemas.Subscribe],
+            summary="查询所有订阅",
+            tags=["subscribe"],
+        )
+        new_routes = app.routes[route_count:]
+        del app.routes[route_count:]
+        insert_at = cls._original_subscribe_list_route_index
+        if insert_at is None:
+            insert_at = len(app.routes)
+        for offset, route in enumerate(new_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._plugin_subscribe_list_route_registered = True
+
+    @classmethod
+    def _restore_subscribe_list_route(cls):
+        if not cls._plugin_subscribe_list_route_registered:
+            return
+        app.routes[:] = [
+            route for route in app.routes
+            if getattr(route, "endpoint", None) is not _patched_read_subscribes
+        ]
+        insert_at = cls._original_subscribe_list_route_index
+        if insert_at is None:
+            insert_at = len(app.routes)
+        for offset, route in enumerate(cls._original_subscribe_list_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._original_subscribe_list_routes = []
+        cls._original_subscribe_list_route_index = None
+        cls._plugin_subscribe_list_route_registered = False
+
+    @classmethod
+    def _patch_tmdb_episode_route(cls):
+        """
+        接管季集查询入口，让日历能通过临时 tmdbid 读取 Bangumi 分集日期。
+        """
+        if cls._plugin_tmdb_episode_route_registered:
+            return
+        path = f"{settings.API_V1_STR}/tmdb/{{tmdbid}}/{{season}}"
+        remaining_routes = []
+        cls._original_tmdb_episode_routes = []
+        cls._original_tmdb_episode_route_index = None
+        for route in app.routes:
+            if getattr(route, "path", None) == path and "GET" in getattr(route, "methods", set()):
+                if cls._original_tmdb_episode_route_index is None:
+                    cls._original_tmdb_episode_route_index = len(remaining_routes)
+                cls._original_tmdb_episode_routes.append(route)
+                continue
+            remaining_routes.append(route)
+        app.routes[:] = remaining_routes
+        route_count = len(app.routes)
+        app.add_api_route(
+            path,
+            _patched_tmdb_season_episodes,
+            methods=["GET"],
+            response_model=List[schemas.TmdbEpisode],
+            summary="TMDB季所有集",
+            tags=["tmdb"],
+        )
+        new_routes = app.routes[route_count:]
+        del app.routes[route_count:]
+        insert_at = cls._original_tmdb_episode_route_index
+        if insert_at is None:
+            insert_at = len(app.routes)
+        for offset, route in enumerate(new_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._plugin_tmdb_episode_route_registered = True
+
+    @classmethod
+    def _restore_tmdb_episode_route(cls):
+        if not cls._plugin_tmdb_episode_route_registered:
+            return
+        app.routes[:] = [
+            route for route in app.routes
+            if getattr(route, "endpoint", None) is not _patched_tmdb_season_episodes
+        ]
+        insert_at = cls._original_tmdb_episode_route_index
+        if insert_at is None:
+            insert_at = len(app.routes)
+        for offset, route in enumerate(cls._original_tmdb_episode_routes):
+            app.routes.insert(min(insert_at + offset, len(app.routes)), route)
+        app.openapi_schema = None
+        cls._original_tmdb_episode_routes = []
+        cls._original_tmdb_episode_route_index = None
+        cls._plugin_tmdb_episode_route_registered = False
+
+    @classmethod
     def _patch_subscribe_search_route(cls):
         """
         接管单个订阅的手动搜索入口。
@@ -475,11 +605,40 @@ async def _patched_subscribe_search(
     return schemas.Response(success=True)
 
 
+async def _patched_read_subscribes(
+        db: AsyncSession = Depends(get_async_db),
+        _: schemas.TokenPayload = Depends(verify_token)) -> Any:
+    subscribes = await Subscribe.async_list(db)
+    return [_subscribe_calendar_payload(subscribe) for subscribe in subscribes]
+
+
+async def _patched_tmdb_season_episodes(
+        tmdbid: int,
+        season: int,
+        episode_group: Optional[str] = None,
+        _: schemas.TokenPayload = Depends(verify_token)) -> Any:
+    bangumiid = _bangumi_id_from_calendar_tmdbid(tmdbid)
+    if bangumiid:
+        episodes = await _async_bangumi_tmdb_episodes(bangumiid=bangumiid, season=season)
+        if not episodes:
+            logger.warn(f"Bangumi日历未获取到分集信息：bangumi:{bangumiid} S{season}")
+        return episodes
+    return await TmdbChain().async_tmdb_episodes(
+        tmdbid=tmdbid,
+        season=season,
+        episode_group=episode_group,
+    )
+
+
 _SOURCE_SUBSCRIBE_CACHE = {
     "time": 0.0,
     "items": [],
 }
 
+_BANGUMI_API_BASE = "https://api.bgm.tv"
+_BANGUMI_CALENDAR_TMDB_OFFSET = 1_000_000_000
+_BANGUMI_EPISODE_CACHE_TTL = 6 * 3600
+_BANGUMI_EPISODE_CACHE: dict[int, tuple[float, list[dict]]] = {}
 _MEDIA_SERVER_REFRESH_CACHE: dict[str, float] = {}
 _MEDIA_SERVER_COMPAT_ID_CACHE: dict[str, tuple[float, Optional[int]]] = {}
 _TMDB_EPISODE_STILL_CACHE: dict[str, tuple[float, dict[int, str]]] = {}
@@ -488,6 +647,213 @@ _TMDB_EPISODE_STILL_CACHE: dict[str, tuple[float, dict[int, str]]] = {}
 def _clear_source_subscribe_cache():
     _SOURCE_SUBSCRIBE_CACHE["time"] = 0.0
     _SOURCE_SUBSCRIBE_CACHE["items"] = []
+
+
+def _bangumi_calendar_tmdbid(bangumiid: Any) -> Optional[int]:
+    bid = _int_or_none(bangumiid)
+    if not bid:
+        return None
+    return -(_BANGUMI_CALENDAR_TMDB_OFFSET + bid)
+
+
+def _bangumi_id_from_calendar_tmdbid(tmdbid: Any) -> Optional[int]:
+    value = _int_or_none(tmdbid)
+    if value is None or value >= 0:
+        return None
+    raw_id = abs(value)
+    if raw_id > _BANGUMI_CALENDAR_TMDB_OFFSET:
+        return raw_id - _BANGUMI_CALENDAR_TMDB_OFFSET
+    return raw_id
+
+
+def _subscribe_calendar_payload(subscribe: Any) -> dict:
+    if isinstance(subscribe, dict):
+        data = dict(subscribe)
+    elif hasattr(subscribe, "to_dict"):
+        data = subscribe.to_dict()
+    else:
+        data = schemas.Subscribe.model_validate(subscribe).model_dump()
+    if _is_bangumi_only_subscribe(subscribe):
+        bangumiid = _int_or_none(data.get("bangumiid") or getattr(subscribe, "bangumiid", None))
+        calendar_tmdbid = _bangumi_calendar_tmdbid(bangumiid)
+        if calendar_tmdbid:
+            data["tmdbid"] = calendar_tmdbid
+            data["mediaid"] = data.get("mediaid") or f"bangumi:{bangumiid}"
+    return data
+
+
+def _bangumi_headers() -> dict:
+    return {
+        "User-Agent": (
+            f"EllickWANG/MoviePilot-sourceprioritysubscribefix/"
+            f"{sourceprioritysubscribefix.plugin_version} (https://movie.nyxara.cn)"
+        ),
+        "Accept": "application/json",
+    }
+
+
+def _bangumi_response_json(response: Any, bangumiid: int) -> Optional[dict]:
+    if not response:
+        return None
+    status_code = getattr(response, "status_code", None)
+    if status_code and status_code >= 400:
+        logger.warn(f"Bangumi分集接口请求失败：bangumi:{bangumiid} HTTP {status_code}")
+        return None
+    try:
+        data = response.json()
+    except Exception as err:
+        logger.warn(f"Bangumi分集接口响应解析失败：bangumi:{bangumiid} - {err}")
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _bangumi_cached_episode_items(bangumiid: int) -> Optional[list[dict]]:
+    cached = _BANGUMI_EPISODE_CACHE.get(bangumiid)
+    if cached and time.time() - cached[0] < _BANGUMI_EPISODE_CACHE_TTL:
+        return cached[1]
+    return None
+
+
+def _cache_bangumi_episode_items(bangumiid: int, episodes: list[dict]) -> list[dict]:
+    _BANGUMI_EPISODE_CACHE[bangumiid] = (time.time(), episodes)
+    return episodes
+
+
+def _bangumi_episode_items(bangumiid: Any) -> list[dict]:
+    bid = _int_or_none(bangumiid)
+    if not bid:
+        return []
+    cached = _bangumi_cached_episode_items(bid)
+    if cached is not None:
+        return cached
+
+    episodes: list[dict] = []
+    limit = 200
+    offset = 0
+    total: Optional[int] = None
+    while True:
+        response = RequestUtils(headers=_bangumi_headers(), timeout=15).get_res(
+            url=f"{_BANGUMI_API_BASE}/v0/episodes",
+            params={"subject_id": bid, "type": 0, "limit": limit, "offset": offset},
+        )
+        try:
+            data = _bangumi_response_json(response, bid)
+        finally:
+            if response is not None:
+                response.close()
+        if not data:
+            break
+        batch = data.get("data") or []
+        if not isinstance(batch, list):
+            break
+        episodes.extend(item for item in batch if isinstance(item, dict))
+        total = _int_or_none(data.get("total")) or len(episodes)
+        offset += len(batch)
+        if not batch or offset >= total or len(batch) < limit:
+            break
+    return _cache_bangumi_episode_items(bid, episodes) if episodes or total == 0 else []
+
+
+async def _async_bangumi_episode_items(bangumiid: Any) -> list[dict]:
+    bid = _int_or_none(bangumiid)
+    if not bid:
+        return []
+    cached = _bangumi_cached_episode_items(bid)
+    if cached is not None:
+        return cached
+
+    episodes: list[dict] = []
+    limit = 200
+    offset = 0
+    total: Optional[int] = None
+    while True:
+        response = await AsyncRequestUtils(headers=_bangumi_headers(), timeout=15).get_res(
+            url=f"{_BANGUMI_API_BASE}/v0/episodes",
+            params={"subject_id": bid, "type": 0, "limit": limit, "offset": offset},
+        )
+        try:
+            data = _bangumi_response_json(response, bid)
+        finally:
+            if response is not None:
+                await response.aclose()
+        if not data:
+            break
+        batch = data.get("data") or []
+        if not isinstance(batch, list):
+            break
+        episodes.extend(item for item in batch if isinstance(item, dict))
+        total = _int_or_none(data.get("total")) or len(episodes)
+        offset += len(batch)
+        if not batch or offset >= total or len(batch) < limit:
+            break
+    return _cache_bangumi_episode_items(bid, episodes) if episodes or total == 0 else []
+
+
+def _bangumi_episode_number(item: dict) -> Optional[int]:
+    for key in ("ep", "sort"):
+        raw_value = item.get(key)
+        if raw_value is None:
+            continue
+        try:
+            number = int(float(str(raw_value)))
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def _bangumi_episode_name(item: Optional[dict], episode: int) -> str:
+    if item:
+        for key in ("name_cn", "name"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+    return f"第 {episode} 集"
+
+
+def _bangumi_episode_runtime(item: Optional[dict]) -> Optional[int]:
+    if not item:
+        return None
+    seconds = _int_or_none(item.get("duration_seconds"))
+    if not seconds:
+        return None
+    return max(1, round(seconds / 60))
+
+
+def _bangumi_tmdb_episodes_from_items(items: list[dict], season: int) -> list[schemas.TmdbEpisode]:
+    episodes: dict[int, schemas.TmdbEpisode] = {}
+    for item in items:
+        episode_number = _bangumi_episode_number(item)
+        if not episode_number or episode_number in episodes:
+            continue
+        episodes[episode_number] = schemas.TmdbEpisode(
+            air_date=item.get("airdate") or None,
+            episode_number=episode_number,
+            episode_type="standard",
+            name=_bangumi_episode_name(item, episode_number),
+            overview=item.get("desc") or None,
+            runtime=_bangumi_episode_runtime(item),
+            season_number=season,
+            still_path=None,
+            vote_average=0,
+        )
+    return [episodes[number] for number in sorted(episodes)]
+
+
+def _bangumi_tmdb_episodes(bangumiid: Any, season: int) -> list[schemas.TmdbEpisode]:
+    return _bangumi_tmdb_episodes_from_items(_bangumi_episode_items(bangumiid), season)
+
+
+async def _async_bangumi_tmdb_episodes(bangumiid: Any, season: int) -> list[schemas.TmdbEpisode]:
+    return _bangumi_tmdb_episodes_from_items(await _async_bangumi_episode_items(bangumiid), season)
+
+
+def _bangumi_episode_item(bangumiid: Any, episode: int) -> Optional[dict]:
+    for item in _bangumi_episode_items(bangumiid):
+        if _bangumi_episode_number(item) == int(episode):
+            return item
+    return None
 
 
 def _type_value(value: Any) -> Optional[str]:
@@ -1762,20 +2128,24 @@ def _bangumi_season_nfo(mediainfo: MediaInfo, season: int) -> minidom.Document:
     return doc
 
 
-def _bangumi_episode_title(episode: int) -> str:
-    return f"第 {episode} 集"
+def _bangumi_episode_title(episode: int, item: Optional[dict] = None) -> str:
+    return _bangumi_episode_name(item, episode)
 
 
 def _bangumi_episode_nfo(mediainfo: MediaInfo, season: int, episode: int) -> minidom.Document:
     doc = minidom.Document()
     root = DomUtils.add_node(doc, doc, "episodedetails")
     _bangumi_add_common_nfo(doc, root, mediainfo, f"s{season}e{episode}")
-    title = _bangumi_episode_title(episode)
+    episode_item = _bangumi_episode_item(mediainfo.bangumi_id, episode)
+    title = _bangumi_episode_title(episode, episode_item)
+    original_title = str((episode_item or {}).get("name") or "").strip() or title
+    aired = (episode_item or {}).get("airdate") or mediainfo.release_date or ""
+    runtime = _bangumi_episode_runtime(episode_item)
     episode_id = f"bangumi-{mediainfo.bangumi_id}-s{season}e{episode}"
     _add_text_node(doc, root, "id", episode_id)
     _add_text_node(doc, root, "episodeid", episode_id)
     _add_text_node(doc, root, "title", title)
-    _add_text_node(doc, root, "originaltitle", title)
+    _add_text_node(doc, root, "originaltitle", original_title)
     _add_text_node(doc, root, "showtitle", _bangumi_tv_show_title(mediainfo))
     _add_text_node(doc, root, "sorttitle", f"S{int(season):02d}E{int(episode):02d}")
     _add_text_node(doc, root, "season", season)
@@ -1784,7 +2154,9 @@ def _bangumi_episode_nfo(mediainfo: MediaInfo, season: int, episode: int) -> min
     _add_text_node(doc, root, "episodenumber", episode)
     _add_text_node(doc, root, "displayseason", season)
     _add_text_node(doc, root, "displayepisode", episode)
-    _add_text_node(doc, root, "aired", mediainfo.release_date or "")
+    _add_text_node(doc, root, "aired", aired)
+    if runtime:
+        _add_text_node(doc, root, "runtime", runtime)
     _add_text_node(doc, root, "lockdata", "true")
     return doc
 
@@ -3118,6 +3490,29 @@ async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: A
     ))
 
 
+def _apply_bangumi_episode_info_to_subscribe_files(info: Optional[schemas.SubscrbieInfo],
+                                                   subscribe: Subscribe) -> Optional[schemas.SubscrbieInfo]:
+    if not info or not info.episodes or not _is_bangumi_only_subscribe(subscribe):
+        return info
+    season = _season_number(getattr(subscribe, "season", None)) or 1
+    episodes = _bangumi_tmdb_episodes(bangumiid=subscribe.bangumiid, season=season)
+    for episode in episodes:
+        episode_number = episode.episode_number
+        if episode_number is None or episode_number not in info.episodes:
+            continue
+        episode_info = info.episodes[episode_number]
+        if episode.name:
+            episode_info.title = episode.name
+        if episode.overview:
+            episode_info.description = episode.overview
+    return info
+
+
+def _patched_subscribe_files_info(self: SubscribeChain, subscribe: Subscribe) -> Optional[schemas.SubscrbieInfo]:
+    info = sourceprioritysubscribefix._originals["subscribe_files_info"](self, subscribe)
+    return _apply_bangumi_episode_info_to_subscribe_files(info, subscribe)
+
+
 async def _patched_subscribe_cache_calendar(self: SubscribeChain):
     """
     订阅日历预缓存：外部来源订阅不要再用 tmdbid=None 查询 TMDB 分集。
@@ -3168,7 +3563,13 @@ async def _patched_subscribe_cache_calendar(self: SubscribeChain):
 
             season = _season_number(subscribe.season) or _season_number(getattr(mediainfo, "season", None)) or 1
             episodes = (getattr(mediainfo, "seasons", None) or {}).get(season) or []
-            if not episodes and not getattr(subscribe, "total_episode", None):
+            calendar_episodes = []
+            if bangumi_only:
+                calendar_episodes = await _async_bangumi_tmdb_episodes(
+                    bangumiid=subscribe.bangumiid,
+                    season=season,
+                )
+            if not episodes and not calendar_episodes and not getattr(subscribe, "total_episode", None):
                 logger.warn(
                     f"未识别到外部来源季集信息，标题：{subscribe.name}，豆瓣ID：{subscribe.doubanid}，"
                     f"BangumiID：{subscribe.bangumiid}，季：{season}"
@@ -3385,9 +3786,17 @@ def _fill_total_episode(chain: SubscribeChain, mediainfo: MediaInfo, title: str,
                 logger.error("媒体信息识别失败！")
                 return None, season, "媒体信息识别失败"
             if not mediainfo.seasons:
-                logger.error(f"媒体信息中没有季集信息，标题：{title}，tmdbid：{tmdbid}，doubanid：{doubanid}")
-                return None, season, "媒体信息中没有季集信息"
-        total_episode = len(mediainfo.seasons.get(season) or [])
+                bangumi_episode_count = (
+                    len(_bangumi_episode_items(mediainfo.bangumi_id or bangumiid))
+                    if bangumi_only
+                    else 0
+                )
+                if not bangumi_episode_count:
+                    logger.error(f"媒体信息中没有季集信息，标题：{title}，tmdbid：{tmdbid}，doubanid：{doubanid}")
+                    return None, season, "媒体信息中没有季集信息"
+        total_episode = len((mediainfo.seasons or {}).get(season) or [])
+        if not total_episode and _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
+            total_episode = len(_bangumi_episode_items(mediainfo.bangumi_id or bangumiid))
         if not total_episode:
             logger.error(f"未获取到总集数，标题：{title}，tmdbid：{tmdbid}, doubanid：{doubanid}")
             return None, season, f"未获取到第 {season} 季的总集数"
@@ -3418,9 +3827,17 @@ async def _async_fill_total_episode(chain: SubscribeChain, mediainfo: MediaInfo,
                 logger.error("媒体信息识别失败！")
                 return None, season, "媒体信息识别失败"
             if not mediainfo.seasons:
-                logger.error(f"媒体信息中没有季集信息，标题：{title}，tmdbid：{tmdbid}，doubanid：{doubanid}")
-                return None, season, "媒体信息中没有季集信息"
-        total_episode = len(mediainfo.seasons.get(season) or [])
+                bangumi_episode_count = (
+                    len(await _async_bangumi_episode_items(mediainfo.bangumi_id or bangumiid))
+                    if bangumi_only
+                    else 0
+                )
+                if not bangumi_episode_count:
+                    logger.error(f"媒体信息中没有季集信息，标题：{title}，tmdbid：{tmdbid}，doubanid：{doubanid}")
+                    return None, season, "媒体信息中没有季集信息"
+        total_episode = len((mediainfo.seasons or {}).get(season) or [])
+        if not total_episode and _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
+            total_episode = len(await _async_bangumi_episode_items(mediainfo.bangumi_id or bangumiid))
         if not total_episode:
             logger.error(f"未获取到总集数，标题：{title}，tmdbid：{tmdbid}, doubanid：{doubanid}")
             return None, season, f"未获取到第 {season} 季的总集数"
