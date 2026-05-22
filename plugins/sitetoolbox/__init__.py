@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import html as html_lib
 import importlib
 import inspect
 import json
 import logging
+import os
 import pkgutil
 import re
 import sys
 import time
+from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -22,6 +25,7 @@ from app import schemas
 from app.core.config import settings
 from app.db.site_oper import SiteOper
 from app.db.systemconfig_oper import SystemConfigOper
+from app.helper.directory import DirectoryHelper
 from app.helper.downloader import DownloaderHelper
 from app.helper.rss import RssHelper
 from app.helper.sites import SitesHelper
@@ -32,11 +36,39 @@ from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 
+ORPHAN_EXCLUDE_PATTERNS = [
+    ".DS_Store",
+    "Thumbs.db",
+    "*.torrent",
+    "*.fastresume",
+    "*.parts",
+    "*.part",
+    "*.tmp",
+    "*.temp",
+    "*.!qB",
+    "*.aria2",
+    "*.mp",
+    "@eaDir",
+    "@eaDir/*",
+    "#recycle",
+    "#recycle/*",
+    "@Recycle",
+    "@Recycle/*",
+    ".Recycle.Bin",
+    ".Recycle.Bin/*",
+    ".Trash",
+    ".Trash/*",
+    "lost+found",
+    "lost+found/*",
+]
+ORPHAN_EXCLUDE_PATTERN_TEXT = "\n".join(ORPHAN_EXCLUDE_PATTERNS)
+
+
 class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
-    plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
+    plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失/无种文件清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.8"
+    plugin_version = "1.3.9"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -60,6 +92,12 @@ class sitetoolbox(_PluginBase):
     _cleanup_auto_cron = "0 */6 * * *"
     _latest_missing_preview: Dict[str, Any] = {}
     _latest_missing_cleanup: Dict[str, Any] = {}
+    _orphan_downloader_names: List[str] = []
+    _orphan_scan_paths: List[str] = []
+    _orphan_min_age_hours = 24
+    _orphan_exclude_patterns = ORPHAN_EXCLUDE_PATTERN_TEXT
+    _latest_orphan_preview: Dict[str, Any] = {}
+    _latest_orphan_cleanup: Dict[str, Any] = {}
     _error_retention_days = 3
     _mteam_site_ids: List[int] = []
     _mteam_warning_days = 25
@@ -110,6 +148,16 @@ class sitetoolbox(_PluginBase):
         self._latest_missing_cleanup = (
             config.get("latest_missing_cleanup") if isinstance(config.get("latest_missing_cleanup"), dict) else {}
         )
+        self._orphan_downloader_names = _str_list(config.get("orphan_downloader_names"))
+        self._orphan_scan_paths = _str_list(config.get("orphan_scan_paths"))
+        self._orphan_min_age_hours = _int_or_default(config.get("orphan_min_age_hours"), 24, minimum=0, maximum=8760)
+        self._orphan_exclude_patterns = _pattern_text(config.get("orphan_exclude_patterns"), ORPHAN_EXCLUDE_PATTERN_TEXT)
+        self._latest_orphan_preview = (
+            config.get("latest_orphan_preview") if isinstance(config.get("latest_orphan_preview"), dict) else {}
+        )
+        self._latest_orphan_cleanup = (
+            config.get("latest_orphan_cleanup") if isinstance(config.get("latest_orphan_cleanup"), dict) else {}
+        )
         self._error_retention_days = _normalize_retention_days(config.get("error_retention_days"))
         self._mteam_site_ids = _int_list(config.get("mteam_site_ids"))
         self._mteam_warning_days = _int_or_default(config.get("mteam_warning_days"), 25, minimum=1, maximum=365)
@@ -138,6 +186,12 @@ class sitetoolbox(_PluginBase):
         self.__class__._cleanup_auto_cron = self._cleanup_auto_cron
         self.__class__._latest_missing_preview = self._latest_missing_preview
         self.__class__._latest_missing_cleanup = self._latest_missing_cleanup
+        self.__class__._orphan_downloader_names = self._orphan_downloader_names
+        self.__class__._orphan_scan_paths = self._orphan_scan_paths
+        self.__class__._orphan_min_age_hours = self._orphan_min_age_hours
+        self.__class__._orphan_exclude_patterns = self._orphan_exclude_patterns
+        self.__class__._latest_orphan_preview = self._latest_orphan_preview
+        self.__class__._latest_orphan_cleanup = self._latest_orphan_cleanup
         self.__class__._error_retention_days = self._error_retention_days
         self.__class__._mteam_site_ids = self._mteam_site_ids
         self.__class__._mteam_warning_days = self._mteam_warning_days
@@ -261,6 +315,22 @@ class sitetoolbox(_PluginBase):
                 "description": "清理最近一次预览中仍处于 missingFiles 状态的种子。",
             },
             {
+                "path": "/cleanup/orphan/preview",
+                "endpoint": _api_preview_orphan_files,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "预览无种文件",
+                "description": "扫描本地下载目录，预览不受任何当前下载器种子保护的文件。",
+            },
+            {
+                "path": "/cleanup/orphan",
+                "endpoint": _api_cleanup_orphan_files,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清理无种文件",
+                "description": "清理最近一次预览中复查后仍没有对应种子的本地文件。",
+            },
+            {
                 "path": "/mteam/login/check",
                 "endpoint": _api_check_mteam_login,
                 "methods": ["POST"],
@@ -280,6 +350,7 @@ class sitetoolbox(_PluginBase):
             for site in sites
         ]
         downloader_options = _downloader_options()
+        download_dir_options = _download_dir_options()
         mteam_site_options = [
             {
                 "title": f"{site.name} ({site.domain})" if site.domain else site.name,
@@ -379,6 +450,72 @@ class sitetoolbox(_PluginBase):
                                         "label": "扫描周期(cron)",
                                         "placeholder": "0 */6 * * *",
                                         "hint": "默认每 6 小时扫描一次",
+                                    },
+                                }),
+                            ],
+                        },
+                    ]),
+                    _form_section("无种文件清理", "扫描本地下载目录，找出文件存在但当前下载器没有对应种子的文件；仅支持手动清理，执行前会重新复查。", [
+                        {
+                            "component": "VAlert",
+                            "props": {
+                                "type": "warning",
+                                "variant": "tonal",
+                                "class": "mb-3",
+                                "text": "这是文件级清理功能。建议先预览多次确认候选准确；路径映射不正确或下载器选择不全时可能误判。",
+                            },
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "orphan_downloader_names",
+                                        "label": "保护下载器",
+                                        "items": downloader_options,
+                                        "multiple": True,
+                                        "chips": True,
+                                        "clearable": True,
+                                        "hint": "留空时沿用缺失种子下载器；这些下载器内的种子路径不会被清理",
+                                    },
+                                }),
+                                _col(12, 6, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "orphan_scan_paths",
+                                        "label": "扫描本地下载目录",
+                                        "items": download_dir_options,
+                                        "multiple": True,
+                                        "chips": True,
+                                        "clearable": True,
+                                        "hint": "留空时扫描全部本地下载目录",
+                                    },
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 4, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "orphan_min_age_hours",
+                                        "label": "最小未修改时间(小时)",
+                                        "type": "number",
+                                        "min": 0,
+                                        "max": 8760,
+                                        "hint": "默认 24 小时，避免清理刚写入或刚完成的文件",
+                                    },
+                                }),
+                                _col(12, 8, {
+                                    "component": "VTextarea",
+                                    "props": {
+                                        "model": "orphan_exclude_patterns",
+                                        "label": "排除规则",
+                                        "rows": 3,
+                                        "auto-grow": True,
+                                        "hint": "每行一个 fnmatch 规则，可匹配文件名或相对路径",
                                     },
                                 }),
                             ],
@@ -545,6 +682,12 @@ class sitetoolbox(_PluginBase):
             "cleanup_auto_cron": "0 */6 * * *",
             "latest_missing_preview": {},
             "latest_missing_cleanup": {},
+            "orphan_downloader_names": [],
+            "orphan_scan_paths": [],
+            "orphan_min_age_hours": 24,
+            "orphan_exclude_patterns": ORPHAN_EXCLUDE_PATTERN_TEXT,
+            "latest_orphan_preview": {},
+            "latest_orphan_cleanup": {},
             "error_retention_days": 3,
             "mteam_site_ids": [],
             "mteam_warning_days": 25,
@@ -580,6 +723,12 @@ class sitetoolbox(_PluginBase):
             "cleanup_auto_cron": self._cleanup_auto_cron,
             "latest_missing_preview": self._latest_missing_preview,
             "latest_missing_cleanup": self._latest_missing_cleanup,
+            "orphan_downloader_names": self._orphan_downloader_names,
+            "orphan_scan_paths": self._orphan_scan_paths,
+            "orphan_min_age_hours": self._orphan_min_age_hours,
+            "orphan_exclude_patterns": self._orphan_exclude_patterns,
+            "latest_orphan_preview": self._latest_orphan_preview,
+            "latest_orphan_cleanup": self._latest_orphan_cleanup,
             "error_retention_days": self._error_retention_days,
             "mteam_site_ids": self._mteam_site_ids,
             "mteam_warning_days": self._mteam_warning_days,
@@ -614,6 +763,16 @@ class sitetoolbox(_PluginBase):
         self._latest_missing_cleanup = cleanup
         self.__class__._latest_missing_cleanup = cleanup
         self.update_config(self._config_payload(latest_missing_cleanup=cleanup))
+
+    def _save_orphan_preview(self, preview: Dict[str, Any]):
+        self._latest_orphan_preview = preview
+        self.__class__._latest_orphan_preview = preview
+        self.update_config(self._config_payload(latest_orphan_preview=preview))
+
+    def _save_orphan_cleanup(self, cleanup: Dict[str, Any]):
+        self._latest_orphan_cleanup = cleanup
+        self.__class__._latest_orphan_cleanup = cleanup
+        self.update_config(self._config_payload(latest_orphan_cleanup=cleanup))
 
     def _save_mteam_login_check(self, result: Dict[str, Any]):
         self._latest_mteam_login_check = result
@@ -1061,6 +1220,92 @@ def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) 
         return message
 
     return plugin._start_background_job("missing_cleanup", "缺失种子清理", worker)
+
+
+def _api_preview_orphan_files(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    downloader_names, scan_paths, min_age_hours, exclude_patterns = _orphan_runtime_options(plugin, payload or {})
+    if not downloader_names:
+        return schemas.Response(success=False, message="未选择保护下载器")
+    if not scan_paths:
+        return schemas.Response(success=False, message="未配置本地扫描目录")
+
+    def worker() -> str:
+        preview = _build_orphan_file_preview(
+            downloader_names=downloader_names,
+            scan_paths=scan_paths,
+            min_age_hours=min_age_hours,
+            exclude_patterns=exclude_patterns,
+        )
+        plugin._save_orphan_preview(preview)
+        total_count = preview.get("total_count", 0)
+        total_size = _format_size(preview.get("total_size", 0))
+        error_count = len(preview.get("errors") or [])
+        message = f"无种文件预览完成：{total_count} 个，{total_size}"
+        if error_count:
+            message += f"，{error_count} 个异常"
+        return message
+
+    return plugin._start_background_job("orphan_preview", "无种文件预览", worker)
+
+
+def _api_cleanup_orphan_files(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    downloader_names, scan_paths, min_age_hours, exclude_patterns = _orphan_runtime_options(plugin, payload or {})
+    if not downloader_names:
+        return schemas.Response(success=False, message="未选择保护下载器")
+    if not scan_paths:
+        return schemas.Response(success=False, message="未配置本地扫描目录")
+
+    preview = plugin._latest_orphan_preview if isinstance(plugin._latest_orphan_preview, dict) else {}
+    preview_items = preview.get("items") if isinstance(preview.get("items"), list) else []
+    if not preview_items:
+        return schemas.Response(success=False, message="请先预览无种文件")
+
+    selected_roots = {_canonical_path_text(path) for path in scan_paths}
+    cleanup_items = [
+        item for item in preview_items
+        if _item_in_selected_roots(item, selected_roots)
+    ]
+    if not cleanup_items:
+        return schemas.Response(success=False, message="最近一次预览中没有当前扫描目录的无种文件")
+
+    def worker() -> str:
+        logger.info(
+            f"站点工具箱开始清理无种文件：候选 {len(cleanup_items)} 个，"
+            f"downloaders={downloader_names}，scan_paths={scan_paths}，min_age_hours={min_age_hours}"
+        )
+        cleanup = _cleanup_orphan_files_from_preview(
+            cleanup_items,
+            downloader_names=downloader_names,
+            scan_paths=scan_paths,
+            min_age_hours=min_age_hours,
+            exclude_patterns=exclude_patterns,
+        )
+        plugin._save_orphan_cleanup(cleanup)
+
+        refreshed = _build_orphan_file_preview(
+            downloader_names=downloader_names,
+            scan_paths=scan_paths,
+            min_age_hours=min_age_hours,
+            exclude_patterns=exclude_patterns,
+        )
+        plugin._save_orphan_preview(refreshed)
+
+        deleted_count = cleanup.get("deleted_count", 0)
+        failed_count = cleanup.get("failed_count", 0)
+        skipped_count = cleanup.get("skipped_count", 0)
+        message = f"无种文件清理完成：删除 {deleted_count} 个，跳过 {skipped_count} 个"
+        if failed_count:
+            message += f"，失败 {failed_count} 个"
+        logger.info(f"站点工具箱{message}")
+        return message
+
+    return plugin._start_background_job("orphan_cleanup", "无种文件清理", worker)
 
 
 def _api_check_mteam_login(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
@@ -1559,6 +1804,452 @@ def _cleanup_result_rows(items: List[Dict[str, Any]], state: str, message: str) 
         }
         for item in items
     ]
+
+
+def _orphan_runtime_options(plugin: sitetoolbox, payload: Dict[str, Any]) -> Tuple[List[str], List[str], int, List[str]]:
+    downloader_names = _str_list(
+        payload.get("downloader_names")
+        or payload.get("downloaders")
+        or payload.get("orphan_downloader_names")
+    )
+    downloader_names = downloader_names or plugin._orphan_downloader_names or plugin._cleanup_downloader_names
+
+    scan_paths = _str_list(payload.get("scan_paths") or payload.get("paths") or payload.get("orphan_scan_paths"))
+    scan_paths = scan_paths or plugin._orphan_scan_paths or _local_download_paths()
+
+    min_age_hours = _int_or_default(
+        payload.get("min_age_hours") if payload.get("min_age_hours") is not None else payload.get("orphan_min_age_hours"),
+        plugin._orphan_min_age_hours,
+        minimum=0,
+        maximum=8760,
+    )
+    patterns = _pattern_list(payload.get("exclude_patterns") or plugin._orphan_exclude_patterns)
+    patterns = list(dict.fromkeys([*ORPHAN_EXCLUDE_PATTERNS, *patterns]))
+    return downloader_names, scan_paths, min_age_hours, patterns
+
+
+def _build_orphan_file_preview(
+        downloader_names: List[str],
+        scan_paths: List[str],
+        min_age_hours: int,
+        exclude_patterns: List[str],
+) -> Dict[str, Any]:
+    protected_paths, errors = _collect_protected_paths(downloader_names)
+    items: List[Dict[str, Any]] = []
+    scan_roots = _scan_roots(scan_paths)
+    cutoff = time.time() - (min_age_hours * 3600)
+
+    for root in scan_roots:
+        if not root.exists():
+            errors.append({"path": root.as_posix(), "message": "扫描目录不存在"})
+            continue
+        if not root.is_dir():
+            errors.append({"path": root.as_posix(), "message": "扫描路径不是目录"})
+            continue
+        try:
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+                current_dir = Path(dirpath)
+                dirnames[:] = [
+                    dirname for dirname in dirnames
+                    if not _is_excluded_path(current_dir / dirname, root, exclude_patterns)
+                    and not (current_dir / dirname).is_symlink()
+                ]
+                for filename in filenames:
+                    filepath = current_dir / filename
+                    item = _orphan_file_item(
+                        filepath=filepath,
+                        root=root,
+                        protected_paths=protected_paths,
+                        cutoff=cutoff,
+                        exclude_patterns=exclude_patterns,
+                    )
+                    if item:
+                        items.append(item)
+        except Exception as err:
+            errors.append({"path": root.as_posix(), "message": f"扫描失败：{err}"})
+
+    items = sorted(items, key=lambda item: (item.get("root") or "", item.get("relative_path") or ""))
+    total_size = sum(int(item.get("size") or 0) for item in items)
+    return {
+        "created_at": _now(),
+        "downloaders": downloader_names,
+        "scan_paths": [root.as_posix() for root in scan_roots],
+        "min_age_hours": min_age_hours,
+        "total_count": len(items),
+        "total_size": total_size,
+        "protected_count": len(protected_paths),
+        "by_root": _summarize_missing_items(items, "root"),
+        "items": items,
+        "errors": errors,
+    }
+
+
+def _cleanup_orphan_files_from_preview(
+        items: List[Dict[str, Any]],
+        downloader_names: List[str],
+        scan_paths: List[str],
+        min_age_hours: int,
+        exclude_patterns: List[str],
+) -> Dict[str, Any]:
+    protected_paths, errors = _collect_protected_paths(downloader_names)
+    scan_roots = _scan_roots(scan_paths)
+    cutoff = time.time() - (min_age_hours * 3600)
+    result_items: List[Dict[str, Any]] = []
+    deleted_count = 0
+    skipped_count = 0
+    failed_count = 0
+    deleted_size = 0
+
+    for item in items:
+        filepath = _canonical_path(item.get("path"))
+        if not filepath:
+            skipped_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "skipped", "文件路径为空"))
+            continue
+        if not _path_under_roots(filepath, scan_roots):
+            skipped_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "skipped", "文件不在当前扫描目录内"))
+            continue
+        if not filepath.exists():
+            skipped_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "skipped", "文件已不存在"))
+            continue
+        if not filepath.is_file() or filepath.is_symlink():
+            skipped_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "skipped", "不是普通文件"))
+            continue
+        root = _matching_root(filepath, scan_roots)
+        if root and _is_excluded_path(filepath, root, exclude_patterns):
+            skipped_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "skipped", "命中排除规则"))
+            continue
+        try:
+            stat = filepath.stat()
+        except OSError as err:
+            failed_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "failed", f"读取文件状态失败：{err}"))
+            continue
+        if stat.st_mtime > cutoff:
+            skipped_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "skipped", "文件修改时间未达到阈值"))
+            continue
+        if _is_path_protected(filepath, protected_paths):
+            skipped_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "skipped", "当前已有种子保护"))
+            continue
+        try:
+            logger.info(f"站点工具箱删除无种文件：{filepath.as_posix()}")
+            filepath.unlink()
+            deleted_count += 1
+            deleted_size += int(stat.st_size or 0)
+            result_items.append(_orphan_cleanup_result_row(item, "deleted", "已删除文件"))
+            _remove_empty_parent_dirs(filepath.parent, scan_roots, protected_paths)
+        except Exception as err:
+            failed_count += 1
+            result_items.append(_orphan_cleanup_result_row(item, "failed", f"删除失败：{err}"))
+
+    return {
+        "cleaned_at": _now(),
+        "candidate_count": len(items),
+        "deleted_count": deleted_count,
+        "deleted_size": deleted_size,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "items": result_items,
+        "errors": errors,
+    }
+
+
+def _collect_protected_paths(downloader_names: List[str]) -> Tuple[List[Path], List[Dict[str, Any]]]:
+    protected: List[Path] = []
+    errors: List[Dict[str, Any]] = []
+    services = DownloaderHelper().get_services(name_filters=downloader_names)
+    supported_types = {"qbittorrent", "transmission", "rtorrent"}
+
+    for downloader_name in downloader_names:
+        service = services.get(downloader_name)
+        if not service or not service.instance:
+            errors.append({"downloader": downloader_name, "message": "下载器未启用或未连接"})
+            continue
+        if service.type not in supported_types:
+            errors.append({"downloader": downloader_name, "message": f"暂不支持 {service.type or '未知'} 下载器"})
+            continue
+        server = service.instance
+        try:
+            if hasattr(server, "is_inactive") and server.is_inactive():
+                server.reconnect()
+            torrents, failed = server.get_torrents()
+        except Exception as err:
+            errors.append({"downloader": downloader_name, "message": f"查询失败：{err}"})
+            continue
+        if failed:
+            errors.append({"downloader": downloader_name, "message": "查询种子列表失败"})
+            continue
+        for torrent in torrents or []:
+            torrent_path = _torrent_content_path(service.type, torrent)
+            mapped_path = _map_downloader_path_to_storage(torrent_path, service)
+            canonical = _canonical_path(mapped_path)
+            if canonical:
+                protected.append(canonical)
+    return list(dict.fromkeys(protected)), errors
+
+
+def _torrent_content_path(service_type: str, torrent: Any) -> str:
+    content_path = _torrent_text(torrent, "content_path")
+    if content_path:
+        return content_path
+    name = _torrent_text(torrent, "name")
+    if service_type == "transmission":
+        save_path = _torrent_text(torrent, "downloadDir") or _torrent_text(torrent, "download_dir")
+    else:
+        save_path = _torrent_text(torrent, "save_path") or _torrent_text(torrent, "downloadDir") or _torrent_text(torrent, "download_dir")
+    return _join_path_text(save_path, name)
+
+
+def _map_downloader_path_to_storage(path: str, service: Any) -> str:
+    text = _clean_path_text(path)
+    if not text:
+        return ""
+    mappings = getattr(getattr(service, "config", None), "path_mapping", None) or []
+    normalized_mappings = []
+    for mapping in mappings:
+        try:
+            storage_path, download_path = mapping
+        except (TypeError, ValueError):
+            continue
+        storage_path = _clean_path_text(storage_path)
+        download_path = _clean_path_text(download_path)
+        if storage_path and download_path:
+            normalized_mappings.append((storage_path, download_path))
+    normalized_mappings.sort(key=lambda item: len(item[1]), reverse=True)
+    for storage_path, download_path in normalized_mappings:
+        if _path_text_equal_or_child(text, download_path):
+            rel = text[len(download_path):].lstrip("/")
+            return _join_path_text(storage_path, rel)
+    return _strip_storage_prefix(text)
+
+
+def _orphan_file_item(
+        filepath: Path,
+        root: Path,
+        protected_paths: List[Path],
+        cutoff: float,
+        exclude_patterns: List[str],
+) -> Optional[Dict[str, Any]]:
+    if filepath.is_symlink() or not filepath.is_file():
+        return None
+    if _is_excluded_path(filepath, root, exclude_patterns):
+        return None
+    if _is_path_protected(filepath, protected_paths):
+        return None
+    try:
+        stat = filepath.stat()
+    except OSError:
+        return None
+    if stat.st_mtime > cutoff:
+        return None
+    relative_path = _relative_path_text(filepath, root)
+    return {
+        "root": root.as_posix(),
+        "path": filepath.as_posix(),
+        "relative_path": relative_path,
+        "name": filepath.name,
+        "size": int(stat.st_size or 0),
+        "modified_at": _format_timestamp(stat.st_mtime),
+        "modified_ts": int(stat.st_mtime or 0),
+        "age_hours": round(max(0, time.time() - stat.st_mtime) / 3600, 1),
+        "reason": "当前下载器没有对应种子路径",
+    }
+
+
+def _orphan_cleanup_result_row(item: Dict[str, Any], state: str, message: str) -> Dict[str, Any]:
+    return {
+        "root": item.get("root"),
+        "path": item.get("path"),
+        "relative_path": item.get("relative_path"),
+        "name": item.get("name"),
+        "size": item.get("size"),
+        "state": state,
+        "message": message,
+    }
+
+
+def _scan_roots(scan_paths: List[str]) -> List[Path]:
+    roots = []
+    for path in scan_paths:
+        canonical = _canonical_path(path)
+        if canonical:
+            roots.append(canonical)
+    roots = sorted(dict.fromkeys(roots), key=lambda item: len(item.parts))
+    filtered: List[Path] = []
+    for root in roots:
+        if any(_path_equal_or_child(root, parent) for parent in filtered):
+            continue
+        filtered.append(root)
+    return filtered
+
+
+def _local_download_paths() -> List[str]:
+    paths = []
+    try:
+        dirs = DirectoryHelper().get_local_download_dirs()
+    except Exception:
+        return []
+    for item in dirs:
+        path = str(getattr(item, "download_path", "") or "").strip()
+        if path:
+            paths.append(path)
+    return list(dict.fromkeys(paths))
+
+
+def _download_dir_options() -> List[dict]:
+    items = []
+    try:
+        dirs = DirectoryHelper().get_local_download_dirs()
+    except Exception:
+        return items
+    for item in dirs:
+        path = str(getattr(item, "download_path", "") or "").strip()
+        if not path:
+            continue
+        name = str(getattr(item, "name", "") or "").strip()
+        items.append({
+            "title": f"{name} ({path})" if name else path,
+            "value": path,
+        })
+    return items
+
+
+def _pattern_text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, list):
+        return "\n".join(str(item or "").strip() for item in value if str(item or "").strip())
+    return str(value)
+
+
+def _pattern_list(value: Any) -> List[str]:
+    text = _pattern_text(value, "")
+    patterns = []
+    for line in re.split(r"[\r\n]+", text):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+    return list(dict.fromkeys(patterns))
+
+
+def _is_excluded_path(path: Path, root: Path, patterns: List[str]) -> bool:
+    name = path.name
+    rel = _relative_path_text(path, root)
+    rel_lower = rel.lower()
+    name_lower = name.lower()
+    for pattern in patterns:
+        pattern_lower = pattern.strip().lower().replace("\\", "/")
+        if not pattern_lower:
+            continue
+        if fnmatch.fnmatch(name_lower, pattern_lower) or fnmatch.fnmatch(rel_lower, pattern_lower):
+            return True
+    return False
+
+
+def _is_path_protected(path: Path, protected_paths: List[Path]) -> bool:
+    return any(_path_equal_or_child(path, protected_path) for protected_path in protected_paths)
+
+
+def _path_under_roots(path: Path, roots: List[Path]) -> bool:
+    return any(_path_equal_or_child(path, root) for root in roots)
+
+
+def _matching_root(path: Path, roots: List[Path]) -> Optional[Path]:
+    matched = [root for root in roots if _path_equal_or_child(path, root)]
+    if not matched:
+        return None
+    return max(matched, key=lambda item: len(item.parts))
+
+
+def _item_in_selected_roots(item: Dict[str, Any], selected_roots: set[str]) -> bool:
+    path = _canonical_path(item.get("path"))
+    if not path:
+        return False
+    return any(_path_text_equal_or_child(path.as_posix(), root) for root in selected_roots)
+
+
+def _remove_empty_parent_dirs(path: Path, scan_roots: List[Path], protected_paths: List[Path]):
+    current = path
+    while current and _path_under_roots(current, scan_roots):
+        if any(current == root for root in scan_roots):
+            break
+        if _is_path_protected(current, protected_paths):
+            break
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def _canonical_path(value: Any) -> Optional[Path]:
+    text = _clean_path_text(value)
+    if not text:
+        return None
+    try:
+        return Path(text).expanduser().resolve(strict=False)
+    except Exception:
+        return Path(os.path.abspath(text))
+
+
+def _canonical_path_text(value: Any) -> str:
+    path = _canonical_path(value)
+    return path.as_posix() if path else ""
+
+
+def _clean_path_text(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    return os.path.normpath(_strip_storage_prefix(text)).replace("\\", "/")
+
+
+def _strip_storage_prefix(text: str) -> str:
+    text = str(text or "").strip()
+    if re.match(r"^[A-Za-z]:/", text):
+        return text
+    if re.match(r"^[A-Za-z][A-Za-z0-9_]*:/", text):
+        return text.split(":", 1)[1] or "/"
+    return text
+
+
+def _join_path_text(parent: str, child: str) -> str:
+    parent = _clean_path_text(parent)
+    child = str(child or "").strip().replace("\\", "/").lstrip("/")
+    if not parent:
+        return child
+    if not child:
+        return parent
+    return f"{parent.rstrip('/')}/{child}"
+
+
+def _path_text_equal_or_child(path: str, root: str) -> bool:
+    path = _clean_path_text(path).rstrip("/")
+    root = _clean_path_text(root).rstrip("/")
+    if not path or not root:
+        return False
+    return path == root or path.startswith(f"{root}/")
+
+
+def _path_equal_or_child(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _relative_path_text(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
@@ -2373,6 +3064,8 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     userdata_results = plugin._latest_userdata_results or []
     missing_preview = plugin._latest_missing_preview or {}
     missing_cleanup = plugin._latest_missing_cleanup or {}
+    orphan_preview = plugin._latest_orphan_preview or {}
+    orphan_cleanup = plugin._latest_orphan_cleanup or {}
     mteam_check = plugin._latest_mteam_login_check or {}
     error_records = plugin._get_error_records()
     ok = len([item for item in results if item.get("state") == "success"])
@@ -2384,12 +3077,16 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
     userdata_warning = len([item for item in userdata_results if item.get("state") == "warning"])
     missing_count = int(missing_preview.get("total_count") or 0)
     missing_size = _format_size(missing_preview.get("total_size"))
+    orphan_count = int(orphan_preview.get("total_count") or 0)
+    orphan_size = _format_size(orphan_preview.get("total_size"))
     mteam_bad = int(mteam_check.get("warning_count") or 0) + int(mteam_check.get("error_count") or 0)
     return [
         _overview_panel(
             plugin=plugin,
             missing_count=missing_count,
             missing_size=missing_size,
+            orphan_count=orphan_count,
+            orphan_size=orphan_size,
             rss_bad=error + warning,
             userdata_bad=userdata_bad + userdata_warning,
             mteam_bad=mteam_bad,
@@ -2398,10 +3095,12 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
             indexer_count=indexer_count,
             userdata_count=userdata_count,
         ),
-        _action_panel(plugin, missing_preview, results, mteam_check),
+        _action_panel(plugin, missing_preview, orphan_preview, results, mteam_check),
         _details_panel(
             missing_preview=missing_preview,
             missing_cleanup=missing_cleanup,
+            orphan_preview=orphan_preview,
+            orphan_cleanup=orphan_cleanup,
             mteam_check=mteam_check,
             plugin=plugin,
             rss_results=results,
@@ -2415,7 +3114,7 @@ def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
 
 
 def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, rss_bad: int,
-                    userdata_bad: int, mteam_bad: int, error_count: int, rule_count: int,
+                    orphan_count: int, orphan_size: str, userdata_bad: int, mteam_bad: int, error_count: int, rule_count: int,
                     indexer_count: int, userdata_count: int) -> dict:
     return {
         "component": "VCard",
@@ -2452,6 +3151,7 @@ def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, 
                         "props": {"dense": True},
                         "content": [
                             _metric_col("缺失种子", missing_count, missing_size),
+                            _metric_col("无种文件", orphan_count, orphan_size),
                             _metric_col("RSS 异常", rss_bad, "最近结果"),
                             _metric_col("数据异常", userdata_bad, "用户数据"),
                             _metric_col("馒头登录", mteam_bad, f"提醒 {plugin._mteam_warning_days} 天"),
@@ -2465,9 +3165,10 @@ def _overview_panel(plugin: sitetoolbox, missing_count: int, missing_size: str, 
     }
 
 
-def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any],
+def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any], orphan_preview: Dict[str, Any],
                   rss_results: List[Dict[str, Any]], mteam_check: Dict[str, Any]) -> dict:
     missing_time = missing_preview.get("created_at") or "-"
+    orphan_time = orphan_preview.get("created_at") or "-"
     rss_time = _latest_rss_time(rss_results) or "-"
     userdata_time = plugin._latest_userdata_checked_at or "-"
     mteam_time = mteam_check.get("checked_at") or "-"
@@ -2484,6 +3185,14 @@ def _action_panel(plugin: sitetoolbox, missing_preview: Dict[str, Any],
                     [
                         _action_button("预览", "mdi-eye-search", "primary", "plugin/sitetoolbox/cleanup/missing/preview"),
                         _action_button("清理", "mdi-delete-alert", "error", "plugin/sitetoolbox/cleanup/missing"),
+                    ],
+                ),
+                _operation_col(
+                    "无种文件",
+                    f"最近：{orphan_time} · 阈值：{plugin._orphan_min_age_hours} 小时",
+                    [
+                        _action_button("预览", "mdi-file-search-outline", "primary", "plugin/sitetoolbox/cleanup/orphan/preview"),
+                        _action_button("清理", "mdi-file-remove-outline", "error", "plugin/sitetoolbox/cleanup/orphan"),
                     ],
                 ),
                 _operation_col(
@@ -2561,6 +3270,7 @@ def _job_state_summary(states: Dict[str, Dict[str, Any]]) -> str:
 
 
 def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, Any],
+                   orphan_preview: Dict[str, Any], orphan_cleanup: Dict[str, Any],
                    mteam_check: Dict[str, Any], plugin: sitetoolbox,
                    rss_results: List[Dict[str, Any]], userdata_results: List[Dict[str, Any]],
                    error_records: List[Dict[str, Any]], rules: List[dict], rss_ok: int, rss_bad: int) -> dict:
@@ -2572,6 +3282,11 @@ def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, A
                 "缺失文件种子",
                 f"{missing_preview.get('total_count', 0)} 个 / {_format_size(missing_preview.get('total_size'))}",
                 [_missing_torrent_panel(missing_preview, missing_cleanup, plugin)],
+            ),
+            _expansion_panel(
+                "无种文件",
+                f"{orphan_preview.get('total_count', 0)} 个 / {_format_size(orphan_preview.get('total_size'))}",
+                [_orphan_file_panel(orphan_preview, orphan_cleanup, plugin)],
             ),
             _expansion_panel(
                 "馒头登录",
@@ -2916,6 +3631,116 @@ def _missing_torrent_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plu
     }
 
 
+def _orphan_file_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plugin: sitetoolbox) -> dict:
+    items = preview.get("items") if isinstance(preview.get("items"), list) else []
+    errors = preview.get("errors") if isinstance(preview.get("errors"), list) else []
+    cleanup_items = cleanup.get("items") if isinstance(cleanup.get("items"), list) else []
+    rows = []
+    for item in items[:200]:
+        rows.append({
+            "component": "tr",
+            "content": [
+                _td(item.get("root") or "-", "text-no-wrap"),
+                _td(item.get("relative_path") or item.get("path") or "-"),
+                _td(_format_size(item.get("size")), "text-no-wrap"),
+                _td(item.get("modified_at") or "-", "text-no-wrap"),
+                _td(item.get("age_hours"), "text-no-wrap"),
+                _td(item.get("reason") or "-"),
+            ],
+        })
+
+    error_rows = [
+        {
+            "component": "tr",
+            "content": [
+                _td(item.get("downloader") or item.get("path") or "-", "text-no-wrap"),
+                _td(item.get("message") or "-"),
+            ],
+        }
+        for item in errors
+    ]
+    cleanup_rows = [
+        {
+            "component": "tr",
+            "content": [
+                _td(_cleanup_state_text(item.get("state")), "text-no-wrap"),
+                _td(item.get("message") or "-"),
+                _td(item.get("relative_path") or item.get("path") or "-"),
+                _td(_format_size(item.get("size")), "text-no-wrap"),
+            ],
+        }
+        for item in cleanup_items[:120]
+    ]
+    root_summary = _path_summary_text(preview.get("by_root") or [])
+
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-3"},
+        "content": [
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-3 mb-2"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "content": [
+                                    {"component": "div", "props": {"class": "text-subtitle-1"}, "text": "无种文件"},
+                                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": root_summary or "暂无路径汇总"},
+                                ],
+                            },
+                            _status_chip(f"{preview.get('total_count', 0)} 个", "error" if preview.get("total_count") else "success"),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True},
+                        "content": [
+                            _compact_col("保护下载器", ", ".join(plugin._orphan_downloader_names or plugin._cleanup_downloader_names) or "未选择"),
+                            _compact_col("扫描目录", len(preview.get("scan_paths") or plugin._orphan_scan_paths or _local_download_paths())),
+                            _compact_col("保护路径", preview.get("protected_count", 0)),
+                            _compact_col("最小未修改", f"{preview.get('min_age_hours', plugin._orphan_min_age_hours)} 小时"),
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "text": "清理会删除预览中的本地文件；执行前会重新读取下载器种子路径并复查文件修改时间、排除规则和扫描目录。",
+                        },
+                    },
+                    _error_table("扫描或下载器异常", error_rows),
+                    _orphan_cleanup_table(cleanup_rows, cleanup),
+                    _empty_alert("还没有预览结果，请先点击“预览无种文件”。") if not rows else {
+                        "component": "VTable",
+                        "props": {"density": "compact"},
+                        "content": [
+                            {
+                                "component": "thead",
+                                "content": [{
+                                    "component": "tr",
+                                    "content": [
+                                        _th("根目录"),
+                                        _th("相对路径"),
+                                        _th("大小"),
+                                        _th("修改时间"),
+                                        _th("小时"),
+                                        _th("原因"),
+                                    ],
+                                }],
+                            },
+                            {"component": "tbody", "content": rows},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
 def _missing_summary_table(title: str, summary: List[Dict[str, Any]]) -> dict:
     rows = [
         {
@@ -3017,6 +3842,48 @@ def _cleanup_table(rows: List[dict], cleanup: Dict[str, Any]) -> dict:
                         "content": [{
                             "component": "tr",
                             "content": [_th("下载器"), _th("结果"), _th("说明"), _th("名称"), _th("Hash")],
+                        }],
+                    },
+                    {"component": "tbody", "content": rows},
+                ],
+            } if rows else _empty_alert("没有清理明细"),
+        ],
+    }
+
+
+def _orphan_cleanup_table(rows: List[dict], cleanup: Dict[str, Any]) -> dict:
+    if not cleanup:
+        return {"component": "div"}
+    return {
+        "component": "div",
+        "props": {"class": "mt-3"},
+        "content": [
+            {
+                "component": "div",
+                "props": {"class": "text-subtitle-2 mb-1"},
+                "text": f"最近无种文件清理：{cleanup.get('cleaned_at') or '-'}",
+            },
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "success" if not cleanup.get("failed_count") else "warning",
+                    "variant": "tonal",
+                    "text": (
+                        f"候选 {cleanup.get('candidate_count', 0)} 个，删除 {cleanup.get('deleted_count', 0)} 个"
+                        f" / {_format_size(cleanup.get('deleted_size'))}，跳过 {cleanup.get('skipped_count', 0)} 个，"
+                        f"失败 {cleanup.get('failed_count', 0)} 个。"
+                    ),
+                },
+            },
+            {
+                "component": "VTable",
+                "props": {"density": "compact"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [{
+                            "component": "tr",
+                            "content": [_th("结果"), _th("说明"), _th("路径"), _th("大小")],
                         }],
                     },
                     {"component": "tbody", "content": rows},
