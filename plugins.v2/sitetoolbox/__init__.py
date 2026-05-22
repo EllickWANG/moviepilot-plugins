@@ -3714,7 +3714,11 @@ def _orphan_file_panel(preview: Dict[str, Any], cleanup: Dict[str, Any], plugin:
                     },
                     _error_table("扫描或下载器异常", error_rows),
                     _orphan_cleanup_table(cleanup_rows, cleanup),
-                    _empty_alert("还没有预览结果，请先点击“预览无种文件”。") if not rows else {
+                    _empty_alert(
+                        "最近预览未发现无种文件。"
+                        if preview.get("created_at")
+                        else "还没有预览结果，请先点击“预览无种文件”。"
+                    ) if not rows else {
                         "component": "VTable",
                         "props": {"density": "compact"},
                         "content": [
