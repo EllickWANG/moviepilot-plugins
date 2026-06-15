@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.10"
+    plugin_version = "1.3.11"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -870,6 +870,7 @@ class sitetoolbox(_PluginBase):
                         raise
                     if _method == "_parse_user_torrent_seeding_info":
                         result = _normalize_xloli_next_page(parser=self, next_page=result)
+                        _apply_seeding_summary_fallback(self, html_text)
                     else:
                         _apply_xloli_uuid_userdata(parser=self, html_text=html_text)
                     _apply_site_userdata_rules(self, html_text, cls._userdata_rules)
@@ -1990,6 +1991,43 @@ def _normalize_xloli_next_page(parser: Any, next_page: Any) -> Any:
         separator = "&" if "?" in normalized else "?"
         normalized = f"{normalized}{separator}type=seeding"
     return normalized
+
+
+_SEEDING_SUMMARY_COUNT_RE = re.compile(r"(\d[\d,]*)\s*条\s*记录")
+_SEEDING_SUMMARY_SIZE_RES = [
+    re.compile(r"总大小[：:\s]*([\d.]+\s*[KMGTP]i?B)", re.IGNORECASE),
+    re.compile(r"Total[:：]?\s*([\d.]+\s*[KMGTP]i?B)", re.IGNORECASE),
+    re.compile(r"共计\s*([\d.]+\s*[KMGTP]i?B)", re.IGNORECASE),
+    re.compile(r"资源总量[：:\s]*([\d.]+\s*[KMGTP]i?B)", re.IGNORECASE),
+]
+
+
+def _apply_seeding_summary_fallback(parser: Any, html_text: str):
+    """
+    通用做种兜底：部分 NexusPHP 站点做种列表页表格结构与核心列检测失配，
+    导致核心数到 0 条。这些站点的 getusertorrentlistajax 页面顶部均有一行
+    规整的“N 条记录 … X TB”汇总。当核心解析出 seeding=0 时，直接从汇总行
+    补回做种数量与做种体积，避免逐站写配置。
+    """
+    if not html_text or "条记录" not in str(html_text):
+        return
+    # 仅在核心未能解析出做种数时兜底，避免影响正常站点
+    if getattr(parser, "seeding", 0):
+        return
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(html_text)))
+    count_match = _SEEDING_SUMMARY_COUNT_RE.search(text)
+    if not count_match:
+        return
+    count = StringUtils.str_int(count_match.group(1).replace(",", ""))
+    if count <= 0:
+        return
+    parser.seeding = count
+    if not getattr(parser, "seeding_size", 0):
+        for size_re in _SEEDING_SUMMARY_SIZE_RES:
+            size_match = size_re.search(text)
+            if size_match:
+                parser.seeding_size = StringUtils.num_filesize(size_match.group(1).strip())
+                break
 
 
 def _is_xloli_parser(parser: Any) -> bool:
