@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.11"
+    plugin_version = "1.3.12"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -871,6 +871,7 @@ class sitetoolbox(_PluginBase):
                     if _method == "_parse_user_torrent_seeding_info":
                         result = _normalize_xloli_next_page(parser=self, next_page=result)
                         _apply_seeding_summary_fallback(self, html_text)
+                        _preserve_seeding_on_fetch_failure(self, html_text)
                     else:
                         _apply_xloli_uuid_userdata(parser=self, html_text=html_text)
                     _apply_site_userdata_rules(self, html_text, cls._userdata_rules)
@@ -2028,6 +2029,58 @@ def _apply_seeding_summary_fallback(parser: Any, html_text: str):
             if size_match:
                 parser.seeding_size = StringUtils.num_filesize(size_match.group(1).strip())
                 break
+
+
+def _get_last_seeding(domain: str) -> Optional[dict]:
+    """读取该站点历史上最近一次做种数 > 0 的记录，用于抓取失败时沿用。"""
+    if not domain:
+        return None
+    try:
+        from app.db.site_oper import SiteOper
+        rows = SiteOper().get_userdata_by_domain(domain) or []
+    except Exception:
+        return None
+    best = None
+    for row in rows:
+        try:
+            seeding = int(getattr(row, "seeding", 0) or 0)
+        except (TypeError, ValueError):
+            seeding = 0
+        if seeding <= 0:
+            continue
+        key = (str(getattr(row, "updated_day", "") or ""), str(getattr(row, "updated_time", "") or ""))
+        size = getattr(row, "seeding_size", 0) or 0
+        if best is None or key > best[0]:
+            best = (key, seeding, size)
+    return {"seeding": best[1], "seeding_size": best[2]} if best else None
+
+
+def _preserve_seeding_on_fetch_failure(parser: Any, html_text: str):
+    """
+    抗抖动：做种页抓取失败（SSL 中断等返回空响应）时，核心会得到 seeding=0，
+    并在站点其余解析正常（err 为空）时用 0 覆盖历史好值，导致做种数在好值与
+    0 之间跳变。此处仅在「本次解析其余正常、但做种页明显是抓取失败（空响应）」
+    时，沿用历史最近一次的做种数据，避免 0 覆盖。
+    """
+    if getattr(parser, "seeding", 0):
+        return
+    # 仅对其余解析成功（已登录、有上传量）的情况兜底，避免影响未登录/异常场景
+    if getattr(parser, "err_msg", None):
+        return
+    if not getattr(parser, "upload", 0):
+        return
+    text = str(html_text or "")
+    # 页面确实返回了内容（含“没有记录”=真 0，或正常表格=核心已判定）→ 信任核心结果
+    if text.strip():
+        return
+    # 到这里：做种页响应为空 = 抓取失败 → 沿用历史好值
+    domain = _normalize_domain(getattr(parser, "_site_domain", "") or getattr(parser, "_base_url", ""))
+    prev = _get_last_seeding(domain)
+    if prev and prev.get("seeding"):
+        parser.seeding = prev["seeding"]
+        if not getattr(parser, "seeding_size", 0) and prev.get("seeding_size"):
+            parser.seeding_size = prev["seeding_size"]
+        logger.info(f"站点工具箱：{domain} 做种页抓取失败，沿用上次做种数据 seeding={prev['seeding']}")
 
 
 def _is_xloli_parser(parser: Any) -> bool:
