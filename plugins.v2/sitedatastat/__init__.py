@@ -1,6 +1,4 @@
-import importlib
 import inspect
-import pkgutil
 import warnings
 from datetime import datetime, timedelta
 from threading import Lock
@@ -114,24 +112,18 @@ class sitedatastat(_PluginBase):
     @staticmethod
     def _load_parser_classes() -> Dict[str, type]:
         """
-        加载插件内置 fork 的全部站点解析器，按 schema 值索引。
+        加载插件内置 fork（单文件 parser 模块）的全部站点解析器，按 schema 值索引。
         """
         classes: Dict[str, type] = {}
-        from . import parser as parser_pkg
-        for module_info in pkgutil.iter_modules(parser_pkg.__path__):
-            try:
-                module = importlib.import_module(f"{parser_pkg.__name__}.{module_info.name}")
-            except Exception as err:
-                logger.warning(f"站点数据统计·自主版：跳过解析器模块 {module_info.name} - {err}")
+        from . import parser as parser_mod
+        for _, obj in inspect.getmembers(parser_mod, inspect.isclass):
+            if obj is SiteParserBase:
                 continue
-            for _, obj in inspect.getmembers(module, inspect.isclass):
-                if obj is SiteParserBase:
-                    continue
-                try:
-                    if issubclass(obj, SiteParserBase) and getattr(obj, "schema", None):
-                        classes[obj.schema.value] = obj
-                except TypeError:
-                    continue
+            try:
+                if issubclass(obj, SiteParserBase) and getattr(obj, "schema", None):
+                    classes[obj.schema.value] = obj
+            except TypeError:
+                continue
         logger.info(f"站点数据统计·自主版：加载内置解析器 {len(classes)} 个 schema")
         return classes
 
