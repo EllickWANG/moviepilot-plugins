@@ -37,7 +37,7 @@ class sitedatastat(_PluginBase):
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -251,6 +251,11 @@ class sitedatastat(_PluginBase):
             return data
         if data.get("err_msg"):
             return data
+        # 本次上传/下载全为 0 但历史有上传：多为静默抓取失败（如 m-team apikey 偶发），整条沿用历史
+        if not data.get("upload") and not data.get("download") and prev.get("upload"):
+            carried = dict(prev)
+            carried["err_msg"] = None
+            return carried
         if not data.get("upload"):
             return data
         if not data.get("seeding") and prev.get("seeding"):
