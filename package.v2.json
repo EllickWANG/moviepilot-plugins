@@ -70,5 +70,13 @@
     "icon": "mdi-seed-plus",
     "author": "Ellick",
     "level": 2
+  },
+  "sitedatastat": {
+    "name": "站点数据统计·自主版",
+    "description": "完全自主抓取并解析各站点用户数据（上传/下载/分享率/魔力/做种），不依赖核心解析流程。",
+    "version": "1.0.0",
+    "icon": "statistic.png",
+    "author": "Nyxara",
+    "level": 2
   }
 }
