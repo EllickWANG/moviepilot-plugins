@@ -37,7 +37,7 @@ class sitedatastat(_PluginBase):
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -172,6 +172,19 @@ class sitedatastat(_PluginBase):
                         fail += 1
                     else:
                         ok += 1
+
+            # calculate_ratio 站点：用最终（含沿用历史）的上传/下载补算分享率，
+            # 避免站点流量页格式不匹配导致分享率为 0（如天雪）
+            from .parser import SITE_RULES
+            calc_domains = [d for d, r in SITE_RULES.items() if r.get("calculate_ratio")]
+            for dom, rec in result.items():
+                if not any(dom == cd or dom.endswith("." + cd) for cd in calc_domains):
+                    continue
+                if not rec.get("ratio") and rec.get("download"):
+                    try:
+                        rec["ratio"] = round(float(rec["upload"]) / float(rec["download"]), 3)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pass
 
             # 落库（插件自有存储，不写核心 SiteUserData）
             self.save_data(today, result)

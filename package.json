@@ -83,7 +83,7 @@
   "sitedatastat": {
     "name": "站点数据统计",
     "description": "完全自主抓取并解析各站点用户数据（上传/下载/分享率/魔力/做种），不依赖核心解析流程。",
-    "version": "1.1.2",
+    "version": "1.1.3",
     "icon": "statistic.png",
     "author": "Nyxara",
     "level": 2
