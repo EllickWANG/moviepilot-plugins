@@ -37,7 +37,7 @@ class sitedatastat(_PluginBase):
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.7"
+    plugin_version = "1.1.8"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -486,7 +486,7 @@ class sitedatastat(_PluginBase):
                 card(dn_title, f"+{StringUtils.str_filesize(inc_dn_total)}", "/plugin_icon/download.png"),
             ]
 
-        charts = self._build_charts(rows)
+        charts = self._build_charts()
 
         inc_suffix = f"(较{prev_md})" if prev_md else ""
         headers = ["站点", "用户名", "用户等级", "上传量", f"上传增量{inc_suffix}",
@@ -542,12 +542,11 @@ class sitedatastat(_PluginBase):
             }],
         }]
 
-    def _build_charts(self, rows: List[dict]) -> List[dict]:
+    def _build_charts(self) -> List[dict]:
         """
         构建插件详情页内嵌图表（VApexChart）：
         - 流量历史趋势：总上传/总下载（GB）随采集日期变化的面积图。
-        - 每日增量：相邻快照之间总上传/总下载的增量柱状图。
-        - 各站点上传占比：最新快照各站上传量的环形图。
+        - 每日增量：相邻快照之间总上传/总下载的增量柱状图（较前一天）。
         数据来自插件自有历史快照，无历史时不渲染对应图表。
         """
         charts: List[dict] = []
@@ -557,7 +556,7 @@ class sitedatastat(_PluginBase):
         days, up_gb, dn_gb, _ = self._get_history_series()
         if len(days) >= 2:
             trend = {
-                "component": "VCol", "props": {"cols": 12, "md": 8},
+                "component": "VCol", "props": {"cols": 12},
                 "content": [{
                     "component": "VCard", "props": {"variant": "tonal"},
                     "content": [
@@ -623,55 +622,7 @@ class sitedatastat(_PluginBase):
             }
             bar_chart = bar
 
-        # 3) 各站上传增量占比（环形图）：本次相对上一份快照（正常即前一天）的上传增量
-        #    来自哪些站点，取增量前 10 站，其余归为「其它」。无上一份快照时不渲染。
-        _, _, prev_date, prev_snap = self._get_recent_two_snapshots()
-        prev_md = self._short_date(prev_date)
-        inc_rows = []
-        if prev_snap:
-            for r in rows:
-                p = prev_snap.get(r.get("domain"))
-                if not p:
-                    continue
-                delta = int(r.get("upload") or 0) - int(p.get("upload") or 0)
-                if delta > 0:
-                    inc_rows.append((r.get("name") or r.get("domain") or "-", delta))
-        if inc_rows:
-            inc_rows.sort(key=lambda x: x[1], reverse=True)
-            top = inc_rows[:10]
-            other = sum(v for _, v in inc_rows[10:])
-            labels = [n for n, _ in top]
-            series = [round(v / (1024 ** 3), 2) for _, v in top]
-            if other > 0:
-                labels.append("其它")
-                series.append(round(other / (1024 ** 3), 2))
-            pie = {
-                "component": "VCol", "props": {"cols": 12, "md": 4},
-                "content": [{
-                    "component": "VCard", "props": {"variant": "tonal"},
-                    "content": [
-                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                         "text": f"上传增量来源占比（较{prev_md}）" if prev_md else "上传增量来源占比"},
-                        {"component": "VCardText", "content": [{
-                            "component": "VApexChart",
-                            "props": {
-                                "type": "donut",
-                                "height": 300,
-                                "options": {
-                                    "labels": labels,
-                                    "legend": {"position": "bottom"},
-                                    "dataLabels": {"enabled": True},
-                                    "tooltip": {"y": {}},
-                                },
-                                "series": series,
-                            },
-                        }]},
-                    ],
-                }],
-            }
-            charts.append(pie)
-
-        # 每日增量柱状图放到趋势/占比之后，独占整行
+        # 每日增量柱状图放到趋势图之后，独占整行
         if bar_chart:
             charts.append(bar_chart)
 
