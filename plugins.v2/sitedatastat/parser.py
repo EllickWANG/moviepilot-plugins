@@ -3489,6 +3489,7 @@ SITE_RULES = {
         },
     },
     "skyeysnow.com": {
+        "calculate_ratio": True,
         "fields": {
             "ratio": {"xpath": "//ul[@id='ratio_menu']/li/a[contains(.,'Ratio')]/text()", "regex": r"Ratio\s*:\s*([0-9.]+)", "type": "float"},
         },
