@@ -37,7 +37,7 @@ class sitedatastat(_PluginBase):
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -293,6 +293,23 @@ class sitedatastat(_PluginBase):
     def _get_snapshot_by_date(self, date: str) -> Optional[Dict[str, dict]]:
         return self.get_data(date)
 
+    def _get_recent_two_snapshots(self) -> Tuple[Optional[Dict[str, dict]], Optional[Dict[str, dict]]]:
+        """
+        返回最近两份非空快照 (最新, 上一份)，用于增量对比。
+        不足两份时上一份为 None。
+        """
+        dates = self.get_data("_dates") or []
+        found: List[Dict[str, dict]] = []
+        for d in reversed(dates):
+            snap = self.get_data(d)
+            if snap:
+                found.append(snap)
+            if len(found) >= 2:
+                break
+        latest = found[0] if found else None
+        prev = found[1] if len(found) >= 2 else None
+        return latest, prev
+
     def _get_history_series(self) -> Tuple[List[str], List[float], List[float], List[float]]:
         """
         汇总历史快照，返回 (日期列表, 总上传GB, 总下载GB, 总做种体积GB)。
@@ -417,6 +434,17 @@ class sitedatastat(_PluginBase):
         total_seed = sum(int(r.get("seeding") or 0) for r in rows)
         total_seed_size = sum(int(r.get("seeding_size") or 0) for r in rows)
 
+        # 与上一份快照对比的增量（按 domain 匹配；无上一份则全部为 0）
+        _, prev_snap = self._get_recent_two_snapshots()
+        prev_snap = prev_snap or {}
+        inc_up_total = inc_dn_total = 0
+        for r in rows:
+            p = prev_snap.get(r.get("domain"))
+            if not p:
+                continue
+            inc_up_total += max(0, int(r.get("upload") or 0) - int(p.get("upload") or 0))
+            inc_dn_total += max(0, int(r.get("download") or 0) - int(p.get("download") or 0))
+
         def card(title, value, icon):
             return {
                 "component": "VCol", "props": {"cols": 6, "md": 3},
@@ -443,10 +471,16 @@ class sitedatastat(_PluginBase):
             card("总做种数", f"{total_seed:,}", "/plugin_icon/seed.png"),
             card("总做种体积", StringUtils.str_filesize(total_seed_size), "/plugin_icon/database.png"),
         ]
+        if prev_snap:
+            totals += [
+                card("较上次上传增量", f"+{StringUtils.str_filesize(inc_up_total)}", "/plugin_icon/upload.png"),
+                card("较上次下载增量", f"+{StringUtils.str_filesize(inc_dn_total)}", "/plugin_icon/download.png"),
+            ]
 
         charts = self._build_charts(rows)
 
-        headers = ["站点", "用户名", "用户等级", "上传量", "下载量", "分享率", "魔力值", "做种数", "做种体积"]
+        headers = ["站点", "用户名", "用户等级", "上传量", "上传增量", "下载量", "下载增量",
+                   "分享率", "魔力值", "做种数", "做种体积"]
         header_row = {"component": "thead", "content": [
             {"component": "th", "props": {"class": "text-start ps-4"}, "text": h} for h in headers]}
 
@@ -456,14 +490,24 @@ class sitedatastat(_PluginBase):
             except (ValueError, TypeError):
                 return "0.0"
 
+        def fmt_delta(cur, base, key):
+            """相对上一份快照的增量；无上一份或未增长显示 '-'。"""
+            if not prev_snap or not base:
+                return "-"
+            d = int(cur or 0) - int(base.get(key) or 0)
+            return f"+{StringUtils.str_filesize(d)}" if d > 0 else "-"
+
         table_rows = []
         for r in rows:
+            base = prev_snap.get(r.get("domain"))
             cells = [
                 {"text": r.get("name"), "cls": "whitespace-nowrap break-keep text-high-emphasis"},
                 {"text": r.get("username") or "-", "cls": ""},
                 {"text": r.get("user_level") or "-", "cls": ""},
                 {"text": StringUtils.str_filesize(r.get("upload") or 0), "cls": "text-success"},
+                {"text": fmt_delta(r.get("upload"), base, "upload"), "cls": "text-success"},
                 {"text": StringUtils.str_filesize(r.get("download") or 0), "cls": "text-error"},
+                {"text": fmt_delta(r.get("download"), base, "download"), "cls": "text-error"},
                 {"text": str(r.get("ratio") or 0), "cls": ""},
                 {"text": fmt_bonus(r.get("bonus") or 0), "cls": ""},
                 {"text": str(r.get("seeding") or 0), "cls": ""},
@@ -492,10 +536,12 @@ class sitedatastat(_PluginBase):
         """
         构建插件详情页内嵌图表（VApexChart）：
         - 流量历史趋势：总上传/总下载（GB）随采集日期变化的面积图。
+        - 每日增量：相邻快照之间总上传/总下载的增量柱状图。
         - 各站点上传占比：最新快照各站上传量的环形图。
         数据来自插件自有历史快照，无历史时不渲染对应图表。
         """
         charts: List[dict] = []
+        bar_chart: Optional[dict] = None
 
         # 1) 流量历史趋势（面积图）
         days, up_gb, dn_gb, _ = self._get_history_series()
@@ -532,7 +578,42 @@ class sitedatastat(_PluginBase):
             }
             charts.append(trend)
 
-        # 2) 各站点上传占比（环形图），取上传量前 10 站，其余归为「其它」
+            # 2) 每日增量（柱状图）：相邻快照差值，第一天无前值故从第二天起
+            inc_days = days[1:]
+            inc_up = [round(max(0.0, up_gb[i] - up_gb[i - 1]), 2) for i in range(1, len(up_gb))]
+            inc_dn = [round(max(0.0, dn_gb[i] - dn_gb[i - 1]), 2) for i in range(1, len(dn_gb))]
+            bar = {
+                "component": "VCol", "props": {"cols": 12},
+                "content": [{
+                    "component": "VCard", "props": {"variant": "tonal"},
+                    "content": [
+                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "每日增量"},
+                        {"component": "VCardText", "content": [{
+                            "component": "VApexChart",
+                            "props": {
+                                "type": "bar",
+                                "height": 280,
+                                "options": {
+                                    "chart": {"toolbar": {"show": False}, "stacked": False},
+                                    "plotOptions": {"bar": {"columnWidth": "55%"}},
+                                    "dataLabels": {"enabled": False},
+                                    "colors": ["#28a745", "#dc3545"],
+                                    "xaxis": {"type": "category", "categories": inc_days},
+                                    "yaxis": {"title": {"text": "GB"}},
+                                    "legend": {"position": "top"},
+                                },
+                                "series": [
+                                    {"name": "上传增量", "data": inc_up},
+                                    {"name": "下载增量", "data": inc_dn},
+                                ],
+                            },
+                        }]},
+                    ],
+                }],
+            }
+            bar_chart = bar
+
+        # 3) 各站点上传占比（环形图），取上传量前 10 站，其余归为「其它」
         up_rows = [(r.get("name") or r.get("domain") or "-", int(r.get("upload") or 0))
                    for r in rows if int(r.get("upload") or 0) > 0]
         if up_rows:
@@ -568,6 +649,10 @@ class sitedatastat(_PluginBase):
                 }],
             }
             charts.append(pie)
+
+        # 每日增量柱状图放到趋势/占比之后，独占整行
+        if bar_chart:
+            charts.append(bar_chart)
 
         return charts
 
