@@ -67,6 +67,9 @@ class SiteParserBase(metaclass=ABCMeta):
         __split_url = urlsplit(url)
         self._site_domain = __split_url.netloc
         self._base_url = f"{__split_url.scheme}://{__split_url.netloc}"
+        # 站点适配规则（按域名命中，独立于核心，内置常见特殊站点）
+        self._userdata_rules = _lookup_site_rules(self._site_domain)
+        self._rules_attrs_applied = False
         self._site_cookie = site_cookie
         self._session = session if session else None
         self._ua = ua
@@ -179,41 +182,69 @@ class SiteParserBase(metaclass=ABCMeta):
             self._parse_site_page(self._index_html)
             # 解析用户基础信息
             if self._user_basic_page:
-                self._parse_user_base_info(
-                    self._get_page_content(
-                        url=urljoin(self._base_url, self._user_basic_page),
-                        params=self._user_basic_params,
-                        headers=self._user_basic_headers
-                    )
+                base_html = self._get_page_content(
+                    url=urljoin(self._base_url, self._user_basic_page),
+                    params=self._user_basic_params,
+                    headers=self._user_basic_headers
                 )
             else:
-                self._parse_user_base_info(self._index_html)
+                base_html = self._index_html
+            self._parse_user_base_info(base_html)
+            # 站点适配规则：attrs（可改写详情/做种页 URL，如 uuid 站点）+ 字段修正
+            self._apply_userdata_rules(base_html, with_attrs=True)
             # 解析用户详细信息
             if self._user_detail_page:
-                self._parse_user_detail_info(
-                    self._get_page_content(
-                        url=urljoin(self._base_url, self._user_detail_page),
-                        params=self._user_detail_params,
-                        headers=self._user_detail_headers
-                    )
+                detail_html = self._get_page_content(
+                    url=urljoin(self._base_url, self._user_detail_page),
+                    params=self._user_detail_params,
+                    headers=self._user_detail_headers
                 )
+                self._parse_user_detail_info(detail_html)
+                self._apply_userdata_rules(detail_html)
             # 解析用户未读消息
             if settings.SITE_MESSAGE:
                 self._pase_unread_msgs()
             # 解析用户上传、下载、分享率等信息
             if self._user_traffic_page:
-                self._parse_user_traffic_info(
-                    self._get_page_content(
-                        url=urljoin(self._base_url, self._user_traffic_page),
-                        params=self._user_traffic_params,
-                        headers=self._user_traffic_headers
-                    )
+                traffic_html = self._get_page_content(
+                    url=urljoin(self._base_url, self._user_traffic_page),
+                    params=self._user_traffic_params,
+                    headers=self._user_traffic_headers
                 )
+                self._parse_user_traffic_info(traffic_html)
+                self._apply_userdata_rules(traffic_html)
             # 解析用户做种信息
             self._parse_seeding_pages()
+            # 收尾：calculate_ratio 等
+            self._finalize_userdata_rules()
         finally:
             # 关闭连接
             self.close()
+
+    def _apply_userdata_rules(self, html_text, with_attrs: bool = False):
+        """
+        应用内置站点适配规则（字段修正 / attrs URL 改写）。
+        """
+        rules = getattr(self, "_userdata_rules", None)
+        if not rules or not html_text:
+            return
+        try:
+            if with_attrs and not self._rules_attrs_applied:
+                _sds_apply_attrs(self, html_text, rules.get("attrs"))
+                self._rules_attrs_applied = True
+            _sds_apply_fields(self, html_text, rules.get("fields"))
+        except Exception as err:
+            logger.debug(f"{self._site_name} 站点适配规则执行失败：{err}")
+
+    def _finalize_userdata_rules(self):
+        rules = getattr(self, "_userdata_rules", None)
+        if not rules:
+            return
+        try:
+            if rules.get("calculate_ratio") and not self.ratio and self.download:
+                self.ratio = round(self.upload / self.download, 3)
+        except Exception:
+            pass
 
     def _pase_unread_msgs(self):
         """
@@ -3260,3 +3291,230 @@ class ZhixingSiteUserInfo(SiteParserBase):
         self.seeding = str(self.seeding or 0)
         self.seeding_size = str(self.seeding_size or 0)
 
+
+
+# ============================================================
+# 内置站点适配规则引擎（移植自 sitetoolbox，独立于核心）
+# 覆盖少数特殊 schema/端点站点：uuid 站点、特殊做种端点、异构页面等。
+# ============================================================
+
+import html as _sds_html  # noqa: E402
+
+
+def _sds_norm_domain(domain):
+    domain = str(domain or "").strip().lower()
+    if not domain:
+        return ""
+    if "://" in domain:
+        domain = urlsplit(domain).netloc or domain
+    return domain.split("@")[-1].split(":", 1)[0].strip()
+
+
+def _lookup_site_rules(domain):
+    d = _sds_norm_domain(domain)
+    for rule_domain, rule in SITE_RULES.items():
+        if d == rule_domain or d.endswith("." + rule_domain):
+            return rule
+    return None
+
+
+def _sds_as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def _sds_extract_xpath(html, spec):
+    try:
+        values = html.xpath(spec.get("xpath"))
+    except Exception:
+        return None
+    if not values:
+        return None
+    index = spec.get("index", 0)
+    if index == "last":
+        index = -1
+    try:
+        value = values[int(index)]
+    except Exception:
+        return None
+    attribute = spec.get("attribute")
+    if isinstance(value, etree._Element):
+        if attribute == "text" or not attribute:
+            return value.xpath("string(.)")
+        if attribute == "tail":
+            return value.tail or ""
+        if attribute == "html":
+            return etree.tostring(value, encoding="unicode")
+        return value.get(attribute) or ""
+    return str(value)
+
+
+def _sds_extract_value(html, html_text, spec):
+    if isinstance(spec, str):
+        spec = {"xpath": spec}
+    if not isinstance(spec, dict):
+        return None
+    if "value" in spec:
+        value = spec.get("value")
+    elif spec.get("xpath"):
+        value = _sds_extract_xpath(html, spec)
+    elif spec.get("regex"):
+        value = html_text
+    else:
+        return None
+    if value is None:
+        return None
+    value = _sds_html.unescape(str(value)).strip()
+    regex = spec.get("regex")
+    if regex:
+        flags = re.IGNORECASE if spec.get("ignore_case", True) else 0
+        m = re.search(regex, value, flags)
+        if not m:
+            return None
+        group = spec.get("group", 1 if m.lastindex else 0)
+        value = m.group(group)
+    for old, new in spec.get("replace") or []:
+        value = value.replace(str(old), str(new))
+    return value.strip()
+
+
+def _sds_norm_field(field):
+    aliases = {
+        "uploaded": "upload", "上传量": "upload",
+        "downloaded": "download", "下载量": "download",
+        "魔力": "bonus", "魔力值": "bonus",
+        "分享率": "ratio",
+        "seeders": "seeding", "当前做种": "seeding",
+        "leechers": "leeching", "当前下载": "leeching",
+    }
+    key = str(field).strip().lower()
+    return aliases.get(key, str(field).strip())
+
+
+def _sds_default_type(field):
+    if field in {"upload", "download", "seeding_size"}:
+        return "size"
+    if field in {"ratio", "bonus"}:
+        return "float"
+    if field in {"seeding", "leeching"}:
+        return "int"
+    return "text"
+
+
+def _sds_clean_number(value):
+    value = str(value).replace("---", "0").replace("∞", "0").replace(",", "")
+    return re.sub(r"\s+", "", value)
+
+
+def _sds_set_value(parser, field, value, value_type=None):
+    field = _sds_norm_field(field)
+    if not field:
+        return
+    value_type = value_type or _sds_default_type(field)
+    value = str(value or "").strip()
+    if value_type == "active":
+        m = re.search(r"(\d+)\s*/\s*(\d+)", value)
+        if m:
+            parser.seeding = StringUtils.str_int(m.group(1))
+            parser.leeching = StringUtils.str_int(m.group(2))
+        return
+    if value_type == "size":
+        setattr(parser, field, StringUtils.num_filesize(value))
+    elif value_type == "int":
+        setattr(parser, field, StringUtils.str_int(value))
+    elif value_type == "float":
+        setattr(parser, field, StringUtils.str_float(_sds_clean_number(value)))
+    else:
+        setattr(parser, field, value)
+
+
+def _sds_apply_fields(parser, html_text, fields):
+    if not fields or not html_text:
+        return
+    try:
+        html = etree.HTML(html_text)
+    except Exception:
+        return
+    if html is None:
+        return
+    for field, specs in fields.items():
+        for spec in _sds_as_list(specs):
+            value = _sds_extract_value(html, html_text, spec)
+            if value is None or value == "":
+                continue
+            if isinstance(spec, dict) and spec.get("only_empty") and getattr(parser, _sds_norm_field(field), None):
+                continue
+            _sds_set_value(parser, field, value, spec.get("type") if isinstance(spec, dict) else None)
+            if not (isinstance(spec, dict) and spec.get("continue")):
+                break
+
+
+def _sds_apply_attrs(parser, html_text, attrs):
+    if not attrs or not html_text:
+        return
+    try:
+        html = etree.HTML(html_text)
+    except Exception:
+        return
+    if html is None:
+        return
+    for attr, spec in attrs.items():
+        if not isinstance(spec, dict):
+            continue
+        value = _sds_extract_value(html, html_text, spec)
+        if not value:
+            continue
+        fmt = spec.get("format")
+        if fmt:
+            value = fmt.replace("{value}", value)
+        setattr(parser, attr, value)
+        if attr == "_torrent_seeding_page":
+            parser._torrent_seeding_params = None
+
+
+# 特殊站点规则（来自 sitetoolbox 现成验证规则）
+SITE_RULES = {
+    "hdcity.city": {
+        "calculate_ratio": True,
+        "fields": {
+            "username": {"xpath": "//div[@id='bottomnav']//a[contains(@href, 'userdetails')]//strong/text()"},
+            "user_level": {"xpath": "//div[@id='bottomnav']//a[contains(@href, 'userdetails')]//strong/following-sibling::text()[1]", "regex": r"\[([^\]]+)\]"},
+            "upload": {"xpath": "//i[starts-with(@title,'Uploaded') or starts-with(@title,'上传量')]/following-sibling::text()[1]"},
+            "download": {"xpath": "//i[starts-with(@title,'Downloaded') or starts-with(@title,'下载量')]/following-sibling::text()[1]"},
+            "ratio": {"xpath": "//i[starts-with(@title,'Ratio') or starts-with(@title,'分享率')]/following-sibling::text()[1]"},
+            "seeding": {"xpath": "//span[@title='Torrents Seeding' or @title='当前做种']/text()"},
+            "leeching": {"xpath": "//span[@title='Torrents Leeching' or @title='当前下载']/text()"},
+            "bonus": {"xpath": "//*[self::strong or self::b][normalize-space()='Karma Points' or normalize-space()='魔力值']/following-sibling::text()[1]"},
+        },
+    },
+    "skyeysnow.com": {
+        "fields": {
+            "ratio": {"xpath": "//ul[@id='ratio_menu']/li/a[contains(.,'Ratio')]/text()", "regex": r"Ratio\s*:\s*([0-9.]+)", "type": "float"},
+        },
+    },
+    "pttime.org": {
+        "fields": {
+            "user_level": {"xpath": "//a[contains(@class,'User_Name')]/parent::*", "regex": r"\[((?:\([^)]+\))?[^\]]*User[^\]]*)\]"},
+            "bonus": {"xpath": "//span[contains(.,'魔力值')]", "regex": r"\]:\s*([0-9,.]+)", "type": "float"},
+        },
+    },
+    "xloli.cc": {
+        "fields": {
+            "username": "//table[@id='info_block']//a[contains(@class,'User_Name')]/b/text()",
+            "user_level": {"value": "初级魔法少女"},
+            "leeching": {"xpath": "//font[contains(@class,'color_active')]/following-sibling::img[contains(@class,'arrowdown')][1]", "attribute": "tail", "regex": r"(\d+)", "type": "int"},
+        },
+        "attrs": {
+            "_user_detail_page": {"xpath": "//table[@id='info_block']//a[contains(@class,'User_Name') and contains(@href,'userdetails.php?uuid=')]/@href", "regex": r"(?:https?://[^/]+/)?(userdetails\.php\?uuid=[0-9a-fA-F-]{36})"},
+            "_torrent_seeding_page": {"xpath": "//table[@id='info_block']//a[contains(@class,'User_Name') and contains(@href,'userdetails.php?uuid=')]/@href", "regex": r"([0-9a-fA-F-]{36})", "format": "getusertorrentlistajax.php?useruuid={value}&type=seeding"},
+        },
+    },
+    "pterclub.net": {
+        "fields": {
+            "seeding": {"xpath": "//font[contains(@class,'color_active')]/following-sibling::a[img[contains(@class,'arrowup')]][1]/img[contains(@class,'arrowup')][1]", "attribute": "tail", "regex": r"(\d+)", "type": "int"},
+            "leeching": {"xpath": "//font[contains(@class,'color_active')]/following-sibling::a[img[contains(@class,'arrowdown')]][1]/img[contains(@class,'arrowdown')][1]", "attribute": "tail", "regex": r"(\d+)", "type": "int"},
+            "seeding_size": {"xpath": "//td[contains(@class,'rowhead') and normalize-space(.)='做种大小']/following-sibling::td[contains(@class,'rowfollow')][1]", "type": "size"},
+        },
+    },
+}
