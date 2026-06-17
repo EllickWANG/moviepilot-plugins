@@ -31,13 +31,13 @@ DATA_FIELDS = [
 
 class sitedatastat(_PluginBase):
     # 插件名称
-    plugin_name = "站点数据统计·自主版"
+    plugin_name = "站点数据统计"
     # 插件描述
     plugin_desc = "完全自主抓取并解析各站点用户数据（上传/下载/分享率/魔力/做种），不依赖核心解析流程。"
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -74,11 +74,11 @@ class sitedatastat(_PluginBase):
         self._parser_classes = self._load_parser_classes()
 
         if self._onlyonce:
-            logger.info("站点数据统计·自主版：立即运行一次采集")
+            logger.info("站点数据统计：立即运行一次采集")
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(self.collect, "date",
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                    name="站点数据统计·自主版")
+                                    name="站点数据统计")
             self._onlyonce = False
             config = config or {}
             config["onlyonce"] = False
@@ -102,7 +102,7 @@ class sitedatastat(_PluginBase):
         if self._enabled and self._cron:
             return [{
                 "id": "sitedatastat",
-                "name": "站点数据统计·自主版采集",
+                "name": "站点数据统计采集",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.collect,
                 "kwargs": {}
@@ -124,7 +124,7 @@ class sitedatastat(_PluginBase):
                     classes[obj.schema.value] = obj
             except TypeError:
                 continue
-        logger.info(f"站点数据统计·自主版：加载内置解析器 {len(classes)} 个 schema")
+        logger.info(f"站点数据统计：加载内置解析器 {len(classes)} 个 schema")
         return classes
 
     # ---------------- 采集 ----------------
@@ -145,7 +145,7 @@ class sitedatastat(_PluginBase):
                 targets.append(site)
 
             if not targets:
-                logger.warning("站点数据统计·自主版：没有可采集的站点")
+                logger.warning("站点数据统计：没有可采集的站点")
                 return
 
             today = datetime.now().strftime("%Y-%m-%d")
@@ -180,7 +180,7 @@ class sitedatastat(_PluginBase):
                 dates.append(today)
                 dates = sorted(dates)[-90:]  # 最多保留 90 天
                 self.save_data("_dates", dates)
-            logger.info(f"站点数据统计·自主版：采集完成，成功 {ok}，失败/沿用 {fail}，共 {len(result)} 站")
+            logger.info(f"站点数据统计：采集完成，成功 {ok}，失败/沿用 {fail}，共 {len(result)} 站")
 
             # 通知
             self._notify(today, result, prev_snapshot)
@@ -238,7 +238,7 @@ class sitedatastat(_PluginBase):
                 return base
             except Exception as err:
                 last_err = str(err)
-                logger.debug(f"站点数据统计·自主版：{site.get('name')} 解析异常({i + 1}/{attempts}) - {err}")
+                logger.debug(f"站点数据统计：{site.get('name')} 解析异常({i + 1}/{attempts}) - {err}")
         base["err_msg"] = last_err or "解析失败"
         return base
 
@@ -303,7 +303,7 @@ class sitedatastat(_PluginBase):
             text = (f"今日上传：{StringUtils.str_filesize(inc_up)}\n"
                     f"今日下载：{StringUtils.str_filesize(inc_dn)}")
         self.post_message(mtype=NotificationType.SiteMessage,
-                          title="站点数据统计·自主版", text=text)
+                          title="站点数据统计", text=text)
 
     # ---------------- 配置表单 ----------------
 
@@ -457,4 +457,4 @@ class sitedatastat(_PluginBase):
                     self._scheduler.shutdown()
                 self._scheduler = None
         except Exception as err:
-            logger.debug(f"站点数据统计·自主版：停止服务异常 - {err}")
+            logger.debug(f"站点数据统计：停止服务异常 - {err}")
