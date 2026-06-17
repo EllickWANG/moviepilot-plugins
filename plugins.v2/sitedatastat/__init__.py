@@ -37,7 +37,7 @@ class sitedatastat(_PluginBase):
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -613,13 +613,22 @@ class sitedatastat(_PluginBase):
             }
             bar_chart = bar
 
-        # 3) 各站点上传占比（环形图），取上传量前 10 站，其余归为「其它」
-        up_rows = [(r.get("name") or r.get("domain") or "-", int(r.get("upload") or 0))
-                   for r in rows if int(r.get("upload") or 0) > 0]
-        if up_rows:
-            up_rows.sort(key=lambda x: x[1], reverse=True)
-            top = up_rows[:10]
-            other = sum(v for _, v in up_rows[10:])
+        # 3) 各站上传增量占比（环形图）：本次相对上一份快照的上传增量来自哪些站点，
+        #    取增量前 10 站，其余归为「其它」。无上一份快照时不渲染。
+        _, prev_snap = self._get_recent_two_snapshots()
+        inc_rows = []
+        if prev_snap:
+            for r in rows:
+                p = prev_snap.get(r.get("domain"))
+                if not p:
+                    continue
+                delta = int(r.get("upload") or 0) - int(p.get("upload") or 0)
+                if delta > 0:
+                    inc_rows.append((r.get("name") or r.get("domain") or "-", delta))
+        if inc_rows:
+            inc_rows.sort(key=lambda x: x[1], reverse=True)
+            top = inc_rows[:10]
+            other = sum(v for _, v in inc_rows[10:])
             labels = [n for n, _ in top]
             series = [round(v / (1024 ** 3), 2) for _, v in top]
             if other > 0:
@@ -630,7 +639,7 @@ class sitedatastat(_PluginBase):
                 "content": [{
                     "component": "VCard", "props": {"variant": "tonal"},
                     "content": [
-                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "各站上传占比"},
+                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "上传增量来源占比"},
                         {"component": "VCardText", "content": [{
                             "component": "VApexChart",
                             "props": {
