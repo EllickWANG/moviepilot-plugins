@@ -37,7 +37,7 @@ class sitedatastat(_PluginBase):
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -293,22 +293,28 @@ class sitedatastat(_PluginBase):
     def _get_snapshot_by_date(self, date: str) -> Optional[Dict[str, dict]]:
         return self.get_data(date)
 
-    def _get_recent_two_snapshots(self) -> Tuple[Optional[Dict[str, dict]], Optional[Dict[str, dict]]]:
+    def _get_recent_two_snapshots(self):
         """
-        返回最近两份非空快照 (最新, 上一份)，用于增量对比。
-        不足两份时上一份为 None。
+        返回最近两份非空快照及其日期 (最新日期, 最新快照, 上一日期, 上一快照)，
+        用于"当前 vs 前一天"的增量对比。不足两份时上一份为 None。
+        注意：取的是上一份"可用"快照，若某天漏采则会落到再往前最近的一天。
         """
         dates = self.get_data("_dates") or []
-        found: List[Dict[str, dict]] = []
+        found: List[Tuple[str, Dict[str, dict]]] = []
         for d in reversed(dates):
             snap = self.get_data(d)
             if snap:
-                found.append(snap)
+                found.append((d, snap))
             if len(found) >= 2:
                 break
-        latest = found[0] if found else None
-        prev = found[1] if len(found) >= 2 else None
-        return latest, prev
+        latest_date, latest_snap = found[0] if found else (None, None)
+        prev_date, prev_snap = found[1] if len(found) >= 2 else (None, None)
+        return latest_date, latest_snap, prev_date, prev_snap
+
+    @staticmethod
+    def _short_date(d: Optional[str]) -> str:
+        """2026-06-16 -> 06-16；空值返回 ''。"""
+        return d[5:] if d and len(d) >= 10 else (d or "")
 
     def _get_history_series(self) -> Tuple[List[str], List[float], List[float], List[float]]:
         """
@@ -434,9 +440,10 @@ class sitedatastat(_PluginBase):
         total_seed = sum(int(r.get("seeding") or 0) for r in rows)
         total_seed_size = sum(int(r.get("seeding_size") or 0) for r in rows)
 
-        # 与上一份快照对比的增量（按 domain 匹配；无上一份则全部为 0）
-        _, prev_snap = self._get_recent_two_snapshots()
+        # 与上一份快照（正常即前一天）对比的增量（按 domain 匹配；无上一份则全部为 0）
+        latest_date, _, prev_date, prev_snap = self._get_recent_two_snapshots()
         prev_snap = prev_snap or {}
+        prev_md = self._short_date(prev_date)
         inc_up_total = inc_dn_total = 0
         for r in rows:
             p = prev_snap.get(r.get("domain"))
@@ -472,15 +479,18 @@ class sitedatastat(_PluginBase):
             card("总做种体积", StringUtils.str_filesize(total_seed_size), "/plugin_icon/database.png"),
         ]
         if prev_snap:
+            up_title = f"较前一天上传增量（{prev_md}→{self._short_date(latest_date)}）" if prev_md else "较前一天上传增量"
+            dn_title = f"较前一天下载增量（{prev_md}→{self._short_date(latest_date)}）" if prev_md else "较前一天下载增量"
             totals += [
-                card("较上次上传增量", f"+{StringUtils.str_filesize(inc_up_total)}", "/plugin_icon/upload.png"),
-                card("较上次下载增量", f"+{StringUtils.str_filesize(inc_dn_total)}", "/plugin_icon/download.png"),
+                card(up_title, f"+{StringUtils.str_filesize(inc_up_total)}", "/plugin_icon/upload.png"),
+                card(dn_title, f"+{StringUtils.str_filesize(inc_dn_total)}", "/plugin_icon/download.png"),
             ]
 
         charts = self._build_charts(rows)
 
-        headers = ["站点", "用户名", "用户等级", "上传量", "上传增量", "下载量", "下载增量",
-                   "分享率", "魔力值", "做种数", "做种体积"]
+        inc_suffix = f"(较{prev_md})" if prev_md else ""
+        headers = ["站点", "用户名", "用户等级", "上传量", f"上传增量{inc_suffix}",
+                   "下载量", f"下载增量{inc_suffix}", "分享率", "魔力值", "做种数", "做种体积"]
         header_row = {"component": "thead", "content": [
             {"component": "th", "props": {"class": "text-start ps-4"}, "text": h} for h in headers]}
 
@@ -587,7 +597,7 @@ class sitedatastat(_PluginBase):
                 "content": [{
                     "component": "VCard", "props": {"variant": "tonal"},
                     "content": [
-                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "每日增量"},
+                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "每日增量（较前一天）"},
                         {"component": "VCardText", "content": [{
                             "component": "VApexChart",
                             "props": {
@@ -613,9 +623,10 @@ class sitedatastat(_PluginBase):
             }
             bar_chart = bar
 
-        # 3) 各站上传增量占比（环形图）：本次相对上一份快照的上传增量来自哪些站点，
-        #    取增量前 10 站，其余归为「其它」。无上一份快照时不渲染。
-        _, prev_snap = self._get_recent_two_snapshots()
+        # 3) 各站上传增量占比（环形图）：本次相对上一份快照（正常即前一天）的上传增量
+        #    来自哪些站点，取增量前 10 站，其余归为「其它」。无上一份快照时不渲染。
+        _, _, prev_date, prev_snap = self._get_recent_two_snapshots()
+        prev_md = self._short_date(prev_date)
         inc_rows = []
         if prev_snap:
             for r in rows:
@@ -639,7 +650,8 @@ class sitedatastat(_PluginBase):
                 "content": [{
                     "component": "VCard", "props": {"variant": "tonal"},
                     "content": [
-                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "上传增量来源占比"},
+                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                         "text": f"上传增量来源占比（较{prev_md}）" if prev_md else "上传增量来源占比"},
                         {"component": "VCardText", "content": [{
                             "component": "VApexChart",
                             "props": {
