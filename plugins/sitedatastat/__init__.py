@@ -37,7 +37,7 @@ class sitedatastat(_PluginBase):
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -293,6 +293,30 @@ class sitedatastat(_PluginBase):
     def _get_snapshot_by_date(self, date: str) -> Optional[Dict[str, dict]]:
         return self.get_data(date)
 
+    def _get_history_series(self) -> Tuple[List[str], List[float], List[float], List[float]]:
+        """
+        汇总历史快照，返回 (日期列表, 总上传GB, 总下载GB, 总做种体积GB)。
+        仅取最近 30 个有数据的快照，避免图表过密。
+        """
+        dates = self.get_data("_dates") or []
+        days: List[str] = []
+        up_gb: List[float] = []
+        dn_gb: List[float] = []
+        seed_gb: List[float] = []
+        gib = 1024 ** 3
+        for d in dates[-30:]:
+            snap = self.get_data(d)
+            if not snap:
+                continue
+            total_up = sum(int(r.get("upload") or 0) for r in snap.values())
+            total_dn = sum(int(r.get("download") or 0) for r in snap.values())
+            total_seed = sum(int(r.get("seeding_size") or 0) for r in snap.values())
+            days.append(d)
+            up_gb.append(round(total_up / gib, 2))
+            dn_gb.append(round(total_dn / gib, 2))
+            seed_gb.append(round(total_seed / gib, 2))
+        return days, up_gb, dn_gb, seed_gb
+
     # ---------------- 通知 ----------------
 
     def _notify(self, today: str, current: Dict[str, dict], prev: Optional[Dict[str, dict]]):
@@ -420,6 +444,8 @@ class sitedatastat(_PluginBase):
             card("总做种体积", StringUtils.str_filesize(total_seed_size), "/plugin_icon/database.png"),
         ]
 
+        charts = self._build_charts(rows)
+
         headers = ["站点", "用户名", "用户等级", "上传量", "下载量", "分享率", "魔力值", "做种数", "做种体积"]
         header_row = {"component": "thead", "content": [
             {"component": "th", "props": {"class": "text-start ps-4"}, "text": h} for h in headers]}
@@ -453,7 +479,7 @@ class sitedatastat(_PluginBase):
 
         return [{
             "component": "VRow",
-            "content": totals + [{
+            "content": totals + charts + [{
                 "component": "VCol", "props": {"cols": 12},
                 "content": [{
                     "component": "VTable", "props": {"hover": True},
@@ -461,6 +487,89 @@ class sitedatastat(_PluginBase):
                 }],
             }],
         }]
+
+    def _build_charts(self, rows: List[dict]) -> List[dict]:
+        """
+        构建插件详情页内嵌图表（VApexChart）：
+        - 流量历史趋势：总上传/总下载（GB）随采集日期变化的面积图。
+        - 各站点上传占比：最新快照各站上传量的环形图。
+        数据来自插件自有历史快照，无历史时不渲染对应图表。
+        """
+        charts: List[dict] = []
+
+        # 1) 流量历史趋势（面积图）
+        days, up_gb, dn_gb, _ = self._get_history_series()
+        if len(days) >= 2:
+            trend = {
+                "component": "VCol", "props": {"cols": 12, "md": 8},
+                "content": [{
+                    "component": "VCard", "props": {"variant": "tonal"},
+                    "content": [
+                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "流量历史趋势"},
+                        {"component": "VCardText", "content": [{
+                            "component": "VApexChart",
+                            "props": {
+                                "type": "area",
+                                "height": 300,
+                                "options": {
+                                    "chart": {"toolbar": {"show": False}, "zoom": {"enabled": False}},
+                                    "dataLabels": {"enabled": False},
+                                    "stroke": {"width": 2, "curve": "smooth"},
+                                    "colors": ["#28a745", "#dc3545"],
+                                    "xaxis": {"type": "category", "categories": days},
+                                    "yaxis": {"title": {"text": "GB"}},
+                                    "tooltip": {"y": {"formatter": None}},
+                                    "legend": {"position": "top"},
+                                },
+                                "series": [
+                                    {"name": "总上传", "data": up_gb},
+                                    {"name": "总下载", "data": dn_gb},
+                                ],
+                            },
+                        }]},
+                    ],
+                }],
+            }
+            charts.append(trend)
+
+        # 2) 各站点上传占比（环形图），取上传量前 10 站，其余归为「其它」
+        up_rows = [(r.get("name") or r.get("domain") or "-", int(r.get("upload") or 0))
+                   for r in rows if int(r.get("upload") or 0) > 0]
+        if up_rows:
+            up_rows.sort(key=lambda x: x[1], reverse=True)
+            top = up_rows[:10]
+            other = sum(v for _, v in up_rows[10:])
+            labels = [n for n, _ in top]
+            series = [round(v / (1024 ** 3), 2) for _, v in top]
+            if other > 0:
+                labels.append("其它")
+                series.append(round(other / (1024 ** 3), 2))
+            pie = {
+                "component": "VCol", "props": {"cols": 12, "md": 4},
+                "content": [{
+                    "component": "VCard", "props": {"variant": "tonal"},
+                    "content": [
+                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "各站上传占比"},
+                        {"component": "VCardText", "content": [{
+                            "component": "VApexChart",
+                            "props": {
+                                "type": "donut",
+                                "height": 300,
+                                "options": {
+                                    "labels": labels,
+                                    "legend": {"position": "bottom"},
+                                    "dataLabels": {"enabled": True},
+                                    "tooltip": {"y": {}},
+                                },
+                                "series": series,
+                            },
+                        }]},
+                    ],
+                }],
+            }
+            charts.append(pie)
+
+        return charts
 
     def stop_service(self):
         try:
