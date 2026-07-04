@@ -43,7 +43,16 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaType, MessageChannel
 from app.schemas.types import ContentType, EventType, ModuleType, NotificationType, ScrapingTarget
-from app.helper.subscribe import SubscribeHelper
+try:
+    # MoviePilot <= 2.10
+    from app.helper.subscribe import SubscribeHelper
+except ImportError:
+    SubscribeHelper = None
+try:
+    # MoviePilot >= 2.11 订阅统计上报移动到 MoviePilotServerHelper
+    from app.helper.server import MoviePilotServerHelper
+except ImportError:
+    MoviePilotServerHelper = None
 from app.helper.torrent import TorrentHelper
 from app.utils.dom import DomUtils
 from app.utils.http import AsyncRequestUtils, RequestUtils
@@ -53,7 +62,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.47"
+    plugin_version = "1.0.48"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -1676,7 +1685,8 @@ def _source_media_from_meta(
 def _patched_media_recognize_by_meta(
         self: MediaChain,
         metainfo: Any,
-        episode_group: Optional[str] = None) -> Optional[MediaInfo]:
+        episode_group: Optional[str] = None,
+        **kwargs) -> Optional[MediaInfo]:
     source_mediainfo = _source_media_from_meta(self, metainfo, getattr(metainfo, "type", None))
     if source_mediainfo:
         source_mediainfo.episode_group = episode_group or source_mediainfo.episode_group
@@ -1686,14 +1696,15 @@ def _patched_media_recognize_by_meta(
         )
         return source_mediainfo
     return sourceprioritysubscribefix._originals["media_recognize_by_meta"](
-        self, metainfo, episode_group=episode_group
+        self, metainfo, episode_group=episode_group, **kwargs
     )
 
 
 def _patched_media_recognize_by_path(
         self: MediaChain,
         path: str,
-        episode_group: Optional[str] = None) -> Optional[Context]:
+        episode_group: Optional[str] = None,
+        **kwargs) -> Optional[Context]:
     file_path = Path(path)
     file_meta = MetaInfoPath(file_path)
     source_mediainfo = _source_media_from_meta(self, file_meta, getattr(file_meta, "type", None))
@@ -1702,7 +1713,7 @@ def _patched_media_recognize_by_path(
         logger.info(f"{path} 使用Bangumi订阅来源识别：{source_mediainfo.title_year}")
         return Context(meta_info=file_meta, media_info=source_mediainfo)
     return sourceprioritysubscribefix._originals["media_recognize_by_path"](
-        self, path, episode_group=episode_group
+        self, path, episode_group=episode_group, **kwargs
     )
 
 
@@ -3430,7 +3441,7 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
 def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, mtype: Optional[MediaType] = None,
                                        tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                                        bangumiid: Optional[int] = None, episode_group: Optional[str] = None,
-                                       cache: bool = True) -> Optional[MediaInfo]:
+                                       cache: bool = True, **kwargs) -> Optional[MediaInfo]:
     if not tmdbid and doubanid:
         mediainfo = _media_from_douban(self, doubanid, mtype)
         if mediainfo:
@@ -3454,6 +3465,7 @@ def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, m
         bangumiid=bangumiid,
         episode_group=episode_group,
         cache=cache,
+        **kwargs,
     ))
 
 
@@ -3463,7 +3475,7 @@ async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: A
                                                    doubanid: Optional[str] = None,
                                                    bangumiid: Optional[int] = None,
                                                    episode_group: Optional[str] = None,
-                                                   cache: bool = True) -> Optional[MediaInfo]:
+                                                   cache: bool = True, **kwargs) -> Optional[MediaInfo]:
     if not tmdbid and doubanid:
         mediainfo = await _async_media_from_douban(self, doubanid, mtype)
         if mediainfo:
@@ -3487,6 +3499,7 @@ async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: A
         bangumiid=bangumiid,
         episode_group=episode_group,
         cache=cache,
+        **kwargs,
     ))
 
 
@@ -3977,7 +3990,7 @@ def _create_subscription(chain: SubscribeChain, mediainfo: MediaInfo, metainfo: 
         "username": username,
         "mediainfo": mediainfo.to_dict(),
     })
-    SubscribeHelper().sub_reg_async(_subscribe_stat_payload(mediainfo, metainfo, title, year))
+    _report_subscribe_stat(_subscribe_stat_payload(mediainfo, metainfo, title, year))
     _clear_source_subscribe_cache()
     return sid, err_msg
 
@@ -4022,9 +4035,23 @@ async def _async_create_subscription(chain: SubscribeChain, mediainfo: MediaInfo
         "username": username,
         "mediainfo": mediainfo.to_dict(),
     })
-    await SubscribeHelper().async_sub_reg(_subscribe_stat_payload(mediainfo, metainfo, title, year))
+    await _async_report_subscribe_stat(_subscribe_stat_payload(mediainfo, metainfo, title, year))
     _clear_source_subscribe_cache()
     return sid, err_msg
+
+
+def _report_subscribe_stat(payload: dict) -> None:
+    if SubscribeHelper is not None:
+        SubscribeHelper().sub_reg_async(payload)
+    elif MoviePilotServerHelper is not None:
+        MoviePilotServerHelper.sub_reg_async(payload)
+
+
+async def _async_report_subscribe_stat(payload: dict) -> None:
+    if SubscribeHelper is not None:
+        await SubscribeHelper().async_sub_reg(payload)
+    elif MoviePilotServerHelper is not None:
+        await MoviePilotServerHelper.async_sub_reg(payload)
 
 
 def _subscribe_stat_payload(mediainfo: MediaInfo, metainfo: MetaInfo, title: str, year: str) -> dict:
