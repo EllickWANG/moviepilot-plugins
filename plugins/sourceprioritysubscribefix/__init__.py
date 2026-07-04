@@ -71,7 +71,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.53"
+    plugin_version = "1.0.54"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -4119,23 +4119,60 @@ def _bangumi_sync_fetch(base_url: str, url: str, key: Optional[str], params: dic
     return None
 
 
+# Bangumi 主通道熔断：主通道（核心 httpx）连续无结果而兜底有结果时，说明主通道故障，
+# 冷却期内直接走兜底，避免每个请求都先烧掉 15-20 秒的失败等待拖垮前端和后端线程。
+_BGM_BREAKER = {"fails": 0, "skip_until": 0.0}
+_BGM_BREAKER_THRESHOLD = 2
+_BGM_BREAKER_COOLDOWN = 600
+
+
+def _bgm_primary_usable() -> bool:
+    return time.time() >= _BGM_BREAKER["skip_until"]
+
+
+def _bgm_record_primary(primary_failed: bool, fallback_succeeded: bool) -> None:
+    if not primary_failed:
+        _BGM_BREAKER["fails"] = 0
+        return
+    # 主通道失败但兜底拿到了数据，才能确认是通道故障而不是资源本身不存在
+    if fallback_succeeded:
+        _BGM_BREAKER["fails"] += 1
+        if _BGM_BREAKER["fails"] >= _BGM_BREAKER_THRESHOLD:
+            _BGM_BREAKER["skip_until"] = time.time() + _BGM_BREAKER_COOLDOWN
+            _BGM_BREAKER["fails"] = 0
+            logger.warn(
+                f"Bangumi 主通道连续失败，{_BGM_BREAKER_COOLDOWN // 60} 分钟内请求将直接走兜底通道")
+
+
 def _patched_bangumi_invoke(self, url, key: Optional[str] = None, **kwargs):
-    result = sourceprioritysubscribefix._originals["bangumi_invoke"](self, url, key=key, **kwargs)
-    if result is not None:
-        return result
-    return _bangumi_sync_fetch(self._base_url, url, key, dict(kwargs) if kwargs else {})
+    primary_failed = False
+    if _bgm_primary_usable():
+        result = sourceprioritysubscribefix._originals["bangumi_invoke"](self, url, key=key, **kwargs)
+        if result is not None:
+            _bgm_record_primary(primary_failed=False, fallback_succeeded=False)
+            return result
+        primary_failed = True
+    result = _bangumi_sync_fetch(self._base_url, url, key, dict(kwargs) if kwargs else {})
+    _bgm_record_primary(primary_failed=primary_failed, fallback_succeeded=result is not None)
+    return result
 
 
 async def _patched_bangumi_async_invoke(self, url, key: Optional[str] = None, **kwargs):
-    result = await sourceprioritysubscribefix._originals["bangumi_async_invoke"](self, url, key=key, **kwargs)
-    if result is not None:
-        return result
+    primary_failed = False
+    if _bgm_primary_usable():
+        result = await sourceprioritysubscribefix._originals["bangumi_async_invoke"](self, url, key=key, **kwargs)
+        if result is not None:
+            _bgm_record_primary(primary_failed=False, fallback_succeeded=False)
+            return result
+        primary_failed = True
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _bangumi_sync_fetch, self._base_url, url, key, dict(kwargs) if kwargs else {})
     except Exception as err:
         logger.debug(f"Bangumi 异步兜底失败：{url} - {err}")
         return None
+    _bgm_record_primary(primary_failed=primary_failed, fallback_succeeded=result is not None)
+    return result
 
 
 def _patched_image_get_request_params(url: str, proxy=None, cookies=None) -> dict:
