@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import subprocess
 import time
@@ -54,14 +53,6 @@ try:
     from app.helper.server import MoviePilotServerHelper
 except ImportError:
     MoviePilotServerHelper = None
-try:
-    from app.modules.bangumi.bangumi import BangumiApi
-except ImportError:
-    BangumiApi = None
-try:
-    from app.helper.image import ImageHelper
-except ImportError:
-    ImageHelper = None
 from app.helper.torrent import TorrentHelper
 from app.utils.dom import DomUtils
 from app.utils.http import AsyncRequestUtils, RequestUtils
@@ -71,7 +62,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.54"
+    plugin_version = "1.0.55"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -267,7 +258,6 @@ class sourceprioritysubscribefix(_PluginBase):
         cls._patch_tmdb_episode_route()
         cls._patch_search_routes()
         cls._patch_subscribe_search_route()
-        cls._apply_bangumi_direct_patch()
         cls._patched = True
         logger.info("订阅外部源优先插件已启用")
 
@@ -307,44 +297,9 @@ class sourceprioritysubscribefix(_PluginBase):
         cls._restore_tmdb_episode_route()
         cls._restore_subscribe_list_route()
         cls._restore_media_seasons_route()
-        cls._restore_bangumi_direct_patch()
         cls._originals = {}
         cls._patched = False
         logger.info("订阅外部源优先插件已停用")
-
-    @classmethod
-    def _apply_bangumi_direct_patch(cls):
-        """
-        实测（2026-07-04）：该服务器到 api.bgm.tv 的直连与代理通道都会间歇性 SSL 阻断，
-        单选一条通道不可靠。保持核心默认（代理）为主通道，请求失败时自动切换直连兜底重试。
-        """
-        try:
-            if BangumiApi is not None and "bangumi_invoke" not in cls._originals:
-                cls._originals["bangumi_invoke"] = BangumiApi._BangumiApi__invoke
-                cls._originals["bangumi_async_invoke"] = BangumiApi._BangumiApi__async_invoke
-                BangumiApi._BangumiApi__invoke = _patched_bangumi_invoke
-                BangumiApi._BangumiApi__async_invoke = _patched_bangumi_async_invoke
-                logger.info("Bangumi 补丁：已启用代理失败自动直连兜底")
-            # 无条件重建运行中的 BangumiModule 实例，确保 _req 恢复核心默认（走代理）
-            from app.core.module import ModuleManager
-            module = ModuleManager().get_running_module("BangumiModule")
-            if module is not None:
-                module.init_module()
-                logger.info("Bangumi 补丁：BangumiModule 实例已按核心默认重建")
-        except Exception as err:
-            logger.warn(f"Bangumi 兜底补丁应用失败：{err} - {traceback.format_exc()}")
-
-    @classmethod
-    def _restore_bangumi_direct_patch(cls):
-        if BangumiApi is not None:
-            if "bangumi_api_init" in cls._originals:
-                BangumiApi.__init__ = cls._originals["bangumi_api_init"]
-            if "bangumi_invoke" in cls._originals:
-                BangumiApi._BangumiApi__invoke = cls._originals["bangumi_invoke"]
-            if "bangumi_async_invoke" in cls._originals:
-                BangumiApi._BangumiApi__async_invoke = cls._originals["bangumi_async_invoke"]
-        if "image_get_request_params" in cls._originals and ImageHelper is not None:
-            ImageHelper._get_request_params = staticmethod(cls._originals["image_get_request_params"])
 
     @classmethod
     def _patch_media_seasons_route(cls):
@@ -4093,98 +4048,6 @@ async def _async_create_subscription(chain: SubscribeChain, mediainfo: MediaInfo
     return sid, err_msg
 
 
-def _bangumi_sync_fetch(base_url: str, url: str, key: Optional[str], params: dict) -> Any:
-    """
-    同步 requests 请求 api.bgm.tv，依次尝试 代理 -> 直连。
-    实测（2026-07-04）：本机 httpx 走 Clash 代理全部失败、直连被 SSL 阻断，
-    只有同步 requests 走代理稳定可用，因此兜底统一落到同步客户端。
-    """
-    channels = []
-    if settings.PROXY:
-        channels.append(("代理", settings.PROXY))
-    channels.append(("直连", None))
-    for label, proxies in channels:
-        try:
-            resp = RequestUtils(
-                ua=settings.NORMAL_USER_AGENT,
-                proxies=proxies,
-                timeout=15,
-            ).get_res(url=base_url + url, params=params)
-            if resp is not None and resp.status_code == 200:
-                data = resp.json()
-                logger.info(f"Bangumi 兜底通道({label})请求成功：{url}")
-                return data.get(key) if key else data
-        except Exception as err:
-            logger.debug(f"Bangumi 兜底通道({label})请求失败：{url} - {err}")
-    return None
-
-
-# Bangumi 主通道熔断：主通道（核心 httpx）连续无结果而兜底有结果时，说明主通道故障，
-# 冷却期内直接走兜底，避免每个请求都先烧掉 15-20 秒的失败等待拖垮前端和后端线程。
-_BGM_BREAKER = {"fails": 0, "skip_until": 0.0}
-_BGM_BREAKER_THRESHOLD = 2
-_BGM_BREAKER_COOLDOWN = 600
-
-
-def _bgm_primary_usable() -> bool:
-    return time.time() >= _BGM_BREAKER["skip_until"]
-
-
-def _bgm_record_primary(primary_failed: bool, fallback_succeeded: bool) -> None:
-    if not primary_failed:
-        _BGM_BREAKER["fails"] = 0
-        return
-    # 主通道失败但兜底拿到了数据，才能确认是通道故障而不是资源本身不存在
-    if fallback_succeeded:
-        _BGM_BREAKER["fails"] += 1
-        if _BGM_BREAKER["fails"] >= _BGM_BREAKER_THRESHOLD:
-            _BGM_BREAKER["skip_until"] = time.time() + _BGM_BREAKER_COOLDOWN
-            _BGM_BREAKER["fails"] = 0
-            logger.warn(
-                f"Bangumi 主通道连续失败，{_BGM_BREAKER_COOLDOWN // 60} 分钟内请求将直接走兜底通道")
-
-
-def _patched_bangumi_invoke(self, url, key: Optional[str] = None, **kwargs):
-    primary_failed = False
-    if _bgm_primary_usable():
-        result = sourceprioritysubscribefix._originals["bangumi_invoke"](self, url, key=key, **kwargs)
-        if result is not None:
-            _bgm_record_primary(primary_failed=False, fallback_succeeded=False)
-            return result
-        primary_failed = True
-    result = _bangumi_sync_fetch(self._base_url, url, key, dict(kwargs) if kwargs else {})
-    _bgm_record_primary(primary_failed=primary_failed, fallback_succeeded=result is not None)
-    return result
-
-
-async def _patched_bangumi_async_invoke(self, url, key: Optional[str] = None, **kwargs):
-    primary_failed = False
-    if _bgm_primary_usable():
-        result = await sourceprioritysubscribefix._originals["bangumi_async_invoke"](self, url, key=key, **kwargs)
-        if result is not None:
-            _bgm_record_primary(primary_failed=False, fallback_succeeded=False)
-            return result
-        primary_failed = True
-    try:
-        result = await asyncio.to_thread(
-            _bangumi_sync_fetch, self._base_url, url, key, dict(kwargs) if kwargs else {})
-    except Exception as err:
-        logger.debug(f"Bangumi 异步兜底失败：{url} - {err}")
-        return None
-    _bgm_record_primary(primary_failed=primary_failed, fallback_succeeded=result is not None)
-    return result
-
-
-def _patched_image_get_request_params(url: str, proxy=None, cookies=None) -> dict:
-    params = sourceprioritysubscribefix._originals["image_get_request_params"](url, proxy, cookies)
-    try:
-        if url and "bgm.tv" in url:
-            params["proxies"] = None
-    except Exception:
-        pass
-    return params
-
-
 def _plugin_bgm_probe() -> Any:
     """
     Bangumi 连通性诊断：分别用直连和代理请求 api.bgm.tv，并报告当前 BangumiApi 实例的代理状态。
@@ -4219,7 +4082,6 @@ def _plugin_bgm_probe() -> Any:
         results["bangumiapi"] = {
             "module_found": module is not None,
             "req_proxies": repr(getattr(req, "_proxies", "unknown")) if req is not None else None,
-            "init_patched": "bangumi_api_init" in sourceprioritysubscribefix._originals,
         }
     except Exception as err:
         results["bangumiapi"] = {"error": str(err)[:300]}
