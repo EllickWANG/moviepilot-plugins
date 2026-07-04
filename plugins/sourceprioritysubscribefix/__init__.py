@@ -70,7 +70,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.49"
+    plugin_version = "1.0.50"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -127,6 +127,14 @@ class sourceprioritysubscribefix(_PluginBase):
                 "auth": "bear",
                 "summary": "刷新Bangumi媒体库",
                 "description": "重新触发最近 Bangumi-only 整理记录所在媒体库扫描，用于修复媒体服务器旧缓存。",
+            },
+            {
+                "path": "/bgmprobe",
+                "endpoint": _plugin_bgm_probe,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "Bangumi连通性诊断",
+                "description": "分别用直连和代理实测 api.bgm.tv，并报告当前 BangumiApi 实例的代理状态。",
             }
         ]
 
@@ -309,21 +317,30 @@ class sourceprioritysubscribefix(_PluginBase):
         MoviePilot >= 2.11 起 BangumiApi 与图片抓取默认走 PROXY_HOST；bgm.tv 国内可直连，
         代理节点异常时会导致 Bangumi 元数据与封面全部失败，这里恢复 2.10 的直连行为。
         """
-        if BangumiApi is not None and "bangumi_api_init" not in cls._originals:
-            cls._originals["bangumi_api_init"] = BangumiApi.__init__
-            BangumiApi.__init__ = _patched_bangumi_api_init
-            try:
+        try:
+            if BangumiApi is None:
+                logger.warn("Bangumi 直连补丁：BangumiApi 导入失败，跳过")
+            elif "bangumi_api_init" not in cls._originals:
+                cls._originals["bangumi_api_init"] = BangumiApi.__init__
+                BangumiApi.__init__ = _patched_bangumi_api_init
+                logger.info("Bangumi 直连补丁：BangumiApi.__init__ 已接管")
                 from app.core.module import ModuleManager
                 module = ModuleManager().get_running_module("BangumiModule")
                 if module is not None:
                     module.init_module()
-                    logger.info("BangumiModule 已按直连模式重新初始化")
-            except Exception as err:
-                logger.warn(f"刷新 BangumiModule 实例失败：{err}")
-        if ImageHelper is not None and hasattr(ImageHelper, "_get_request_params") \
-                and "image_get_request_params" not in cls._originals:
-            cls._originals["image_get_request_params"] = ImageHelper._get_request_params
-            ImageHelper._get_request_params = staticmethod(_patched_image_get_request_params)
+                    logger.info("Bangumi 直连补丁：BangumiModule 已按直连模式重新初始化")
+                else:
+                    logger.warn("Bangumi 直连补丁：未找到运行中的 BangumiModule 实例")
+        except Exception as err:
+            logger.warn(f"Bangumi 直连补丁应用失败：{err} - {traceback.format_exc()}")
+        try:
+            if ImageHelper is not None and hasattr(ImageHelper, "_get_request_params") \
+                    and "image_get_request_params" not in cls._originals:
+                cls._originals["image_get_request_params"] = ImageHelper._get_request_params
+                ImageHelper._get_request_params = staticmethod(_patched_image_get_request_params)
+                logger.info("Bangumi 直连补丁：图片抓取 bgm.tv 已改为直连")
+        except Exception as err:
+            logger.warn(f"Bangumi 图片直连补丁应用失败：{err}")
 
     @classmethod
     def _restore_bangumi_direct_patch(cls):
@@ -4101,6 +4118,41 @@ def _patched_image_get_request_params(url: str, proxy=None, cookies=None) -> dic
     except Exception:
         pass
     return params
+
+
+def _plugin_bgm_probe() -> Any:
+    """
+    Bangumi 连通性诊断：分别用直连和代理请求 api.bgm.tv，并报告当前 BangumiApi 实例的代理状态。
+    """
+    results: dict = {}
+    probes = [("direct", None)]
+    if settings.PROXY:
+        probes.append(("proxy", settings.PROXY))
+    for label, proxies in probes:
+        start = time.time()
+        try:
+            res = RequestUtils(ua=settings.NORMAL_USER_AGENT, proxies=proxies, timeout=10).get_res(
+                "https://api.bgm.tv/v0/subjects/2", raise_exception=True)
+            results[label] = {
+                "ok": bool(res is not None and res.status_code == 200),
+                "status": res.status_code if res is not None else None,
+                "seconds": round(time.time() - start, 2),
+            }
+        except Exception as err:
+            results[label] = {"ok": False, "error": str(err)[:300], "seconds": round(time.time() - start, 2)}
+    try:
+        from app.core.module import ModuleManager
+        module = ModuleManager().get_running_module("BangumiModule")
+        api = getattr(module, "bangumiapi", None) if module is not None else None
+        req = getattr(api, "_req", None) if api is not None else None
+        results["bangumiapi"] = {
+            "module_found": module is not None,
+            "req_proxies": repr(getattr(req, "_proxies", "unknown")) if req is not None else None,
+            "init_patched": "bangumi_api_init" in sourceprioritysubscribefix._originals,
+        }
+    except Exception as err:
+        results["bangumiapi"] = {"error": str(err)[:300]}
+    return results
 
 
 def _report_subscribe_stat(payload: dict) -> None:
