@@ -73,6 +73,7 @@ class BrushConfig:
         self.except_subscribe = config.get("except_subscribe", True)
         self.brush_sequential = config.get("brush_sequential", False)
         self.proxy_delete = config.get("proxy_delete", False)
+        self.delete_same_content = config.get("delete_same_content", False)
         self.del_no_free = config.get("del_no_free", False) if self.freeleech in ["free", "2xfree"] else False
         self.active_time_range = config.get("active_time_range")
         self.cron = config.get("cron")
@@ -263,7 +264,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.5.5"
+    plugin_version = "4.3.5.6"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1568,6 +1569,22 @@ class FlowBrush(_PluginBase):
                                                         }
                                                     }
                                                 ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'delete_same_content',
+                                                            'label': '删除时清理同数据种子',
+                                                        }
+                                                    }
+                                                ]
                                             }
                                         ]
                                     },
@@ -1833,6 +1850,7 @@ class FlowBrush(_PluginBase):
             "except_subscribe": True,
             "brush_sequential": False,
             "proxy_delete": False,
+            "delete_same_content": False,
             "del_no_free": False,
             "freeleech": "free",
             "hr": "yes",
@@ -2456,12 +2474,23 @@ class FlowBrush(_PluginBase):
                     need_delete_hashes.extend(not_proxy_delete_hashes)
 
                 if need_delete_hashes:
+                    # 同数据种子清理：刷流种子触发删除时，一并删除下载器中指向同一份数据的其他种子（辅种、手动添加等）
+                    if brush_config.delete_same_content:
+                        related_hashes = self.__collect_same_content_hashes(
+                            delete_hashes=need_delete_hashes,
+                            all_torrents=seeding_torrents,
+                            exclude_tag=brush_config.delete_except_tags)
+                        if related_hashes:
+                            logger.info(f"同数据种子清理：共找到 {len(related_hashes)} 个与被删刷流种子同数据的种子，将一并删除")
+                            need_delete_hashes.extend(related_hashes)
                     # 如果是QB，则重新汇报Tracker
                     if DownloaderHelper().is_downloader("qbittorrent", service=self.service_info):
                         self.__qb_torrents_reannounce(torrent_hashes=need_delete_hashes)
                     # 删除种子
                     if downloader.delete_torrents(ids=need_delete_hashes, delete_file=True):
                         for torrent_hash in need_delete_hashes:
+                            if torrent_hash not in torrent_tasks:
+                                continue
                             torrent_tasks[torrent_hash]["deleted"] = True
                             torrent_tasks[torrent_hash]["deleted_time"] = time.time()
 
@@ -2587,6 +2616,59 @@ class FlowBrush(_PluginBase):
                 not_proxy_delete_torrents.append(torrent)
 
         return proxy_delete_torrents, not_proxy_delete_torrents
+
+    def __get_content_key(self, torrent: Any) -> Optional[str]:
+        """
+        获取种子数据内容标识，指向同一份数据的种子（辅种、手动添加等）标识相同
+        """
+        if DownloaderHelper().is_downloader("qbittorrent", service=self.service_info):
+            content_path = torrent.get("content_path")
+            if content_path:
+                return content_path
+            name = torrent.get("name")
+            if not name:
+                return None
+            return f"{torrent.get('save_path') or ''}/{name}"
+        else:
+            name = getattr(torrent, "name", None)
+            if not name:
+                return None
+            download_dir = getattr(torrent, "download_dir", "") or ""
+            return f"{download_dir}/{name}"
+
+    def __collect_same_content_hashes(self, delete_hashes: List[str], all_torrents: List[Any],
+                                      exclude_tag: Optional[str] = None) -> List[str]:
+        """
+        收集与待删除种子指向同一份数据的其他种子，删除排除标签对这些种子同样生效
+        """
+        delete_hash_set = set(delete_hashes)
+        delete_keys = set()
+        candidates = []
+        for torrent in all_torrents:
+            torrent_hash = self.__get_hash(torrent)
+            if not torrent_hash:
+                continue
+            if torrent_hash in delete_hash_set:
+                key = self.__get_content_key(torrent)
+                if key:
+                    delete_keys.add(key)
+            else:
+                candidates.append(torrent)
+        if not delete_keys:
+            return []
+
+        # 删除排除标签同样生效，避免误删受保护的种子
+        if exclude_tag and exclude_tag.strip():
+            candidates = self.__filter_torrents_by_tag(torrents=candidates, exclude_tag=exclude_tag)
+
+        related_hashes = []
+        for torrent in candidates:
+            key = self.__get_content_key(torrent)
+            if key and key in delete_keys:
+                torrent_hash = self.__get_hash(torrent)
+                related_hashes.append(torrent_hash)
+                logger.info(f"同数据种子清理：{key} ({torrent_hash}) 与被删除的刷流种子数据一致，将一并删除")
+        return related_hashes
 
     def __evaluate_conditions_for_delete(self, site_name: str, torrent_info: dict, torrent_task: dict) \
             -> Tuple[bool, str]:
@@ -3126,6 +3208,7 @@ class FlowBrush(_PluginBase):
             "except_subscribe": brush_config.except_subscribe,
             "brush_sequential": brush_config.brush_sequential,
             "proxy_delete": brush_config.proxy_delete,
+            "delete_same_content": brush_config.delete_same_content,
             "active_time_range": brush_config.active_time_range,
             "cron": brush_config.cron,
             "qb_category": brush_config.qb_category,
