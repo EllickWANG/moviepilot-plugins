@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import time
@@ -70,7 +71,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.52"
+    plugin_version = "1.0.53"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -4092,32 +4093,37 @@ async def _async_create_subscription(chain: SubscribeChain, mediainfo: MediaInfo
     return sid, err_msg
 
 
-def _bangumi_fallback_proxies(api: Any) -> Any:
+def _bangumi_sync_fetch(base_url: str, url: str, key: Optional[str], params: dict) -> Any:
     """
-    返回与当前主通道相反的代理配置：主通道走代理则兜底直连，反之亦然。
+    同步 requests 请求 api.bgm.tv，依次尝试 代理 -> 直连。
+    实测（2026-07-04）：本机 httpx 走 Clash 代理全部失败、直连被 SSL 阻断，
+    只有同步 requests 走代理稳定可用，因此兜底统一落到同步客户端。
     """
-    primary = getattr(getattr(api, "_req", None), "_proxies", None)
-    return settings.PROXY if primary is None else None
+    channels = []
+    if settings.PROXY:
+        channels.append(("代理", settings.PROXY))
+    channels.append(("直连", None))
+    for label, proxies in channels:
+        try:
+            resp = RequestUtils(
+                ua=settings.NORMAL_USER_AGENT,
+                proxies=proxies,
+                timeout=15,
+            ).get_res(url=base_url + url, params=params)
+            if resp is not None and resp.status_code == 200:
+                data = resp.json()
+                logger.info(f"Bangumi 兜底通道({label})请求成功：{url}")
+                return data.get(key) if key else data
+        except Exception as err:
+            logger.debug(f"Bangumi 兜底通道({label})请求失败：{url} - {err}")
+    return None
 
 
 def _patched_bangumi_invoke(self, url, key: Optional[str] = None, **kwargs):
     result = sourceprioritysubscribefix._originals["bangumi_invoke"](self, url, key=key, **kwargs)
     if result is not None:
         return result
-    try:
-        resp = RequestUtils(
-            ua=settings.NORMAL_USER_AGENT,
-            proxies=_bangumi_fallback_proxies(self),
-            timeout=15,
-        ).get_res(url=self._base_url + url, params=dict(kwargs) if kwargs else {})
-        if resp is None or resp.status_code != 200:
-            return None
-        data = resp.json()
-        logger.info(f"Bangumi 兜底通道请求成功：{url}")
-        return data.get(key) if key else data
-    except Exception as err:
-        logger.debug(f"Bangumi 兜底通道请求失败：{url} - {err}")
-        return None
+    return _bangumi_sync_fetch(self._base_url, url, key, dict(kwargs) if kwargs else {})
 
 
 async def _patched_bangumi_async_invoke(self, url, key: Optional[str] = None, **kwargs):
@@ -4125,18 +4131,10 @@ async def _patched_bangumi_async_invoke(self, url, key: Optional[str] = None, **
     if result is not None:
         return result
     try:
-        resp = await AsyncRequestUtils(
-            ua=settings.NORMAL_USER_AGENT,
-            proxies=_bangumi_fallback_proxies(self),
-            timeout=15,
-        ).get_res(url=self._base_url + url, params=dict(kwargs) if kwargs else {})
-        if resp is None or resp.status_code != 200:
-            return None
-        data = resp.json()
-        logger.info(f"Bangumi 兜底通道请求成功：{url}")
-        return data.get(key) if key else data
+        return await asyncio.to_thread(
+            _bangumi_sync_fetch, self._base_url, url, key, dict(kwargs) if kwargs else {})
     except Exception as err:
-        logger.debug(f"Bangumi 兜底通道请求失败：{url} - {err}")
+        logger.debug(f"Bangumi 异步兜底失败：{url} - {err}")
         return None
 
 
