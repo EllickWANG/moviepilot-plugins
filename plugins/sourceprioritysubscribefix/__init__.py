@@ -53,6 +53,14 @@ try:
     from app.helper.server import MoviePilotServerHelper
 except ImportError:
     MoviePilotServerHelper = None
+try:
+    from app.modules.bangumi.bangumi import BangumiApi
+except ImportError:
+    BangumiApi = None
+try:
+    from app.helper.image import ImageHelper
+except ImportError:
+    ImageHelper = None
 from app.helper.torrent import TorrentHelper
 from app.utils.dom import DomUtils
 from app.utils.http import AsyncRequestUtils, RequestUtils
@@ -62,7 +70,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.48"
+    plugin_version = "1.0.49"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -250,6 +258,7 @@ class sourceprioritysubscribefix(_PluginBase):
         cls._patch_tmdb_episode_route()
         cls._patch_search_routes()
         cls._patch_subscribe_search_route()
+        cls._apply_bangumi_direct_patch()
         cls._patched = True
         logger.info("订阅外部源优先插件已启用")
 
@@ -289,9 +298,39 @@ class sourceprioritysubscribefix(_PluginBase):
         cls._restore_tmdb_episode_route()
         cls._restore_subscribe_list_route()
         cls._restore_media_seasons_route()
+        cls._restore_bangumi_direct_patch()
         cls._originals = {}
         cls._patched = False
         logger.info("订阅外部源优先插件已停用")
+
+    @classmethod
+    def _apply_bangumi_direct_patch(cls):
+        """
+        MoviePilot >= 2.11 起 BangumiApi 与图片抓取默认走 PROXY_HOST；bgm.tv 国内可直连，
+        代理节点异常时会导致 Bangumi 元数据与封面全部失败，这里恢复 2.10 的直连行为。
+        """
+        if BangumiApi is not None and "bangumi_api_init" not in cls._originals:
+            cls._originals["bangumi_api_init"] = BangumiApi.__init__
+            BangumiApi.__init__ = _patched_bangumi_api_init
+            try:
+                from app.core.module import ModuleManager
+                module = ModuleManager().get_running_module("BangumiModule")
+                if module is not None:
+                    module.init_module()
+                    logger.info("BangumiModule 已按直连模式重新初始化")
+            except Exception as err:
+                logger.warn(f"刷新 BangumiModule 实例失败：{err}")
+        if ImageHelper is not None and hasattr(ImageHelper, "_get_request_params") \
+                and "image_get_request_params" not in cls._originals:
+            cls._originals["image_get_request_params"] = ImageHelper._get_request_params
+            ImageHelper._get_request_params = staticmethod(_patched_image_get_request_params)
+
+    @classmethod
+    def _restore_bangumi_direct_patch(cls):
+        if "bangumi_api_init" in cls._originals and BangumiApi is not None:
+            BangumiApi.__init__ = cls._originals["bangumi_api_init"]
+        if "image_get_request_params" in cls._originals and ImageHelper is not None:
+            ImageHelper._get_request_params = staticmethod(cls._originals["image_get_request_params"])
 
     @classmethod
     def _patch_media_seasons_route(cls):
@@ -4038,6 +4077,30 @@ async def _async_create_subscription(chain: SubscribeChain, mediainfo: MediaInfo
     await _async_report_subscribe_stat(_subscribe_stat_payload(mediainfo, metainfo, title, year))
     _clear_source_subscribe_cache()
     return sid, err_msg
+
+
+def _patched_bangumi_api_init(self, *args, **kwargs):
+    sourceprioritysubscribefix._originals["bangumi_api_init"](self, *args, **kwargs)
+    try:
+        self._req = RequestUtils(
+            ua=settings.NORMAL_USER_AGENT,
+            proxies=None,
+            session=getattr(self, "_session", None),
+        )
+        if hasattr(self, "_async_req"):
+            self._async_req = AsyncRequestUtils(ua=settings.NORMAL_USER_AGENT, proxies=None)
+    except Exception as err:
+        logger.warn(f"Bangumi API 直连补丁应用失败：{err}")
+
+
+def _patched_image_get_request_params(url: str, proxy=None, cookies=None) -> dict:
+    params = sourceprioritysubscribefix._originals["image_get_request_params"](url, proxy, cookies)
+    try:
+        if url and "bgm.tv" in url:
+            params["proxies"] = None
+    except Exception:
+        pass
+    return params
 
 
 def _report_subscribe_stat(payload: dict) -> None:
