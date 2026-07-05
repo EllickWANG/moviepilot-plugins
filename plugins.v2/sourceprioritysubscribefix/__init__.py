@@ -63,7 +63,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -3187,6 +3187,47 @@ def _bangumi_only_subscribes_for_page(limit: int = 20) -> list[Subscribe]:
         return []
 
 
+def _is_douban_only_subscribe(subscribe: Optional[Subscribe]) -> bool:
+    return bool(subscribe and subscribe.doubanid and not _real_tmdb_id(subscribe.tmdbid))
+
+
+def _douban_only_subscribes_for_page(limit: int = 20) -> list[Subscribe]:
+    try:
+        subscribes = [
+            subscribe for subscribe in SubscribeOper().list()
+            if _is_douban_only_subscribe(subscribe)
+        ]
+        return sorted(subscribes, key=lambda item: item.id or 0, reverse=True)[:limit]
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件读取豆瓣订阅数据失败：{err}")
+        return []
+
+
+def _douban_source_keyword(download_history: Any) -> Optional[dict]:
+    source_keyword = SubscribeChain.parse_subscribe_source_keyword(_download_history_source(download_history))
+    if not source_keyword or not source_keyword.get("doubanid"):
+        return None
+    if _real_tmdb_id(source_keyword.get("tmdbid")):
+        return None
+    return source_keyword
+
+
+def _douban_source_downloads(limit: int = 12) -> list[DownloadHistory]:
+    result = []
+    try:
+        histories = DownloadHistoryOper().list_by_page(page=1, count=500) or []
+        histories = sorted(histories, key=lambda item: item.id or 0, reverse=True)
+    except Exception as err:
+        logger.warn(f"订阅外部源优先插件读取下载历史失败：{err}")
+        histories = []
+    for history in histories:
+        if _douban_source_keyword(history):
+            result.append(history)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _component_text(component: str, text: Any, props: Optional[dict] = None) -> dict:
     item = {
         "component": component,
@@ -3508,12 +3549,23 @@ def _failed_transfer_entries(plugin_id: str, histories: list[TransferHistory]) -
     return rows, mobile_items
 
 
+def _subscribe_source_text(subscribe: Subscribe) -> str:
+    if subscribe.bangumiid and _is_bangumi_only_subscribe(subscribe):
+        return f"bangumi:{subscribe.bangumiid}"
+    if subscribe.doubanid:
+        return f"douban:{subscribe.doubanid}"
+    if subscribe.bangumiid:
+        return f"bangumi:{subscribe.bangumiid}"
+    return "-"
+
+
 def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[dict]]:
     rows = []
     mobile_items = []
     for subscribe in subscribes:
         progress = f"{(subscribe.total_episode or 0) - (subscribe.lack_episode or 0)} / {subscribe.total_episode or 0}"
         season_text = f"S{subscribe.season:02d}" if subscribe.season else "-"
+        source_text = _subscribe_source_text(subscribe)
         rows.append({
             "component": "tr",
             "content": [
@@ -3521,7 +3573,7 @@ def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[di
                 _td(subscribe.name, "text-no-wrap"),
                 _td(subscribe.year, "text-no-wrap"),
                 _td(season_text, "text-no-wrap"),
-                _td(f"bangumi:{subscribe.bangumiid}", "text-no-wrap"),
+                _td(source_text, "text-no-wrap"),
                 _td(progress, "text-no-wrap"),
             ],
         })
@@ -3530,7 +3582,7 @@ def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[di
             subtitle=f"{subscribe.year or '-'} · {season_text} · {progress}",
             chips=[
                 _chip(f"ID {subscribe.id}", "primary", "mdi-pound"),
-                _chip(f"bangumi:{subscribe.bangumiid}", "info", "mdi-book-open-page-variant"),
+                _chip(source_text, "info", "mdi-book-open-page-variant"),
             ],
             details=[
                 _detail_line("年份", subscribe.year),
@@ -3541,12 +3593,17 @@ def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[di
     return rows, mobile_items
 
 
-def _download_entries(downloads: list[DownloadHistory]) -> tuple[list[dict], list[dict]]:
+def _download_entries(downloads: list[DownloadHistory],
+                      source: str = "bangumi") -> tuple[list[dict], list[dict]]:
     rows = []
     mobile_items = []
     for download in downloads:
-        source_keyword = _bangumi_source_keyword(download) or {}
-        source_text = f"bangumi:{source_keyword.get('bangumiid')}"
+        if source == "douban":
+            source_keyword = _douban_source_keyword(download) or {}
+            source_text = f"douban:{source_keyword.get('doubanid')}"
+        else:
+            source_keyword = _bangumi_source_keyword(download) or {}
+            source_text = f"bangumi:{source_keyword.get('bangumiid')}"
         rows.append({
             "component": "tr",
             "content": [
@@ -3579,11 +3636,15 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
         if _history_has_bangumi_source(history)
     ][:20]
     source_download_items = _source_downloads(limit=12)
+    douban_download_items = _douban_source_downloads(limit=12)
     bangumi_subscribes = _bangumi_only_subscribes_for_page(limit=20)
+    douban_subscribes = _douban_only_subscribes_for_page(limit=20)
     enabled_text = "已启用" if plugin.get_state() else "已停用"
     failed_rows, failed_mobile_items = _failed_transfer_entries(plugin_id, failed_histories)
     subscribe_rows, subscribe_mobile_items = _subscribe_entries(bangumi_subscribes)
+    douban_subscribe_rows, douban_subscribe_mobile_items = _subscribe_entries(douban_subscribes)
     download_rows, download_mobile_items = _download_entries(source_download_items)
+    douban_download_rows, douban_download_mobile_items = _download_entries(douban_download_items, source="douban")
 
     return [
         {
@@ -3591,9 +3652,21 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
             "props": {"dense": True},
             "content": [
                 _stat_card("插件状态", enabled_text, f"版本 {plugin.plugin_version}", "mdi-heart-cog", "primary"),
-                _stat_card("Bangumi 订阅", len(bangumi_subscribes), "未绑定 TMDB/豆瓣", "mdi-book-heart", "info"),
+                _stat_card(
+                    "外部源订阅",
+                    len(bangumi_subscribes) + len(douban_subscribes),
+                    f"Bangumi {len(bangumi_subscribes)} · 豆瓣 {len(douban_subscribes)}",
+                    "mdi-book-heart",
+                    "info",
+                ),
                 _stat_card("失败整理", len(failed_histories), "最多显示最近 20 条", "mdi-alert-circle", "error"),
-                _stat_card("来源下载", len(source_download_items), "最近 Bangumi-only 来源下载", "mdi-download-circle", "success"),
+                _stat_card(
+                    "来源下载",
+                    len(source_download_items) + len(douban_download_items),
+                    f"Bangumi {len(source_download_items)} · 豆瓣 {len(douban_download_items)}",
+                    "mdi-download-circle",
+                    "success",
+                ),
             ],
         },
         {
@@ -3669,6 +3742,39 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                             rows=download_rows,
                             mobile_items=download_mobile_items,
                             empty_text="暂无 Bangumi-only 来源下载记录。",
+                        )
+                    ],
+                },
+            ],
+        },
+        {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "lg": 6},
+                    "content": [
+                        _table_card(
+                            title="豆瓣-only 订阅",
+                            icon="mdi-movie-open-star",
+                            headers=["ID", "标题", "年份", "季", "豆瓣", "进度"],
+                            rows=douban_subscribe_rows,
+                            mobile_items=douban_subscribe_mobile_items,
+                            empty_text="暂无豆瓣-only 订阅。",
+                        )
+                    ],
+                },
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "lg": 6},
+                    "content": [
+                        _table_card(
+                            title="最近豆瓣来源下载",
+                            icon="mdi-download",
+                            headers=["ID", "标题", "豆瓣", "资源名", "时间"],
+                            rows=douban_download_rows,
+                            mobile_items=douban_download_mobile_items,
+                            empty_text="暂无豆瓣来源下载记录。",
                         )
                     ],
                 },
