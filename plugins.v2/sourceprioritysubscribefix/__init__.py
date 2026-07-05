@@ -63,7 +63,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -210,6 +210,8 @@ class sourceprioritysubscribefix(_PluginBase):
             "search_async_process": SearchChain.async_process,
             "search_async_process_stream": SearchChain.async_process_stream,
             "download_single": DownloadChain.download_single,
+            "media_recognize_media": MediaChain.recognize_media,
+            "media_async_recognize_media": MediaChain.async_recognize_media,
             "media_recognize_by_meta": MediaChain.recognize_by_meta,
             "media_recognize_by_path": MediaChain.recognize_by_path,
             "media_handle_tv_episode_file": MediaChain._handle_tv_episode_file,
@@ -238,6 +240,8 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = _patched_search_async_process
         SearchChain.async_process_stream = _patched_search_async_process_stream
         DownloadChain.download_single = _patched_download_single
+        MediaChain.recognize_media = _patched_media_recognize_media
+        MediaChain.async_recognize_media = _patched_media_async_recognize_media
         MediaChain.recognize_by_meta = _patched_media_recognize_by_meta
         MediaChain.recognize_by_path = _patched_media_recognize_by_path
         MediaChain._handle_tv_episode_file = _patched_media_handle_tv_episode_file
@@ -277,6 +281,8 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = cls._originals["search_async_process"]
         SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
         DownloadChain.download_single = cls._originals["download_single"]
+        MediaChain.recognize_media = cls._originals["media_recognize_media"]
+        MediaChain.async_recognize_media = cls._originals["media_async_recognize_media"]
         MediaChain.recognize_by_meta = cls._originals["media_recognize_by_meta"]
         MediaChain.recognize_by_path = cls._originals["media_recognize_by_path"]
         MediaChain._handle_tv_episode_file = cls._originals["media_handle_tv_episode_file"]
@@ -1914,6 +1920,21 @@ def _source_media_from_meta(
     if getattr(subscribe, "media_category", None):
         mediainfo.category = subscribe.media_category
     return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
+
+
+def _patched_media_recognize_media(self: MediaChain, *args, **kwargs) -> Optional[MediaInfo]:
+    """
+    兜底覆盖模块直连识别（如手动整理按 doubanid 识别），豆瓣媒体补齐二级分类。
+    """
+    return _mark_douban_media_ready(_mark_bangumi_media_ready(
+        sourceprioritysubscribefix._originals["media_recognize_media"](self, *args, **kwargs)
+    ))
+
+
+async def _patched_media_async_recognize_media(self: MediaChain, *args, **kwargs) -> Optional[MediaInfo]:
+    return _mark_douban_media_ready(_mark_bangumi_media_ready(
+        await sourceprioritysubscribefix._originals["media_async_recognize_media"](self, *args, **kwargs)
+    ))
 
 
 def _patched_media_recognize_by_meta(
