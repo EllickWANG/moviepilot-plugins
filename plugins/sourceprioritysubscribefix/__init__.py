@@ -63,7 +63,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -3783,7 +3783,11 @@ def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[di
     rows = []
     mobile_items = []
     for subscribe in subscribes:
-        progress = f"{(subscribe.total_episode or 0) - (subscribe.lack_episode or 0)} / {subscribe.total_episode or 0}"
+        if _type_value(subscribe.type) == MediaType.MOVIE.value or not subscribe.total_episode:
+            # 电影订阅没有集数概念，展示订阅状态
+            progress = {"N": "待搜索", "R": "订阅中", "P": "待审核", "S": "已暂停"}.get(subscribe.state, subscribe.state or "-")
+        else:
+            progress = f"{(subscribe.total_episode or 0) - (subscribe.lack_episode or 0)} / {subscribe.total_episode or 0}"
         season_text = f"S{subscribe.season:02d}" if subscribe.season else "-"
         source_text, source_color, source_icon = _subscribe_source_badge(subscribe)
         rows.append({
