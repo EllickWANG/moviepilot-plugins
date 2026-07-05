@@ -54,15 +54,16 @@ try:
 except ImportError:
     MoviePilotServerHelper = None
 from app.helper.torrent import TorrentHelper
+from app.modules.themoviedb.category import CategoryHelper
 from app.utils.dom import DomUtils
 from app.utils.http import AsyncRequestUtils, RequestUtils
 
 
 class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
-    plugin_desc = "订阅时优先使用豆瓣来源；仅 Bangumi-only 订阅使用 Bangumi 详情，避免普通 TMDB 订阅被误改。"
+    plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.0.55"
+    plugin_version = "1.1.0"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -925,6 +926,16 @@ def _is_bangumi_only_subscribe(subscribe: Optional[Subscribe]) -> bool:
     return bool(subscribe and subscribe.bangumiid and not subscribe.tmdbid and not subscribe.doubanid)
 
 
+def _real_tmdb_id(tmdbid: Any) -> Optional[int]:
+    """
+    真实 TMDB ID（正整数）；Bangumi 日历的负数伪 tmdbid 不算。
+    """
+    value = _int_or_none(tmdbid)
+    if value is not None and value > 0:
+        return value
+    return None
+
+
 def _ids_target_bangumi_only(tmdbid: Optional[int] = None,
                              doubanid: Optional[str] = None,
                              bangumiid: Optional[int] = None) -> bool:
@@ -1282,18 +1293,233 @@ def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaI
     return mediainfo
 
 
+# 豆瓣类型中文名 -> TMDB genre_ids（与 category.yaml 的 genre_ids 条件对齐）
+_DOUBAN_GENRE_IDS: dict[str, int] = {
+    "剧情": 18,
+    "喜剧": 35,
+    "动作": 28,
+    "爱情": 10749,
+    "科幻": 878,
+    "动画": 16,
+    "悬疑": 9648,
+    "惊悚": 53,
+    "恐怖": 27,
+    "犯罪": 80,
+    "音乐": 10402,
+    "歌舞": 10402,
+    "传记": 36,
+    "历史": 36,
+    "战争": 10752,
+    "西部": 37,
+    "奇幻": 14,
+    "冒险": 12,
+    "家庭": 10751,
+    "儿童": 10762,
+    "纪录片": 99,
+    "真人秀": 10764,
+    "脱口秀": 10767,
+    "综艺": 10764,
+}
+
+# 豆瓣国家/地区中文名 -> ISO 3166-1 代码（origin_country/production_countries）
+_DOUBAN_COUNTRY_CODES: dict[str, str] = {
+    "中国大陆": "CN",
+    "中国内地": "CN",
+    "中国": "CN",
+    "中国台湾": "TW",
+    "台湾": "TW",
+    "中国香港": "HK",
+    "香港": "HK",
+    "中国澳门": "MO",
+    "澳门": "MO",
+    "日本": "JP",
+    "韩国": "KR",
+    "朝鲜": "KP",
+    "美国": "US",
+    "英国": "GB",
+    "法国": "FR",
+    "德国": "DE",
+    "意大利": "IT",
+    "西班牙": "ES",
+    "葡萄牙": "PT",
+    "俄罗斯": "RU",
+    "荷兰": "NL",
+    "比利时": "BE",
+    "瑞士": "CH",
+    "瑞典": "SE",
+    "挪威": "NO",
+    "丹麦": "DK",
+    "芬兰": "FI",
+    "波兰": "PL",
+    "奥地利": "AT",
+    "爱尔兰": "IE",
+    "希腊": "GR",
+    "捷克": "CZ",
+    "匈牙利": "HU",
+    "乌克兰": "UA",
+    "加拿大": "CA",
+    "墨西哥": "MX",
+    "巴西": "BR",
+    "阿根廷": "AR",
+    "智利": "CL",
+    "澳大利亚": "AU",
+    "新西兰": "NZ",
+    "印度": "IN",
+    "泰国": "TH",
+    "新加坡": "SG",
+    "马来西亚": "MY",
+    "菲律宾": "PH",
+    "印度尼西亚": "ID",
+    "越南": "VN",
+    "缅甸": "MM",
+    "老挝": "LA",
+    "柬埔寨": "KH",
+    "蒙古国": "MN",
+    "土耳其": "TR",
+    "伊朗": "IR",
+    "伊拉克": "IQ",
+    "以色列": "IL",
+    "沙特阿拉伯": "SA",
+    "阿联酋": "AE",
+    "埃及": "EG",
+    "南非": "ZA",
+}
+
+# 豆瓣语言中文名 -> ISO 639-1 代码（original_language）
+_DOUBAN_LANGUAGE_CODES: dict[str, str] = {
+    "汉语普通话": "zh",
+    "普通话": "zh",
+    "国语": "zh",
+    "汉语": "zh",
+    "中文": "zh",
+    "闽南语": "zh",
+    "上海话": "zh",
+    "四川话": "zh",
+    "粤语": "cn",
+    "藏语": "bo",
+    "英语": "en",
+    "日语": "ja",
+    "韩语": "ko",
+    "法语": "fr",
+    "德语": "de",
+    "西班牙语": "es",
+    "意大利语": "it",
+    "俄语": "ru",
+    "葡萄牙语": "pt",
+    "泰语": "th",
+    "印地语": "hi",
+    "阿拉伯语": "ar",
+    "土耳其语": "tr",
+    "越南语": "vi",
+    "印度尼西亚语": "id",
+    "印尼语": "id",
+    "他加禄语": "tl",
+    "塔加拉族语": "tl",
+    "菲律宾语": "tl",
+    "马来语": "ms",
+    "蒙古语": "mn",
+    "波斯语": "fa",
+    "希伯来语": "he",
+    "瑞典语": "sv",
+    "丹麦语": "da",
+    "挪威语": "nb",
+    "芬兰语": "fi",
+    "波兰语": "pl",
+    "荷兰语": "nl",
+    "希腊语": "el",
+    "捷克语": "cs",
+    "匈牙利语": "hu",
+    "乌克兰语": "uk",
+}
+
+
+def _douban_pseudo_tmdb_info(mediainfo: MediaInfo) -> Optional[dict]:
+    """
+    将豆瓣详情的中文字段翻译为 TMDB 风格的字段字典，供 CategoryHelper 匹配二级分类。
+    没有任何可用信号时返回 None，避免全部落入无条件的兜底分类。
+    """
+    info = mediainfo.douban_info or {}
+    # 原始 douban_info 缺字段时回退 MediaInfo 规整后的字段（元素可能是 str 或 {"name": ...}）
+    genre_names = info.get("genres") or [
+        g.get("name") if isinstance(g, dict) else g for g in (mediainfo.genres or [])
+    ]
+    country_names = info.get("countries") or [
+        c.get("name") if isinstance(c, dict) else c for c in (mediainfo.production_countries or [])
+    ]
+    language_names = info.get("languages") or (getattr(mediainfo, "languages", None) or [])
+    genre_ids: list[int] = []
+    for name in genre_names:
+        gid = _DOUBAN_GENRE_IDS.get(str(name).strip())
+        if gid and gid not in genre_ids:
+            genre_ids.append(gid)
+    country_codes: list[str] = []
+    for name in country_names:
+        code = _DOUBAN_COUNTRY_CODES.get(str(name).strip())
+        if code and code not in country_codes:
+            country_codes.append(code)
+    original_language = None
+    for name in language_names:
+        code = _DOUBAN_LANGUAGE_CODES.get(str(name).strip())
+        if code:
+            original_language = code
+            break
+    if not genre_ids and not country_codes and not original_language:
+        return None
+    pseudo: dict[str, Any] = {}
+    if genre_ids:
+        pseudo["genre_ids"] = genre_ids
+    if country_codes:
+        pseudo["origin_country"] = country_codes
+        pseudo["production_countries"] = [{"iso_3166_1": code} for code in country_codes]
+    if original_language:
+        pseudo["original_language"] = original_language
+    year = str(info.get("year") or "").strip()
+    if year.isdigit():
+        pseudo["release_date"] = f"{year}-01-01"
+        pseudo["first_air_date"] = f"{year}-01-01"
+    return pseudo
+
+
+def _infer_douban_media_category(mediainfo: MediaInfo) -> Optional[str]:
+    pseudo = _douban_pseudo_tmdb_info(mediainfo)
+    if not pseudo:
+        return None
+    try:
+        helper = CategoryHelper()
+        if mediainfo.type == MediaType.TV:
+            return helper.get_tv_category(pseudo) or None
+        return helper.get_movie_category(pseudo) or None
+    except Exception as err:
+        logger.warn(f"{mediainfo.title_year} 豆瓣信息推断二级分类失败：{err}")
+        return None
+
+
+def _mark_douban_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaInfo]:
+    """
+    豆瓣来源媒体（无 TMDB ID）缺少二级分类时，用豆瓣字段推断补齐。
+    """
+    if not mediainfo or not mediainfo.douban_id or mediainfo.tmdb_id:
+        return mediainfo
+    if not mediainfo.category:
+        category = _infer_douban_media_category(mediainfo)
+        if category:
+            mediainfo.category = category
+            logger.info(f"{mediainfo.title_year} 使用豆瓣信息推断二级分类：{category}")
+    return mediainfo
+
+
 def _media_from_douban(chain: Any, doubanid: str, mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     info = chain.douban_info(doubanid=doubanid, mtype=mtype)
     if not info:
         return None
-    return MediaInfo(douban_info=info)
+    return _mark_douban_media_ready(MediaInfo(douban_info=info))
 
 
 async def _async_media_from_douban(chain: Any, doubanid: str, mtype: Optional[MediaType]) -> Optional[MediaInfo]:
     info = await chain.async_douban_info(doubanid=doubanid, mtype=mtype)
     if not info:
         return None
-    return MediaInfo(douban_info=info)
+    return _mark_douban_media_ready(MediaInfo(douban_info=info))
 
 
 def _media_from_bangumi(chain: Any, bangumiid: int) -> Optional[MediaInfo]:
@@ -1703,8 +1929,10 @@ def _patched_media_recognize_by_meta(
             f"{source_mediainfo.title_year}"
         )
         return source_mediainfo
-    return sourceprioritysubscribefix._originals["media_recognize_by_meta"](
-        self, metainfo, episode_group=episode_group, **kwargs
+    return _mark_douban_media_ready(
+        sourceprioritysubscribefix._originals["media_recognize_by_meta"](
+            self, metainfo, episode_group=episode_group, **kwargs
+        )
     )
 
 
@@ -1720,9 +1948,12 @@ def _patched_media_recognize_by_path(
         source_mediainfo.episode_group = episode_group or source_mediainfo.episode_group
         logger.info(f"{path} 使用Bangumi订阅来源识别：{source_mediainfo.title_year}")
         return Context(meta_info=file_meta, media_info=source_mediainfo)
-    return sourceprioritysubscribefix._originals["media_recognize_by_path"](
+    context = sourceprioritysubscribefix._originals["media_recognize_by_path"](
         self, path, episode_group=episode_group, **kwargs
     )
+    if context is not None:
+        _mark_douban_media_ready(getattr(context, "media_info", None))
+    return context
 
 
 def _patched_media_handle_tv_episode_file(
@@ -3464,7 +3695,7 @@ def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, m
             mediainfo = _media_from_bangumi(self, subscribe.bangumiid)
             if mediainfo:
                 return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
-    return _mark_bangumi_media_ready(sourceprioritysubscribefix._originals["subscribe_recognize_media"](
+    return _mark_douban_media_ready(_mark_bangumi_media_ready(sourceprioritysubscribefix._originals["subscribe_recognize_media"](
         self,
         meta=meta,
         mtype=mtype,
@@ -3474,7 +3705,7 @@ def _patched_subscribe_recognize_media(self: SubscribeChain, meta: Any = None, m
         episode_group=episode_group,
         cache=cache,
         **kwargs,
-    ))
+    )))
 
 
 async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: Any = None,
@@ -3498,7 +3729,7 @@ async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: A
             mediainfo = await _async_media_from_bangumi(self, subscribe.bangumiid)
             if mediainfo:
                 return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
-    return _mark_bangumi_media_ready(await sourceprioritysubscribefix._originals["subscribe_async_recognize_media"](
+    return _mark_douban_media_ready(_mark_bangumi_media_ready(await sourceprioritysubscribefix._originals["subscribe_async_recognize_media"](
         self,
         meta=meta,
         mtype=mtype,
@@ -3508,7 +3739,7 @@ async def _patched_subscribe_async_recognize_media(self: SubscribeChain, meta: A
         episode_group=episode_group,
         cache=cache,
         **kwargs,
-    ))
+   )))
 
 
 def _apply_bangumi_episode_info_to_subscribe_files(info: Optional[schemas.SubscrbieInfo],
@@ -3764,6 +3995,9 @@ async def _patched_search_by_id_stream(request: Request,
 
 def _explicit_source_media(chain: SubscribeChain, tmdbid: Optional[int], doubanid: Optional[str], bangumiid: Optional[int],
                            mtype: Optional[MediaType]) -> Optional[MediaInfo]:
+    # 优先级：TMDB（真实 ID）> 豆瓣 > Bangumi；有真实 TMDB ID 时交还原生流程
+    if _real_tmdb_id(tmdbid):
+        return None
     if doubanid:
         return _media_from_douban(chain, doubanid, mtype)
     if _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
@@ -3773,6 +4007,9 @@ def _explicit_source_media(chain: SubscribeChain, tmdbid: Optional[int], doubani
 
 async def _async_explicit_source_media(chain: SubscribeChain, tmdbid: Optional[int], doubanid: Optional[str], bangumiid: Optional[int],
                                        mtype: Optional[MediaType]) -> Optional[MediaInfo]:
+    # 优先级：TMDB（真实 ID）> 豆瓣 > Bangumi；有真实 TMDB ID 时交还原生流程
+    if _real_tmdb_id(tmdbid):
+        return None
     if doubanid:
         return await _async_media_from_douban(chain, doubanid, mtype)
     if _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
@@ -3877,7 +4114,9 @@ def _patched_subscribe_add(self: SubscribeChain, title: str, year: str, mtype: M
                            message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                            **kwargs) -> Tuple[Optional[int], str]:
     try:
-        if not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
+        # TMDB 为最高优先级：有真实 TMDB ID 或既无豆瓣也非 Bangumi-only 时，交还原生流程
+        if _real_tmdb_id(tmdbid) or (
+                not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid)):
             return sourceprioritysubscribefix._originals["subscribe_add"](
                 self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
                 season, channel, source, userid, username, message, exist_ok, **kwargs
@@ -3922,7 +4161,9 @@ async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: s
                                        message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                                        **kwargs) -> Tuple[Optional[int], str]:
     try:
-        if not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid):
+        # TMDB 为最高优先级：有真实 TMDB ID 或既无豆瓣也非 Bangumi-only 时，交还原生流程
+        if _real_tmdb_id(tmdbid) or (
+                not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid)):
             return await sourceprioritysubscribefix._originals["subscribe_async_add"](
                 self, title, year, mtype, tmdbid, doubanid, bangumiid, mediaid, episode_group,
                 season, channel, source, userid, username, message, exist_ok, **kwargs

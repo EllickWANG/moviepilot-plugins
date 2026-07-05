@@ -4,12 +4,14 @@
 
 ## 用途
 
-MoviePilot 原生订阅、搜索、下载整理和刮削流程更偏向 TMDB。这个插件用于让外部来源优先参与流程：
+MoviePilot 原生订阅、搜索、下载整理和刮削流程只认 TMDB。这个插件接管豆瓣与 Bangumi 外部源媒体的全流程，媒体来源优先级为 **TMDB（真实 ID）> 豆瓣 > Bangumi**：
 
-- 如果订阅入口带有 `doubanid`，优先使用豆瓣详情生成订阅媒体信息。
-- 如果订阅入口带有 `bangumiid`，优先使用 Bangumi 详情生成订阅媒体信息。
-- 如果没有 `doubanid` 或 `bangumiid`，保留 MoviePilot 原本识别逻辑。
+- 如果订阅带有真实 TMDB ID，交还 MoviePilot 原生 TMDB 流程（最高优先级）。
+- 没有 TMDB ID 但带有 `doubanid`，锁定豆瓣详情生成订阅媒体信息，不再去 TMDB 识别。
+- 没有 TMDB ID 和 `doubanid` 但带有 `bangumiid`（Bangumi-only），锁定 Bangumi 详情。
 - 对 Bangumi-only 订阅补齐标题别名、季信息、二级分类、搜索匹配、整理识别和 NFO/图片刮削。
+- 豆瓣来源媒体（无 TMDB ID）整理入库时，用豆瓣的类型/国家/语言字段翻译成 TMDB 风格字段，
+  复用 `category.yaml` 分类策略自动推断二级分类（如 日番/国产剧/华语电影），不再落到一级目录根部。
 
 这个插件不修改 MoviePilot 主源码，通过运行时补丁接入。停用插件或重启后会按插件状态重新挂载。
 
