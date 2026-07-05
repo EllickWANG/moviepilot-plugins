@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import schemas
 from app.api.endpoints.search import _stream_search_events
+from app.chain import ChainBase
 from app.chain.download import DownloadChain
 from app.chain.mediaserver import MediaServerChain
 from app.chain.media import MediaChain
@@ -65,7 +66,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -222,8 +223,8 @@ class sourceprioritysubscribefix(_PluginBase):
             "download_single": DownloadChain.download_single,
             "media_get_message_image": MediaInfo.get_message_image,
             "media_get_poster_image": MediaInfo.get_poster_image,
-            "media_recognize_media": MediaChain.recognize_media,
-            "media_async_recognize_media": MediaChain.async_recognize_media,
+            "chain_recognize_media": ChainBase.recognize_media,
+            "chain_async_recognize_media": ChainBase.async_recognize_media,
             "media_recognize_by_meta": MediaChain.recognize_by_meta,
             "media_recognize_by_path": MediaChain.recognize_by_path,
             "media_handle_tv_episode_file": MediaChain._handle_tv_episode_file,
@@ -254,8 +255,8 @@ class sourceprioritysubscribefix(_PluginBase):
         DownloadChain.download_single = _patched_download_single
         MediaInfo.get_message_image = _patched_media_get_message_image
         MediaInfo.get_poster_image = _patched_media_get_poster_image
-        MediaChain.recognize_media = _patched_media_recognize_media
-        MediaChain.async_recognize_media = _patched_media_async_recognize_media
+        ChainBase.recognize_media = _patched_chain_recognize_media
+        ChainBase.async_recognize_media = _patched_chain_async_recognize_media
         MediaChain.recognize_by_meta = _patched_media_recognize_by_meta
         MediaChain.recognize_by_path = _patched_media_recognize_by_path
         MediaChain._handle_tv_episode_file = _patched_media_handle_tv_episode_file
@@ -297,8 +298,8 @@ class sourceprioritysubscribefix(_PluginBase):
         DownloadChain.download_single = cls._originals["download_single"]
         MediaInfo.get_message_image = cls._originals["media_get_message_image"]
         MediaInfo.get_poster_image = cls._originals["media_get_poster_image"]
-        MediaChain.recognize_media = cls._originals["media_recognize_media"]
-        MediaChain.async_recognize_media = cls._originals["media_async_recognize_media"]
+        ChainBase.recognize_media = cls._originals["chain_recognize_media"]
+        ChainBase.async_recognize_media = cls._originals["chain_async_recognize_media"]
         MediaChain.recognize_by_meta = cls._originals["media_recognize_by_meta"]
         MediaChain.recognize_by_path = cls._originals["media_recognize_by_path"]
         MediaChain._handle_tv_episode_file = cls._originals["media_handle_tv_episode_file"]
@@ -2106,21 +2107,21 @@ def _redirect_pseudo_tmdbid_kwargs(kwargs: dict) -> dict:
     return kwargs
 
 
-def _patched_media_recognize_media(self: MediaChain, *args, **kwargs) -> Optional[MediaInfo]:
+def _patched_chain_recognize_media(self: Any, *args, **kwargs) -> Optional[MediaInfo]:
     """
-    兜底覆盖模块直连识别（如手动整理按 doubanid 识别、媒体详情按伪 tmdbid 查询），
+    基类级兜底：覆盖所有链路的模块直连识别（下载完成整理、手动整理、媒体详情伪 tmdbid 等），
     解码日历伪 ID 并为豆瓣媒体补齐二级分类。
     """
     kwargs = _redirect_pseudo_tmdbid_kwargs(kwargs)
     return _mark_douban_media_ready(_mark_bangumi_media_ready(
-        sourceprioritysubscribefix._originals["media_recognize_media"](self, *args, **kwargs)
+        sourceprioritysubscribefix._originals["chain_recognize_media"](self, *args, **kwargs)
     ))
 
 
-async def _patched_media_async_recognize_media(self: MediaChain, *args, **kwargs) -> Optional[MediaInfo]:
+async def _patched_chain_async_recognize_media(self: Any, *args, **kwargs) -> Optional[MediaInfo]:
     kwargs = _redirect_pseudo_tmdbid_kwargs(kwargs)
     return _mark_douban_media_ready(_mark_bangumi_media_ready(
-        await sourceprioritysubscribefix._originals["media_async_recognize_media"](self, *args, **kwargs)
+        await sourceprioritysubscribefix._originals["chain_async_recognize_media"](self, *args, **kwargs)
     ))
 
 
