@@ -66,7 +66,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -221,6 +221,7 @@ class sourceprioritysubscribefix(_PluginBase):
             "search_async_process": SearchChain.async_process,
             "search_async_process_stream": SearchChain.async_process_stream,
             "download_single": DownloadChain.download_single,
+            "media_download_save_image": MediaChain._download_and_save_image,
             "media_get_message_image": MediaInfo.get_message_image,
             "media_get_poster_image": MediaInfo.get_poster_image,
             "chain_recognize_media": ChainBase.recognize_media,
@@ -253,6 +254,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = _patched_search_async_process
         SearchChain.async_process_stream = _patched_search_async_process_stream
         DownloadChain.download_single = _patched_download_single
+        MediaChain._download_and_save_image = _patched_media_download_and_save_image
         MediaInfo.get_message_image = _patched_media_get_message_image
         MediaInfo.get_poster_image = _patched_media_get_poster_image
         ChainBase.recognize_media = _patched_chain_recognize_media
@@ -296,6 +298,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = cls._originals["search_async_process"]
         SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
         DownloadChain.download_single = cls._originals["download_single"]
+        MediaChain._download_and_save_image = cls._originals["media_download_save_image"]
         MediaInfo.get_message_image = cls._originals["media_get_message_image"]
         MediaInfo.get_poster_image = cls._originals["media_get_poster_image"]
         ChainBase.recognize_media = cls._originals["chain_recognize_media"]
@@ -767,6 +770,17 @@ def _patched_media_get_message_image(self: MediaInfo, default: Optional[bool] = 
 def _patched_media_get_poster_image(self: MediaInfo, default: Optional[bool] = None):
     return _douban_proxy_image_url(
         sourceprioritysubscribefix._originals["media_get_poster_image"](self, default=default)
+    )
+
+
+def _patched_media_download_and_save_image(self: MediaChain, fileitem: schemas.FileItem,
+                                            path: Path, url: str):
+    """
+    刮削图片下载走 settings.PROXY 且无 Referer，豆瓣图床会拒绝；
+    豆瓣 URL 改经插件图片代理（本机直连 + Referer 伪装）。
+    """
+    return sourceprioritysubscribefix._originals["media_download_save_image"](
+        self, fileitem, path, _douban_proxy_image_url(url)
     )
 
 
