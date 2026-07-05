@@ -63,7 +63,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -3349,7 +3349,7 @@ def _stat_card(title: str, value: Any, subtitle: str, icon: str, color: str) -> 
         "content": [
             {
                 "component": "VCard",
-                "props": {"variant": "tonal", "color": color, "class": "h-100"},
+                "props": {"variant": "flat", "rounded": "xl", "border": True, "class": "h-100"},
                 "content": [
                     {
                         "component": "VCardText",
@@ -3357,32 +3357,179 @@ def _stat_card(title: str, value: Any, subtitle: str, icon: str, color: str) -> 
                         "content": [
                             {
                                 "component": "div",
-                                "props": {"class": "d-flex align-start justify-space-between ga-2"},
+                                "props": {"class": "d-flex align-center ga-3"},
                                 "content": [
+                                    {
+                                        "component": "VAvatar",
+                                        "props": {
+                                            "variant": "tonal",
+                                            "color": color,
+                                            "rounded": "lg",
+                                            "size": 46,
+                                            "class": "flex-shrink-0",
+                                        },
+                                        "content": [
+                                            {"component": "VIcon", "props": {"icon": icon, "size": 24}},
+                                        ],
+                                    },
                                     {
                                         "component": "div",
                                         "props": {"style": "min-width:0"},
                                         "content": [
-                                            _component_text("div", title, {"class": "text-caption text-medium-emphasis"}),
-                                            _component_text("div", value, {"class": "text-h6 text-sm-h5 font-weight-bold mt-1"}),
                                             _component_text(
-                                                "div",
-                                                subtitle,
+                                                "div", value,
+                                                {"class": "text-h5 font-weight-bold lh-1"},
+                                            ),
+                                            _component_text(
+                                                "div", title,
+                                                {"class": "text-caption font-weight-medium mt-1"},
+                                            ),
+                                            _component_text(
+                                                "div", subtitle,
                                                 {
-                                                    "class": "text-caption mt-1",
+                                                    "class": "text-caption text-medium-emphasis",
                                                     "style": "word-break:break-word",
                                                 },
                                             ),
                                         ],
                                     },
-                                    {
-                                        "component": "VIcon",
-                                        "props": {"icon": icon, "size": 28, "class": "flex-shrink-0"},
-                                    },
                                 ],
                             }
                         ],
                     }
+                ],
+            }
+        ],
+    }
+
+
+def _priority_chip(text: str, color: str, icon: str) -> dict:
+    return {
+        "component": "VChip",
+        "props": {
+            "size": "small",
+            "variant": "flat",
+            "color": color,
+            "prepend-icon": icon,
+            "class": "font-weight-medium",
+        },
+        "text": text,
+    }
+
+
+def _hero_card(plugin: Any, plugin_id: str) -> dict:
+    enabled = plugin.get_state()
+    status_chip = {
+        "component": "VChip",
+        "props": {
+            "size": "small",
+            "variant": "flat",
+            "color": "success" if enabled else "error",
+            "prepend-icon": "mdi-power" if enabled else "mdi-power-off",
+            "class": "font-weight-medium",
+        },
+        "text": "已启用" if enabled else "已停用",
+    }
+    version_chip = {
+        "component": "VChip",
+        "props": {
+            "size": "small",
+            "variant": "outlined",
+            "prepend-icon": "mdi-tag-outline",
+        },
+        "text": f"v{plugin.plugin_version}",
+    }
+    chevron = {
+        "component": "VIcon",
+        "props": {"icon": "mdi-chevron-right", "size": 18, "class": "text-medium-emphasis"},
+    }
+    return {
+        "component": "VCard",
+        "props": {"variant": "tonal", "color": "primary", "rounded": "xl", "class": "mb-4"},
+        "content": [
+            {
+                "component": "VCardText",
+                "props": {"class": "pa-4 pa-sm-5"},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-3"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "d-flex align-center ga-3", "style": "min-width:0"},
+                                "content": [
+                                    {
+                                        "component": "VAvatar",
+                                        "props": {
+                                            "variant": "flat",
+                                            "color": "primary",
+                                            "rounded": "lg",
+                                            "size": 52,
+                                            "class": "flex-shrink-0",
+                                        },
+                                        "content": [
+                                            {"component": "VIcon", "props": {"icon": "mdi-heart-cog", "size": 30}},
+                                        ],
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"style": "min-width:0"},
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "d-flex align-center flex-wrap ga-2"},
+                                                "content": [
+                                                    _component_text(
+                                                        "div", "订阅外部源优先",
+                                                        {"class": "text-h6 font-weight-bold"},
+                                                    ),
+                                                    status_chip,
+                                                    version_chip,
+                                                ],
+                                            },
+                                            _component_text(
+                                                "div",
+                                                "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削",
+                                                {"class": "text-caption text-medium-emphasis mt-1"},
+                                            ),
+                                        ],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "variant": "flat",
+                                    "color": "primary",
+                                    "rounded": "lg",
+                                    "prepend-icon": "mdi-sync",
+                                },
+                                "text": "刷新最近 Bangumi 媒体库",
+                                "events": {
+                                    "click": {
+                                        "api": f"plugin/{plugin_id}/refresh",
+                                        "method": "post",
+                                    }
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex align-center flex-wrap ga-2 mt-4"},
+                        "content": [
+                            _component_text(
+                                "div", "媒体来源优先级",
+                                {"class": "text-caption text-medium-emphasis mr-1"},
+                            ),
+                            _priority_chip("TMDB 真实 ID", "primary", "mdi-database"),
+                            chevron,
+                            _priority_chip("豆瓣", "success", "mdi-movie-open-star"),
+                            chevron,
+                            _priority_chip("Bangumi", "pink", "mdi-book-open-page-variant"),
+                        ],
+                    },
                 ],
             }
         ],
@@ -3418,23 +3565,79 @@ def _td(text: Any, class_name: str = "") -> dict:
     return item
 
 
+def _chip_td(text: Any, color: str) -> dict:
+    return {
+        "component": "td",
+        "props": {"class": "text-no-wrap"},
+        "content": [
+            {
+                "component": "VChip",
+                "props": {
+                    "size": "x-small",
+                    "variant": "tonal",
+                    "color": color,
+                    "class": "font-weight-medium",
+                },
+                "text": _safe_page_text(text),
+            }
+        ],
+    }
+
+
+def _empty_state(icon: str, text: str) -> dict:
+    return {
+        "component": "div",
+        "props": {"class": "d-flex flex-column align-center justify-center py-8 ga-2"},
+        "content": [
+            {
+                "component": "VIcon",
+                "props": {"icon": icon, "size": 40, "class": "text-disabled"},
+            },
+            _component_text("div", text, {"class": "text-caption text-medium-emphasis"}),
+        ],
+    }
+
+
 def _table_card(
         title: str,
         icon: str,
         headers: list[str],
         rows: list[dict],
         mobile_items: list[dict],
-        empty_text: str) -> dict:
-    content = [
-        {
-            "component": "div",
-            "props": {"class": "d-flex align-center mb-3"},
-            "content": [
-                {"component": "VIcon", "props": {"icon": icon, "class": "mr-2"}},
-                _component_text("div", title, {"class": "text-subtitle-1 font-weight-medium"}),
-            ],
-        }
-    ]
+        empty_text: str,
+        accent: str = "primary",
+        empty_icon: str = "mdi-tray-remove") -> dict:
+    header = {
+        "component": "div",
+        "props": {"class": "d-flex align-center ga-2 mb-3"},
+        "content": [
+            {
+                "component": "VAvatar",
+                "props": {
+                    "variant": "tonal",
+                    "color": accent,
+                    "rounded": "lg",
+                    "size": 32,
+                },
+                "content": [
+                    {"component": "VIcon", "props": {"icon": icon, "size": 18}},
+                ],
+            },
+            _component_text("div", title, {"class": "text-subtitle-1 font-weight-bold"}),
+            {"component": "VSpacer"},
+            {
+                "component": "VChip",
+                "props": {
+                    "size": "small",
+                    "variant": "tonal",
+                    "color": accent if rows else "default",
+                    "class": "font-weight-medium",
+                },
+                "text": f"{len(rows)} 条",
+            },
+        ],
+    }
+    content = [header]
     if rows:
         content.append({
             "component": "div",
@@ -3442,7 +3645,7 @@ def _table_card(
             "content": [
                 {
                     "component": "VTable",
-                    "props": {"hover": True, "density": "compact"},
+                    "props": {"hover": True, "density": "comfortable"},
                     "content": [
                         _table_header(headers),
                         {
@@ -3459,17 +3662,10 @@ def _table_card(
             "content": mobile_items,
         })
     else:
-        content.append({
-            "component": "VAlert",
-            "props": {
-                "type": "info",
-                "variant": "tonal",
-                "text": empty_text,
-            },
-        })
+        content.append(_empty_state(empty_icon, empty_text))
     return {
         "component": "VCard",
-        "props": {"variant": "outlined"},
+        "props": {"variant": "flat", "rounded": "xl", "border": True, "class": "h-100"},
         "content": [
             {
                 "component": "VCardText",
@@ -3549,14 +3745,17 @@ def _failed_transfer_entries(plugin_id: str, histories: list[TransferHistory]) -
     return rows, mobile_items
 
 
-def _subscribe_source_text(subscribe: Subscribe) -> str:
+def _subscribe_source_badge(subscribe: Subscribe) -> tuple[str, str, str]:
+    """
+    返回 (显示文本, 颜色, 图标)
+    """
     if subscribe.bangumiid and _is_bangumi_only_subscribe(subscribe):
-        return f"bangumi:{subscribe.bangumiid}"
+        return f"bangumi:{subscribe.bangumiid}", "pink", "mdi-book-open-page-variant"
     if subscribe.doubanid:
-        return f"douban:{subscribe.doubanid}"
+        return f"douban:{subscribe.doubanid}", "success", "mdi-movie-open-star"
     if subscribe.bangumiid:
-        return f"bangumi:{subscribe.bangumiid}"
-    return "-"
+        return f"bangumi:{subscribe.bangumiid}", "pink", "mdi-book-open-page-variant"
+    return "-", "default", "mdi-help-circle-outline"
 
 
 def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[dict]]:
@@ -3565,15 +3764,15 @@ def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[di
     for subscribe in subscribes:
         progress = f"{(subscribe.total_episode or 0) - (subscribe.lack_episode or 0)} / {subscribe.total_episode or 0}"
         season_text = f"S{subscribe.season:02d}" if subscribe.season else "-"
-        source_text = _subscribe_source_text(subscribe)
+        source_text, source_color, source_icon = _subscribe_source_badge(subscribe)
         rows.append({
             "component": "tr",
             "content": [
                 _td(subscribe.id, "text-no-wrap"),
-                _td(subscribe.name, "text-no-wrap"),
+                _td(subscribe.name, "text-no-wrap font-weight-medium"),
                 _td(subscribe.year, "text-no-wrap"),
                 _td(season_text, "text-no-wrap"),
-                _td(source_text, "text-no-wrap"),
+                _chip_td(source_text, source_color),
                 _td(progress, "text-no-wrap"),
             ],
         })
@@ -3582,7 +3781,7 @@ def _subscribe_entries(subscribes: list[Subscribe]) -> tuple[list[dict], list[di
             subtitle=f"{subscribe.year or '-'} · {season_text} · {progress}",
             chips=[
                 _chip(f"ID {subscribe.id}", "primary", "mdi-pound"),
-                _chip(source_text, "info", "mdi-book-open-page-variant"),
+                _chip(source_text, source_color, source_icon),
             ],
             details=[
                 _detail_line("年份", subscribe.year),
@@ -3601,15 +3800,17 @@ def _download_entries(downloads: list[DownloadHistory],
         if source == "douban":
             source_keyword = _douban_source_keyword(download) or {}
             source_text = f"douban:{source_keyword.get('doubanid')}"
+            source_color = "success"
         else:
             source_keyword = _bangumi_source_keyword(download) or {}
             source_text = f"bangumi:{source_keyword.get('bangumiid')}"
+            source_color = "pink"
         rows.append({
             "component": "tr",
             "content": [
                 _td(download.id, "text-no-wrap"),
-                _td(download.title, "text-no-wrap"),
-                _td(source_text, "text-no-wrap"),
+                _td(download.title, "text-no-wrap font-weight-medium"),
+                _chip_td(source_text, source_color),
                 _td(download.torrent_name),
                 _td(download.date, "text-no-wrap"),
             ],
@@ -3639,7 +3840,6 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
     douban_download_items = _douban_source_downloads(limit=12)
     bangumi_subscribes = _bangumi_only_subscribes_for_page(limit=20)
     douban_subscribes = _douban_only_subscribes_for_page(limit=20)
-    enabled_text = "已启用" if plugin.get_state() else "已停用"
     failed_rows, failed_mobile_items = _failed_transfer_entries(plugin_id, failed_histories)
     subscribe_rows, subscribe_mobile_items = _subscribe_entries(bangumi_subscribes)
     douban_subscribe_rows, douban_subscribe_mobile_items = _subscribe_entries(douban_subscribes)
@@ -3647,56 +3847,44 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
     douban_download_rows, douban_download_mobile_items = _download_entries(douban_download_items, source="douban")
 
     return [
+        _hero_card(plugin, plugin_id),
         {
             "component": "VRow",
             "props": {"dense": True},
             "content": [
-                _stat_card("插件状态", enabled_text, f"版本 {plugin.plugin_version}", "mdi-heart-cog", "primary"),
                 _stat_card(
-                    "外部源订阅",
-                    len(bangumi_subscribes) + len(douban_subscribes),
-                    f"Bangumi {len(bangumi_subscribes)} · 豆瓣 {len(douban_subscribes)}",
-                    "mdi-book-heart",
-                    "info",
+                    "豆瓣订阅",
+                    len(douban_subscribes),
+                    "无 TMDB ID 的豆瓣来源",
+                    "mdi-movie-open-star",
+                    "success",
                 ),
-                _stat_card("失败整理", len(failed_histories), "最多显示最近 20 条", "mdi-alert-circle", "error"),
+                _stat_card(
+                    "Bangumi 订阅",
+                    len(bangumi_subscribes),
+                    "未绑定 TMDB/豆瓣",
+                    "mdi-book-open-page-variant",
+                    "pink",
+                ),
                 _stat_card(
                     "来源下载",
                     len(source_download_items) + len(douban_download_items),
-                    f"Bangumi {len(source_download_items)} · 豆瓣 {len(douban_download_items)}",
+                    f"豆瓣 {len(douban_download_items)} · Bangumi {len(source_download_items)}",
                     "mdi-download-circle",
-                    "success",
+                    "info",
+                ),
+                _stat_card(
+                    "失败整理",
+                    len(failed_histories),
+                    "一切正常" if not failed_histories else "最多显示最近 20 条",
+                    "mdi-check-circle" if not failed_histories else "mdi-alert-circle",
+                    "success" if not failed_histories else "error",
                 ),
             ],
         },
         {
             "component": "VRow",
-            "content": [
-                {
-                    "component": "VCol",
-                    "props": {"cols": 12},
-                    "content": [
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "variant": "tonal",
-                                "color": "primary",
-                                "prepend-icon": "mdi-sync",
-                            },
-                            "text": "刷新最近 Bangumi 媒体库",
-                            "events": {
-                                "click": {
-                                    "api": f"plugin/{plugin_id}/refresh",
-                                    "method": "post",
-                                }
-                            },
-                        }
-                    ],
-                }
-            ],
-        },
-        {
-            "component": "VRow",
+            "props": {"class": "mt-1"},
             "content": [
                 {
                     "component": "VCol",
@@ -3709,6 +3897,8 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                             rows=failed_rows,
                             mobile_items=failed_mobile_items,
                             empty_text="当前没有失败整理记录。",
+                            accent="error",
+                            empty_icon="mdi-check-circle-outline",
                         )
                     ],
                 }
@@ -3722,12 +3912,13 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                     "props": {"cols": 12, "lg": 6},
                     "content": [
                         _table_card(
-                            title="Bangumi-only 订阅",
-                            icon="mdi-book-open-page-variant",
-                            headers=["ID", "标题", "年份", "季", "Bangumi", "进度"],
-                            rows=subscribe_rows,
-                            mobile_items=subscribe_mobile_items,
-                            empty_text="暂无 Bangumi-only 订阅。",
+                            title="豆瓣-only 订阅",
+                            icon="mdi-movie-open-star",
+                            headers=["ID", "标题", "年份", "季", "来源", "进度"],
+                            rows=douban_subscribe_rows,
+                            mobile_items=douban_subscribe_mobile_items,
+                            empty_text="暂无豆瓣-only 订阅。",
+                            accent="success",
                         )
                     ],
                 },
@@ -3736,12 +3927,13 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                     "props": {"cols": 12, "lg": 6},
                     "content": [
                         _table_card(
-                            title="最近 Bangumi-only 来源下载",
+                            title="最近豆瓣来源下载",
                             icon="mdi-download",
-                            headers=["ID", "标题", "Bangumi", "资源名", "时间"],
-                            rows=download_rows,
-                            mobile_items=download_mobile_items,
-                            empty_text="暂无 Bangumi-only 来源下载记录。",
+                            headers=["ID", "标题", "来源", "资源名", "时间"],
+                            rows=douban_download_rows,
+                            mobile_items=douban_download_mobile_items,
+                            empty_text="暂无豆瓣来源下载记录。",
+                            accent="success",
                         )
                     ],
                 },
@@ -3755,12 +3947,13 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                     "props": {"cols": 12, "lg": 6},
                     "content": [
                         _table_card(
-                            title="豆瓣-only 订阅",
-                            icon="mdi-movie-open-star",
-                            headers=["ID", "标题", "年份", "季", "豆瓣", "进度"],
-                            rows=douban_subscribe_rows,
-                            mobile_items=douban_subscribe_mobile_items,
-                            empty_text="暂无豆瓣-only 订阅。",
+                            title="Bangumi-only 订阅",
+                            icon="mdi-book-open-page-variant",
+                            headers=["ID", "标题", "年份", "季", "来源", "进度"],
+                            rows=subscribe_rows,
+                            mobile_items=subscribe_mobile_items,
+                            empty_text="暂无 Bangumi-only 订阅。",
+                            accent="pink",
                         )
                     ],
                 },
@@ -3769,12 +3962,13 @@ def _diagnostic_page(plugin: sourceprioritysubscribefix) -> List[dict]:
                     "props": {"cols": 12, "lg": 6},
                     "content": [
                         _table_card(
-                            title="最近豆瓣来源下载",
+                            title="最近 Bangumi-only 来源下载",
                             icon="mdi-download",
-                            headers=["ID", "标题", "豆瓣", "资源名", "时间"],
-                            rows=douban_download_rows,
-                            mobile_items=douban_download_mobile_items,
-                            empty_text="暂无豆瓣来源下载记录。",
+                            headers=["ID", "标题", "来源", "资源名", "时间"],
+                            rows=download_rows,
+                            mobile_items=download_mobile_items,
+                            empty_text="暂无 Bangumi-only 来源下载记录。",
+                            accent="pink",
                         )
                     ],
                 },
