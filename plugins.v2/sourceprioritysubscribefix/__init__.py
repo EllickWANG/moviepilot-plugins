@@ -6,13 +6,14 @@ import time
 import traceback
 import re
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, List, Optional, Tuple
 from xml.dom import minidom
 
 from fastapi import BackgroundTasks, Depends, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response as FastAPIResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,7 +65,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -113,6 +114,14 @@ class sourceprioritysubscribefix(_PluginBase):
                 "auth": "bear",
                 "summary": "使用订阅来源重新整理",
                 "description": "对 Bangumi-only 订阅下载失败的整理记录，按下载历史中的订阅来源重新整理。",
+            },
+            {
+                "path": "/img",
+                "endpoint": _plugin_douban_image_proxy,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "豆瓣图片代理",
+                "description": "代理豆瓣图床图片（防盗链），供微信通知等外部服务使用。",
             },
             {
                 "path": "/refresh",
@@ -211,6 +220,8 @@ class sourceprioritysubscribefix(_PluginBase):
             "search_async_process": SearchChain.async_process,
             "search_async_process_stream": SearchChain.async_process_stream,
             "download_single": DownloadChain.download_single,
+            "media_get_message_image": MediaInfo.get_message_image,
+            "media_get_poster_image": MediaInfo.get_poster_image,
             "media_recognize_media": MediaChain.recognize_media,
             "media_async_recognize_media": MediaChain.async_recognize_media,
             "media_recognize_by_meta": MediaChain.recognize_by_meta,
@@ -241,6 +252,8 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = _patched_search_async_process
         SearchChain.async_process_stream = _patched_search_async_process_stream
         DownloadChain.download_single = _patched_download_single
+        MediaInfo.get_message_image = _patched_media_get_message_image
+        MediaInfo.get_poster_image = _patched_media_get_poster_image
         MediaChain.recognize_media = _patched_media_recognize_media
         MediaChain.async_recognize_media = _patched_media_async_recognize_media
         MediaChain.recognize_by_meta = _patched_media_recognize_by_meta
@@ -282,6 +295,8 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process = cls._originals["search_async_process"]
         SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
         DownloadChain.download_single = cls._originals["download_single"]
+        MediaInfo.get_message_image = cls._originals["media_get_message_image"]
+        MediaInfo.get_poster_image = cls._originals["media_get_poster_image"]
         MediaChain.recognize_media = cls._originals["media_recognize_media"]
         MediaChain.async_recognize_media = cls._originals["media_async_recognize_media"]
         MediaChain.recognize_by_meta = cls._originals["media_recognize_by_meta"]
@@ -716,6 +731,67 @@ def _douban_id_from_calendar_tmdbid(tmdbid: Any) -> Optional[str]:
     if raw_id > _DOUBAN_CALENDAR_TMDB_OFFSET:
         return str(raw_id - _DOUBAN_CALENDAR_TMDB_OFFSET)
     return None
+
+
+_PUBLIC_BASE_URL_FALLBACK = "https://movie.nyxara.cn"
+
+
+def _public_base_url() -> str:
+    domain = (settings.APP_DOMAIN or "").strip().rstrip("/")
+    if not domain:
+        return _PUBLIC_BASE_URL_FALLBACK
+    if not domain.startswith("http"):
+        domain = f"https://{domain}"
+    return domain
+
+
+def _douban_proxy_image_url(url: Any) -> Any:
+    """
+    豆瓣图床防盗链，微信等外部服务拉不到图，改走插件自带的公网图片代理。
+    """
+    if not url or "doubanio.com" not in str(url):
+        return url
+    return (
+        f"{_public_base_url()}/api/v1/plugin/sourceprioritysubscribefix/img"
+        f"?apikey={settings.API_TOKEN}&url={quote(str(url), safe='')}"
+    )
+
+
+def _patched_media_get_message_image(self: MediaInfo, default: Optional[bool] = None):
+    return _douban_proxy_image_url(
+        sourceprioritysubscribefix._originals["media_get_message_image"](self, default=default)
+    )
+
+
+def _patched_media_get_poster_image(self: MediaInfo, default: Optional[bool] = None):
+    return _douban_proxy_image_url(
+        sourceprioritysubscribefix._originals["media_get_poster_image"](self, default=default)
+    )
+
+
+def _plugin_douban_image_proxy(url: str) -> Any:
+    """
+    豆瓣图片公网代理（apikey 鉴权），仅允许豆瓣图床域名。
+    """
+    if not re.match(r"^https?://img\d*\.doubanio\.com/", url or ""):
+        return schemas.Response(success=False, message="不支持的图片地址")
+    try:
+        res = RequestUtils(
+            ua=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
+            referer="https://movie.douban.com/",
+            timeout=15,
+        ).get_res(url)
+    except Exception as err:
+        logger.warn(f"豆瓣图片代理获取失败：{url} - {err}")
+        res = None
+    if not res or not res.content:
+        return schemas.Response(success=False, message="图片获取失败")
+    return FastAPIResponse(
+        content=res.content,
+        media_type=(res.headers.get("Content-Type") or "image/jpeg").split(";")[0],
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 def _douban_first_air_date(info: dict) -> Optional[str]:
@@ -2011,16 +2087,38 @@ def _source_media_from_meta(
     return _mark_bangumi_media_ready(_apply_subscribe_ids(mediainfo, subscribe))
 
 
+def _redirect_pseudo_tmdbid_kwargs(kwargs: dict) -> dict:
+    """
+    媒体详情等入口会拿日历伪 tmdbid 来识别，这里解码回豆瓣/Bangumi ID。
+    """
+    tmdbid = kwargs.get("tmdbid")
+    doubanid = _douban_id_from_calendar_tmdbid(tmdbid)
+    if doubanid and not kwargs.get("doubanid"):
+        kwargs = dict(kwargs)
+        kwargs["tmdbid"] = None
+        kwargs["doubanid"] = doubanid
+        return kwargs
+    bangumiid = _bangumi_id_from_calendar_tmdbid(tmdbid)
+    if bangumiid and not kwargs.get("bangumiid"):
+        kwargs = dict(kwargs)
+        kwargs["tmdbid"] = None
+        kwargs["bangumiid"] = bangumiid
+    return kwargs
+
+
 def _patched_media_recognize_media(self: MediaChain, *args, **kwargs) -> Optional[MediaInfo]:
     """
-    兜底覆盖模块直连识别（如手动整理按 doubanid 识别），豆瓣媒体补齐二级分类。
+    兜底覆盖模块直连识别（如手动整理按 doubanid 识别、媒体详情按伪 tmdbid 查询），
+    解码日历伪 ID 并为豆瓣媒体补齐二级分类。
     """
+    kwargs = _redirect_pseudo_tmdbid_kwargs(kwargs)
     return _mark_douban_media_ready(_mark_bangumi_media_ready(
         sourceprioritysubscribefix._originals["media_recognize_media"](self, *args, **kwargs)
     ))
 
 
 async def _patched_media_async_recognize_media(self: MediaChain, *args, **kwargs) -> Optional[MediaInfo]:
+    kwargs = _redirect_pseudo_tmdbid_kwargs(kwargs)
     return _mark_douban_media_ready(_mark_bangumi_media_ready(
         await sourceprioritysubscribefix._originals["media_async_recognize_media"](self, *args, **kwargs)
     ))
