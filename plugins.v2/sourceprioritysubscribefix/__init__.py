@@ -5,6 +5,7 @@ import subprocess
 import time
 import traceback
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, List, Optional, Tuple
@@ -63,7 +64,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.1.5"
+    plugin_version = "1.2.0"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -641,6 +642,12 @@ async def _patched_tmdb_season_episodes(
         season: int,
         episode_group: Optional[str] = None,
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
+    doubanid = _douban_id_from_calendar_tmdbid(tmdbid)
+    if doubanid:
+        episodes = await _async_douban_tmdb_episodes(doubanid=doubanid, season=season)
+        if not episodes:
+            logger.warn(f"豆瓣日历未获取到分集信息：douban:{doubanid} S{season}")
+        return episodes
     bangumiid = _bangumi_id_from_calendar_tmdbid(tmdbid)
     if bangumiid:
         episodes = await _async_bangumi_tmdb_episodes(bangumiid=bangumiid, season=season)
@@ -661,6 +668,7 @@ _SOURCE_SUBSCRIBE_CACHE = {
 
 _BANGUMI_API_BASE = "https://api.bgm.tv"
 _BANGUMI_CALENDAR_TMDB_OFFSET = 1_000_000_000
+_DOUBAN_CALENDAR_TMDB_OFFSET = 2_000_000_000
 _BANGUMI_EPISODE_CACHE_TTL = 6 * 3600
 _BANGUMI_EPISODE_CACHE: dict[int, tuple[float, list[dict]]] = {}
 _MEDIA_SERVER_REFRESH_CACHE: dict[str, float] = {}
@@ -685,9 +693,82 @@ def _bangumi_id_from_calendar_tmdbid(tmdbid: Any) -> Optional[int]:
     if value is None or value >= 0:
         return None
     raw_id = abs(value)
+    if raw_id > _DOUBAN_CALENDAR_TMDB_OFFSET:
+        # 豆瓣日历伪 ID 区间
+        return None
     if raw_id > _BANGUMI_CALENDAR_TMDB_OFFSET:
         return raw_id - _BANGUMI_CALENDAR_TMDB_OFFSET
     return raw_id
+
+
+def _douban_calendar_tmdbid(doubanid: Any) -> Optional[int]:
+    did = _int_or_none(doubanid)
+    if not did:
+        return None
+    return -(_DOUBAN_CALENDAR_TMDB_OFFSET + did)
+
+
+def _douban_id_from_calendar_tmdbid(tmdbid: Any) -> Optional[str]:
+    value = _int_or_none(tmdbid)
+    if value is None or value >= 0:
+        return None
+    raw_id = abs(value)
+    if raw_id > _DOUBAN_CALENDAR_TMDB_OFFSET:
+        return str(raw_id - _DOUBAN_CALENDAR_TMDB_OFFSET)
+    return None
+
+
+def _douban_first_air_date(info: dict) -> Optional[str]:
+    for value in (info.get("pubdate") or []):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", str(value))
+        if m:
+            return m.group(1)
+    for key in ("air_date", "release_date"):
+        value = info.get(key)
+        if value:
+            m = re.search(r"(\d{4}-\d{2}-\d{2})", str(value))
+            if m:
+                return m.group(1)
+    return None
+
+
+async def _async_douban_tmdb_episodes(doubanid: str, season: int,
+                                      fallback_total: int = 0) -> list[schemas.TmdbEpisode]:
+    """
+    用豆瓣详情合成日历分集：豆瓣没有分集播出日期，按首播日 + 每周一集推算。
+    """
+    try:
+        info = await MediaChain().async_douban_info(doubanid=doubanid, mtype=MediaType.TV)
+    except Exception as err:
+        logger.warn(f"豆瓣日历获取详情失败：douban:{doubanid} - {err}")
+        info = None
+    if not info:
+        return []
+    total = _int_or_none(info.get("episodes_count")) or fallback_total or 0
+    if not total:
+        return []
+    first = _douban_first_air_date(info)
+    base = None
+    if first:
+        try:
+            base = datetime.strptime(first, "%Y-%m-%d")
+        except ValueError:
+            base = None
+    episodes = []
+    for idx in range(1, total + 1):
+        air_date = (base + timedelta(days=7 * (idx - 1))).strftime("%Y-%m-%d") if base else None
+        episodes.append(schemas.TmdbEpisode(
+            air_date=air_date,
+            episode_number=idx,
+            episode_type="standard",
+            name=f"第 {idx} 集",
+            overview=None,
+            runtime=None,
+            season_number=season,
+            still_path=None,
+            vote_average=0,
+        ))
+    return episodes
 
 
 def _subscribe_calendar_payload(subscribe: Any) -> dict:
@@ -703,6 +784,14 @@ def _subscribe_calendar_payload(subscribe: Any) -> dict:
         if calendar_tmdbid:
             data["tmdbid"] = calendar_tmdbid
             data["mediaid"] = data.get("mediaid") or f"bangumi:{bangumiid}"
+        return data
+    doubanid = data.get("doubanid") or getattr(subscribe, "doubanid", None)
+    if doubanid and not _real_tmdb_id(data.get("tmdbid")) \
+            and _type_value(data.get("type")) == MediaType.TV.value:
+        calendar_tmdbid = _douban_calendar_tmdbid(doubanid)
+        if calendar_tmdbid:
+            data["tmdbid"] = calendar_tmdbid
+            data["mediaid"] = data.get("mediaid") or f"douban:{doubanid}"
     return data
 
 
