@@ -50,6 +50,7 @@ class BrushConfig:
         self.maxupspeed = self.__parse_number(config.get("maxupspeed"))
         self.maxdlspeed = self.__parse_number(config.get("maxdlspeed"))
         self.maxdlcount = self.__parse_number(config.get("maxdlcount"))
+        self.site_cycle_cap = self.__parse_number(config.get("site_cycle_cap"))
         self.include = config.get("include")
         self.exclude = config.get("exclude")
         self.size = config.get("size")
@@ -126,7 +127,8 @@ class BrushConfig:
             "site_hr_active",
             "site_skip_tips",
             "del_no_free",
-            "rss_support"
+            "rss_support",
+            "site_cycle_cap"
             # 当新增支持字段时，仅在此处添加字段名
         }
         try:
@@ -264,7 +266,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.5.6"
+    plugin_version = "4.3.6"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1035,7 +1037,7 @@ class FlowBrush(_PluginBase):
                                                 'component': 'VCol',
                                                 'props': {
                                                     "cols": 12,
-                                                    "md": 4
+                                                    "md": 3
                                                 },
                                                 'content': [
                                                     {
@@ -1052,7 +1054,24 @@ class FlowBrush(_PluginBase):
                                                 'component': 'VCol',
                                                 'props': {
                                                     "cols": 12,
-                                                    "md": 4
+                                                    "md": 3
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'site_cycle_cap',
+                                                            'label': '单站每轮新增上限',
+                                                            'placeholder': '留空不限制，多个站点均衡刷流'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    "cols": 12,
+                                                    "md": 3
                                                 },
                                                 'content': [
                                                     {
@@ -1069,7 +1088,7 @@ class FlowBrush(_PluginBase):
                                                 'component': 'VCol',
                                                 'props': {
                                                     "cols": 12,
-                                                    "md": 4
+                                                    "md": 3
                                                 },
                                                 'content': [
                                                     {
@@ -2107,8 +2126,16 @@ class FlowBrush(_PluginBase):
 
         logger.info(f"正在准备种子刷流，数量 {len(torrents)}")
 
+        # 单站每轮新增上限，保证一轮内多个站点均衡获得下载名额
+        site_cycle_cap = int(brush_config.site_cycle_cap) if brush_config.site_cycle_cap else 0
+        site_added_count = 0
+
         # 过滤种子
         for torrent in torrents:
+            if site_cycle_cap and site_added_count >= site_cycle_cap:
+                logger.info(f"站点 {siteinfo.name} 本轮已新增 {site_added_count} 个刷流任务，"
+                            f"达到单站每轮上限 {site_cycle_cap}，切换下一站点")
+                return True
             # 判断能否通过刷流前置条件
             pre_condition_passed, reason = self.__evaluate_pre_conditions_for_brush(include_network_conditions=False)
             self.__log_brush_conditions(passed=pre_condition_passed, reason=reason)
@@ -2187,6 +2214,7 @@ class FlowBrush(_PluginBase):
             statistic_info["count"] += 1
             logger.info(f"站点 {siteinfo.name}，新增刷流种子下载：{torrent.title}|{torrent.description}")
             self.__send_add_message(torrent)
+            site_added_count += 1
 
         return True
 
@@ -3119,6 +3147,7 @@ class FlowBrush(_PluginBase):
             "maxupspeed": "总上传带宽",
             "maxdlspeed": "总下载带宽",
             "maxdlcount": "同时下载任务数",
+            "site_cycle_cap": "单站每轮新增上限",
             "seed_time": "做种时间",
             "hr_seed_time": "H&R做种时间",
             "seed_ratio": "分享率",
@@ -3185,6 +3214,7 @@ class FlowBrush(_PluginBase):
             "maxupspeed": brush_config.maxupspeed,
             "maxdlspeed": brush_config.maxdlspeed,
             "maxdlcount": brush_config.maxdlcount,
+            "site_cycle_cap": brush_config.site_cycle_cap,
             "include": brush_config.include,
             "exclude": brush_config.exclude,
             "size": brush_config.size,
