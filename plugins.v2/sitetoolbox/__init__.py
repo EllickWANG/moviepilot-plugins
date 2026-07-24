@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.14"
+    plugin_version = "1.3.15"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -71,6 +71,9 @@ class sitetoolbox(_PluginBase):
     _originals: dict[tuple[type, str], Any] = {}
     _site_rules: list[dict[str, Any]] = []
     _userdata_rules: list[dict[str, Any]] = []
+    _asyncfix_raw_cookie_domains: list[str] = []
+    _aru_patched = False
+    _aru_originals: dict[tuple[type, str], Any] = {}
     _jobs_lock = Lock()
     _error_log_lock = Lock()
     _error_capture_installed = False
@@ -150,6 +153,11 @@ class sitetoolbox(_PluginBase):
             for rule in self.__class__._site_rules
             if isinstance(rule.get("userdata"), dict)
         ]
+        self.__class__._asyncfix_raw_cookie_domains = [
+            rule.get("domain")
+            for rule in self.__class__._site_rules
+            if isinstance(rule.get("asyncfix"), dict) and rule["asyncfix"].get("raw_cookie")
+        ]
 
         if self._enabled:
             self._install_error_capture()
@@ -159,8 +167,13 @@ class sitetoolbox(_PluginBase):
                 self._patch_userdata_parsers()
             else:
                 self._unpatch_userdata()
+            if self.__class__._asyncfix_raw_cookie_domains:
+                self._patch_async_raw_cookie()
+            else:
+                self._unpatch_async_raw_cookie()
         else:
             self._unpatch_userdata()
+            self._unpatch_async_raw_cookie()
             self._uninstall_error_capture()
 
     def get_state(self) -> bool:
@@ -566,6 +579,7 @@ class sitetoolbox(_PluginBase):
 
     def stop_service(self):
         self._unpatch_userdata()
+        self._unpatch_async_raw_cookie()
         self._uninstall_error_capture()
 
     def _config_payload(self, **overrides) -> Dict[str, Any]:
@@ -900,6 +914,59 @@ class sitetoolbox(_PluginBase):
         cls._originals = {}
         cls._patched = False
         logger.info("站点工具箱用户数据解析规则已停用")
+
+    @classmethod
+    def _patch_async_raw_cookie(cls):
+        """
+        对配置了 asyncfix.raw_cookie 的域名，异步请求改用原始 Cookie 头。
+
+        根因：AsyncRequestUtils 会用 cookie_parse 把 cookie 字符串 URL 解码成字典，
+        再交给 httpx 的 cookie jar 重新序列化。对 cookie 值含 %3D 等编码的站点
+        （如 hdvideo.top），重组后的 Cookie 头无法通过站点鉴权（返回伪装 404），
+        而同步 requests 及原始 Cookie 头都正常。此补丁保留原始 cookie 字符串，
+        请求命中配置域名时直接放入 Cookie 头并跳过 cookie jar。
+        """
+        if cls._aru_patched:
+            logger.info(
+                f"站点工具箱异步Cookie修正域名已更新：{cls._asyncfix_raw_cookie_domains}")
+            return
+        from app.utils.http import AsyncRequestUtils
+
+        orig_init = AsyncRequestUtils.__init__
+        orig_request = AsyncRequestUtils.request
+        cls._aru_originals[(AsyncRequestUtils, "__init__")] = orig_init
+        cls._aru_originals[(AsyncRequestUtils, "request")] = orig_request
+
+        def patched_init(self, *args, **kwargs):
+            raw_cookie = kwargs.get("cookies")
+            if raw_cookie is None and len(args) >= 3:
+                raw_cookie = args[2]
+            orig_init(self, *args, **kwargs)
+            if isinstance(raw_cookie, str) and raw_cookie.strip():
+                self._sitetoolbox_raw_cookie = raw_cookie.strip()
+
+        async def patched_request(self, method, url, *args, **kwargs):
+            raw = getattr(self, "_sitetoolbox_raw_cookie", None)
+            if raw and _asyncfix_domain_match(url, sitetoolbox._asyncfix_raw_cookie_domains):
+                self._headers = {**(self._headers or {}), "Cookie": raw}
+                self._cookies = None
+            return await orig_request(self, method, url, *args, **kwargs)
+
+        AsyncRequestUtils.__init__ = patched_init
+        AsyncRequestUtils.request = patched_request
+        cls._aru_patched = True
+        logger.info(
+            f"站点工具箱异步Cookie修正已启用，域名：{cls._asyncfix_raw_cookie_domains}")
+
+    @classmethod
+    def _unpatch_async_raw_cookie(cls):
+        if not cls._aru_patched:
+            return
+        for (target_cls, method), original in list(cls._aru_originals.items()):
+            setattr(target_cls, method, original)
+        cls._aru_originals = {}
+        cls._aru_patched = False
+        logger.info("站点工具箱异步Cookie修正已停用")
 
 
 class _SiteToolboxErrorHandler(logging.Handler):
@@ -2022,8 +2089,9 @@ def _normalize_site_item(domain: Any, config: Any) -> Optional[dict[str, Any]]:
 
     indexer = config.get("indexer")
     userdata = config.get("userdata") or config.get("user_data")
+    asyncfix = config.get("asyncfix")
 
-    if indexer is None and userdata is None:
+    if indexer is None and userdata is None and asyncfix is None:
         if _looks_like_indexer(config):
             indexer = config
         else:
@@ -2033,7 +2101,24 @@ def _normalize_site_item(domain: Any, config: Any) -> Optional[dict[str, Any]]:
         "domain": domain,
         "indexer": indexer if isinstance(indexer, dict) else None,
         "userdata": userdata if isinstance(userdata, dict) else None,
+        "asyncfix": asyncfix if isinstance(asyncfix, dict) else None,
     }
+
+
+def _asyncfix_domain_match(url: str, domains: list) -> bool:
+    """
+    判断请求 URL 是否命中 asyncfix 配置域名（含子域名）
+    """
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return False
+    host = host.lower()
+    for domain in domains or []:
+        domain = str(domain or "").lower().strip()
+        if domain and (host == domain or host.endswith("." + domain)):
+            return True
+    return False
 
 
 def _looks_like_indexer(config: dict[str, Any]) -> bool:
