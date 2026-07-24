@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.18"
+    plugin_version = "1.3.19"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1222,6 +1222,21 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
             matrix[key] = {"status": status, "length": length}
         except Exception as err:
             matrix[key] = {"error": f"{type(err).__name__}: {err}"}
+
+    # http2 变体（v2.14 ARU 可能启用 http2，ALPN 指纹不同）
+    async def _matrix_probe_http2():
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False,
+                                     http2=True) as client:
+            res = await client.get(target, headers={"User-Agent": ua_suffixed,
+                                                    "Cookie": site.cookie or ""})
+            return res.status_code, len(res.text or ""), str(res.http_version)
+
+    try:
+        status, length, http_version = asyncio.run(_matrix_probe_http2())
+        matrix["http2"] = {"status": status, "length": length, "http_version": http_version}
+    except Exception as err:
+        matrix["http2"] = {"error": f"{type(err).__name__}: {err}"}
     report["httpx_matrix"] = matrix
 
     # asyncfix 补丁挂载状态自检
@@ -1313,16 +1328,31 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
             for row in live:
                 key = f"dl={row.get('downloadvolumefactor')},up={row.get('uploadvolumefactor')}"
                 factor_dist[key] = factor_dist.get(key, 0) + 1
+            frees = [r for r in live if r.get("downloadvolumefactor") in (0, 0.0)]
+            seeder_dist: Dict[str, int] = {}
+            size_zero = 0
+            for row in frees:
+                seeders = row.get("seeders")
+                bucket = "None" if seeders is None else (
+                    "0" if not str(seeders).strip() or str(seeders) == "0" else "1+")
+                seeder_dist[bucket] = seeder_dist.get(bucket, 0) + 1
+                if not row.get("size"):
+                    size_zero += 1
             report["spider_live"] = {
                 "count": len(live),
-                "free_count": len([r for r in live if r.get("downloadvolumefactor") in (0, 0.0)]),
+                "free_count": len(frees),
                 "factor_distribution": factor_dist,
+                "free_seeders_dist": seeder_dist,
+                "free_size_zero_count": size_zero,
                 "samples": [
                     {"title": (r.get("title") or "")[:50],
                      "dl": r.get("downloadvolumefactor"),
                      "up": r.get("uploadvolumefactor"),
-                     "hr": r.get("hit_and_run")}
-                    for r in live[:3]
+                     "hr": r.get("hit_and_run"),
+                     "seeders": r.get("seeders"),
+                     "size": r.get("size"),
+                     "pubdate": r.get("pubdate")}
+                    for r in frees[:5]
                 ],
             }
     except Exception as err:
