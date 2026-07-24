@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.12"
+    plugin_version = "1.3.13"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -243,6 +243,14 @@ class sitetoolbox(_PluginBase):
                 "auth": "bear",
                 "summary": "检查站点用户数据完整性",
                 "description": "检查站点最新用户数据是否存在错误、缺失或关键字段异常。",
+            },
+            {
+                "path": "/probe/indexer/{site_id}",
+                "endpoint": _api_probe_indexer,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "诊断站点索引器",
+                "description": "分步报告索引器定义、同步/异步抓取和蜘蛛解析结果，定位搜索/刷流拿不到种子的问题。",
             },
             {
                 "path": "/cleanup/missing/preview",
@@ -996,6 +1004,146 @@ def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas
         return f"用户数据检查完成：异常 {bad_count}/{len(results)}"
 
     return plugin._start_background_job("userdata_check", "用户数据检查", worker)
+
+
+def _api_probe_indexer(site_id: int) -> schemas.Response:
+    """
+    诊断站点索引器：索引器定义、同步/异步抓取、蜘蛛解析分步报告。
+    用于定位"站点连通但搜索/刷流拿不到种子"类问题。
+    """
+    import asyncio
+    import traceback as _tb
+
+    site = SiteOper().get(site_id)
+    if not site:
+        return schemas.Response(success=False, message=f"站点 {site_id} 不存在")
+    domain = StringUtils.get_url_domain(site.url)
+    report: Dict[str, Any] = {
+        "site_id": site_id,
+        "site_name": site.name,
+        "domain": domain,
+        "site_proxy": bool(site.proxy),
+    }
+
+    # 1. 索引器定义
+    indexer = None
+    try:
+        indexer = SitesHelper().get_indexer(domain)
+    except Exception as err:
+        report["indexer"] = {"found": False, "error": f"{type(err).__name__}: {err}"}
+    if indexer:
+        torrents_conf = indexer.get("torrents") or {}
+        browse_conf = indexer.get("browse") or {}
+        search_conf = indexer.get("search") or {}
+        report["indexer"] = {
+            "found": True,
+            "id": indexer.get("id"),
+            "name": indexer.get("name"),
+            "schema": indexer.get("schema"),
+            "parser": indexer.get("parser"),
+            "render": indexer.get("render"),
+            "public": indexer.get("public"),
+            "domain": indexer.get("domain"),
+            "search_paths": [p.get("path") for p in (search_conf.get("paths") or []) if isinstance(p, dict)],
+            "browse_path": browse_conf.get("path") if isinstance(browse_conf, dict) else None,
+            "has_torrents_fields": bool(torrents_conf.get("fields")),
+            "torrents_list_selector": (torrents_conf.get("list") or {}).get("selector"),
+        }
+    elif "indexer" not in report:
+        report["indexer"] = {"found": False}
+
+    # 2. 目标 URL：优先索引器搜索路径，否则默认 torrents.php
+    base = (indexer.get("domain") if indexer else None) or site.url or ""
+    if base and not base.endswith("/"):
+        base += "/"
+    paths = ((indexer or {}).get("search") or {}).get("paths") or []
+    path = paths[0].get("path") if paths and isinstance(paths[0], dict) else "torrents.php"
+    target = urljoin(base, path or "torrents.php")
+    report["target_url"] = target
+
+    ua = site.ua or settings.USER_AGENT
+    proxies = settings.PROXY if site.proxy else None
+    timeout = site.timeout or 15
+
+    def _res_summary(res) -> Dict[str, Any]:
+        if res is None:
+            return {"ok": False, "error": "无响应(None)，请求层异常被吞"}
+        text = res.text or ""
+        lower = text.lower()
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
+        return {
+            "ok": res.status_code == 200,
+            "status": res.status_code,
+            "final_url": str(getattr(res, "url", "") or ""),
+            "length": len(text),
+            "logged_in": ("logout.php" in lower or "usercp.php" in lower),
+            "login_wall": ("takelogin" in lower or ("login.php" in lower and "logout.php" not in lower)),
+            "title": title_match.group(1).strip()[:80] if title_match else "",
+        }
+
+    # 3. 同步 requests 抓取
+    sync_html = ""
+    try:
+        res = RequestUtils(cookies=site.cookie, ua=ua, timeout=timeout,
+                           proxies=proxies).get_res(target, allow_redirects=True)
+        report["sync_fetch"] = _res_summary(res)
+        sync_html = res.text if res is not None else ""
+    except Exception as err:
+        report["sync_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
+
+    # 4. 异步 httpx 抓取（直连 httpx，不吞异常，暴露核心异步链路的真实错误）
+    async def _async_probe():
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            return await client.get(target, headers={"User-Agent": ua, "Cookie": site.cookie or ""})
+
+    try:
+        ares = asyncio.run(_async_probe())
+        atext = ares.text or ""
+        alower = atext.lower()
+        report["async_fetch"] = {
+            "ok": ares.status_code == 200,
+            "status": ares.status_code,
+            "final_url": str(ares.url),
+            "length": len(atext),
+            "logged_in": ("logout.php" in alower or "usercp.php" in alower),
+        }
+    except Exception as err:
+        report["async_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
+
+    # 5. 蜘蛛解析（对同步抓到的 HTML 跑解析，隔离"抓取失败"与"解析失败"）
+    probe_indexer = None
+    try:
+        from app.modules.indexer.spider import TorrentSpider
+        if indexer and indexer.get("torrents"):
+            probe_indexer = dict(indexer)
+            probe_indexer.update({"cookie": site.cookie, "ua": ua, "proxy": site.proxy})
+            if sync_html:
+                spider = TorrentSpider(probe_indexer)
+                rows = spider.parse(sync_html)
+                report["spider_parse"] = {
+                    "ok": True,
+                    "count": len(rows or []),
+                    "first_title": (rows[0].get("title") if rows else None),
+                }
+            else:
+                report["spider_parse"] = {"ok": False, "error": "同步抓取无内容，跳过解析"}
+        else:
+            report["spider_parse"] = {"ok": False, "error": "索引器缺失或没有 torrents 字段定义"}
+    except Exception as err:
+        report["spider_parse"] = {"ok": False, "error": f"{type(err).__name__}: {err}",
+                                  "trace": _tb.format_exc()[-800:]}
+
+    # 6. 蜘蛛完整流程（含请求），与核心刷流/搜索同路径
+    try:
+        from app.modules.indexer.spider import TorrentSpider
+        if probe_indexer:
+            live = TorrentSpider(probe_indexer).get_torrents()
+            report["spider_live"] = {"count": len(live or [])}
+    except Exception as err:
+        report["spider_live"] = {"error": f"{type(err).__name__}: {err}"}
+
+    return schemas.Response(success=True, data=report)
 
 
 def _api_preview_missing_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
