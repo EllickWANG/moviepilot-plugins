@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.17"
+    plugin_version = "1.3.18"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -950,6 +950,8 @@ class sitetoolbox(_PluginBase):
             if raw and _asyncfix_domain_match(url, sitetoolbox._asyncfix_raw_cookie_domains):
                 self._headers = {**(self._headers or {}), "Cookie": raw}
                 self._cookies = None
+                sitetoolbox._aru_inject_count = getattr(sitetoolbox, "_aru_inject_count", 0) + 1
+                logger.debug(f"站点工具箱异步Cookie修正已注入：{url}")
             return await orig_request(self, method, url, *args, **kwargs)
 
         AsyncRequestUtils.__init__ = patched_init
@@ -1233,13 +1235,21 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
     try:
         from app.utils.http import AsyncRequestUtils
 
+        aru_obj = AsyncRequestUtils(ua=ua, cookies=site.cookie, timeout=timeout,
+                                    referer=None, proxies=proxies)
+        report["aru_instance"] = {
+            "has_raw_cookie_attr": bool(getattr(aru_obj, "_sitetoolbox_raw_cookie", None)),
+            "init_func": f"{AsyncRequestUtils.__init__.__module__}.{AsyncRequestUtils.__init__.__qualname__}",
+            "request_func": f"{AsyncRequestUtils.request.__module__}.{AsyncRequestUtils.request.__qualname__}",
+            "inject_count_before": getattr(sitetoolbox, "_aru_inject_count", 0),
+        }
+
         async def _aru_probe():
-            return await AsyncRequestUtils(
-                ua=ua, cookies=site.cookie, timeout=timeout,
-                referer=None, proxies=proxies).get_res(target, allow_redirects=True)
+            return await aru_obj.get_res(target, allow_redirects=True)
 
         aru_res = asyncio.run(_aru_probe())
         report["async_requestutils_fetch"] = _res_summary(aru_res)
+        report["aru_instance"]["inject_count_after"] = getattr(sitetoolbox, "_aru_inject_count", 0)
     except Exception as err:
         report["async_requestutils_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}",
                                               "trace": _tb.format_exc()[-600:]}
@@ -1295,11 +1305,26 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
         report["spider_parse"] = {"ok": False, "error": f"{type(err).__name__}: {err}",
                                   "trace": _tb.format_exc()[-800:]}
 
-    # 8. 蜘蛛完整流程（含请求），与核心刷流/搜索同路径
+    # 8. 蜘蛛完整流程（含请求），与核心刷流/搜索同路径；重点报告促销字段解析结果
     try:
         if spider_cls and probe_indexer:
-            live = spider_cls(probe_indexer).get_torrents()
-            report["spider_live"] = {"count": len(live or [])}
+            live = spider_cls(probe_indexer).get_torrents() or []
+            factor_dist: Dict[str, int] = {}
+            for row in live:
+                key = f"dl={row.get('downloadvolumefactor')},up={row.get('uploadvolumefactor')}"
+                factor_dist[key] = factor_dist.get(key, 0) + 1
+            report["spider_live"] = {
+                "count": len(live),
+                "free_count": len([r for r in live if r.get("downloadvolumefactor") in (0, 0.0)]),
+                "factor_distribution": factor_dist,
+                "samples": [
+                    {"title": (r.get("title") or "")[:50],
+                     "dl": r.get("downloadvolumefactor"),
+                     "up": r.get("uploadvolumefactor"),
+                     "hr": r.get("hit_and_run")}
+                    for r in live[:3]
+                ],
+            }
     except Exception as err:
         report["spider_live"] = {"error": f"{type(err).__name__}: {err}"}
 
