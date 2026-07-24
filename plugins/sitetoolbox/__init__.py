@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.20"
+    plugin_version = "1.3.21"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -948,10 +948,27 @@ class sitetoolbox(_PluginBase):
         async def patched_request(self, method, url, *args, **kwargs):
             raw = getattr(self, "_sitetoolbox_raw_cookie", None)
             if raw and _asyncfix_domain_match(url, sitetoolbox._asyncfix_raw_cookie_domains):
-                self._headers = {**(self._headers or {}), "Cookie": raw}
-                self._cookies = None
-                sitetoolbox._aru_inject_count = getattr(sitetoolbox, "_aru_inject_count", 0) + 1
-                logger.debug(f"站点工具箱异步Cookie修正已注入：{url}")
+                # 直连通道：ARU 原生请求特征会被该类站点 WAF 识别为伪装 404，
+                # 这里用裸 httpx + 原始 Cookie 头重发（实测全变体 200），返回同类型 Response
+                import httpx
+                headers = {k: v for k, v in (self._headers or {}).items() if v is not None}
+                headers["Cookie"] = raw
+                try:
+                    async with httpx.AsyncClient(
+                            proxy=getattr(self, "_proxies", None),
+                            timeout=getattr(self, "_timeout", 20),
+                            verify=False,
+                            follow_redirects=True) as client:
+                        res = await client.request(
+                            method, url, headers=headers,
+                            params=kwargs.get("params"),
+                            data=kwargs.get("data"),
+                            json=kwargs.get("json"))
+                    sitetoolbox._aru_inject_count = getattr(sitetoolbox, "_aru_inject_count", 0) + 1
+                    logger.debug(f"站点工具箱异步直连通道：{url} -> {res.status_code}")
+                    return res
+                except Exception as err:
+                    logger.warning(f"站点工具箱异步直连通道失败，回退原生请求：{err}")
             return await orig_request(self, method, url, *args, **kwargs)
 
         AsyncRequestUtils.__init__ = patched_init
