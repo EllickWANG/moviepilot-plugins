@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.19"
+    plugin_version = "1.3.20"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1075,13 +1075,16 @@ def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas
     return plugin._start_background_job("userdata_check", "用户数据检查", worker)
 
 
-def _api_probe_indexer(site_id: int) -> schemas.Response:
+def _api_probe_indexer(site_id: int, steps: Optional[str] = None) -> schemas.Response:
     """
     诊断站点索引器：索引器定义、同步/异步抓取、蜘蛛解析分步报告。
     用于定位"站点连通但搜索/刷流拿不到种子"类问题。
+    steps 可选，逗号分隔按需执行以避免网关超时：fetch, matrix, aru, spider
     """
     import asyncio
     import traceback as _tb
+
+    wanted = set((steps or "fetch,matrix,aru,spider").replace(" ", "").split(","))
 
     site = SiteOper().get(site_id)
     if not site:
@@ -1150,15 +1153,16 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
             "title": title_match.group(1).strip()[:80] if title_match else "",
         }
 
-    # 3. 同步 requests 抓取
+    # 3. 同步 requests 抓取（spider 步骤也依赖它的 HTML）
     sync_html = ""
-    try:
-        res = RequestUtils(cookies=site.cookie, ua=ua, timeout=timeout,
-                           proxies=proxies).get_res(target, allow_redirects=True)
-        report["sync_fetch"] = _res_summary(res)
-        sync_html = res.text if res is not None else ""
-    except Exception as err:
-        report["sync_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
+    if wanted & {"fetch", "spider"}:
+        try:
+            res = RequestUtils(cookies=site.cookie, ua=ua, timeout=timeout,
+                               proxies=proxies).get_res(target, allow_redirects=True)
+            report["sync_fetch"] = _res_summary(res)
+            sync_html = res.text if res is not None else ""
+        except Exception as err:
+            report["sync_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
 
     # 4. 异步 httpx 抓取（直连 httpx，不吞异常，暴露核心异步链路的真实错误）
     async def _async_probe():
@@ -1166,19 +1170,20 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             return await client.get(target, headers={"User-Agent": ua, "Cookie": site.cookie or ""})
 
-    try:
-        ares = asyncio.run(_async_probe())
-        atext = ares.text or ""
-        alower = atext.lower()
-        report["async_fetch"] = {
-            "ok": ares.status_code == 200,
-            "status": ares.status_code,
-            "final_url": str(ares.url),
-            "length": len(atext),
-            "logged_in": ("logout.php" in alower or "usercp.php" in alower),
-        }
-    except Exception as err:
-        report["async_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
+    if "fetch" in wanted:
+        try:
+            ares = asyncio.run(_async_probe())
+            atext = ares.text or ""
+            alower = atext.lower()
+            report["async_fetch"] = {
+                "ok": ares.status_code == 200,
+                "status": ares.status_code,
+                "final_url": str(ares.url),
+                "length": len(atext),
+                "logged_in": ("logout.php" in alower or "usercp.php" in alower),
+            }
+        except Exception as err:
+            report["async_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
 
     # 4.5 httpx 请求特征矩阵：定位站点 WAF 对异步请求 404 的触发因子
     async def _matrix_probe(verify: bool, with_content_type: bool):
@@ -1192,14 +1197,15 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
             return res.status_code, len(res.text or "")
 
     matrix = {}
-    for verify_flag in (True, False):
-        for ct_flag in (True, False):
-            key = f"verify={verify_flag},content_type={ct_flag}"
-            try:
-                status, length = asyncio.run(_matrix_probe(verify_flag, ct_flag))
-                matrix[key] = {"status": status, "length": length}
-            except Exception as err:
-                matrix[key] = {"error": f"{type(err).__name__}: {err}"}
+    if "matrix" in wanted:
+        for verify_flag in (True, False):
+            for ct_flag in (True, False):
+                key = f"verify={verify_flag},content_type={ct_flag}"
+                try:
+                    status, length = asyncio.run(_matrix_probe(verify_flag, ct_flag))
+                    matrix[key] = {"status": status, "length": length}
+                except Exception as err:
+                    matrix[key] = {"error": f"{type(err).__name__}: {err}"}
 
     # 追加变体：UA 插件后缀 / 完整 ARU 头组合
     async def _matrix_probe_headers(headers: dict, verify: bool):
@@ -1216,13 +1222,6 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
                                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                                "Cookie": site.cookie or ""}, False),
     }
-    for key, (variant_headers, verify_flag) in extra_variants.items():
-        try:
-            status, length = asyncio.run(_matrix_probe_headers(variant_headers, verify_flag))
-            matrix[key] = {"status": status, "length": length}
-        except Exception as err:
-            matrix[key] = {"error": f"{type(err).__name__}: {err}"}
-
     # http2 变体（v2.14 ARU 可能启用 http2，ALPN 指纹不同）
     async def _matrix_probe_http2():
         import httpx
@@ -1232,12 +1231,19 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
                                                     "Cookie": site.cookie or ""})
             return res.status_code, len(res.text or ""), str(res.http_version)
 
-    try:
-        status, length, http_version = asyncio.run(_matrix_probe_http2())
-        matrix["http2"] = {"status": status, "length": length, "http_version": http_version}
-    except Exception as err:
-        matrix["http2"] = {"error": f"{type(err).__name__}: {err}"}
-    report["httpx_matrix"] = matrix
+    if "matrix" in wanted:
+        for key, (variant_headers, verify_flag) in extra_variants.items():
+            try:
+                status, length = asyncio.run(_matrix_probe_headers(variant_headers, verify_flag))
+                matrix[key] = {"status": status, "length": length}
+            except Exception as err:
+                matrix[key] = {"error": f"{type(err).__name__}: {err}"}
+        try:
+            status, length, http_version = asyncio.run(_matrix_probe_http2())
+            matrix["http2"] = {"status": status, "length": length, "http_version": http_version}
+        except Exception as err:
+            matrix["http2"] = {"error": f"{type(err).__name__}: {err}"}
+        report["httpx_matrix"] = matrix
 
     # asyncfix 补丁挂载状态自检
     report["asyncfix_status"] = {
@@ -1247,7 +1253,10 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
     }
 
     # 5. AsyncRequestUtils 原样复刻（与核心 async_get_torrents 完全相同的调用方式）
-    try:
+    if "aru" not in wanted:
+        pass
+    else:
+      try:
         from app.utils.http import AsyncRequestUtils
 
         aru_obj = AsyncRequestUtils(ua=ua, cookies=site.cookie, timeout=timeout,
@@ -1265,7 +1274,7 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
         aru_res = asyncio.run(_aru_probe())
         report["async_requestutils_fetch"] = _res_summary(aru_res)
         report["aru_instance"]["inject_count_after"] = getattr(sitetoolbox, "_aru_inject_count", 0)
-    except Exception as err:
+      except Exception as err:
         report["async_requestutils_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}",
                                               "trace": _tb.format_exc()[-600:]}
 
@@ -1296,6 +1305,8 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
     # 7. 蜘蛛解析（对同步抓到的 HTML 跑解析，隔离"抓取失败"与"解析失败"）
     probe_indexer = None
     spider_cls = None
+    if "spider" not in wanted:
+        return schemas.Response(success=True, data=report)
     try:
         spider_cls, spider_names = _find_spider_cls()
         report["spider_class"] = {"picked": spider_cls.__name__ if spider_cls else None,
