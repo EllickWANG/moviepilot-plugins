@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.13"
+    plugin_version = "1.3.14"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1111,15 +1111,57 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
     except Exception as err:
         report["async_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
 
-    # 5. 蜘蛛解析（对同步抓到的 HTML 跑解析，隔离"抓取失败"与"解析失败"）
-    probe_indexer = None
+    # 5. AsyncRequestUtils 原样复刻（与核心 async_get_torrents 完全相同的调用方式）
     try:
-        from app.modules.indexer.spider import TorrentSpider
-        if indexer and indexer.get("torrents"):
+        from app.utils.http import AsyncRequestUtils
+
+        async def _aru_probe():
+            return await AsyncRequestUtils(
+                ua=ua, cookies=site.cookie, timeout=timeout,
+                referer=None, proxies=proxies).get_res(target, allow_redirects=True)
+
+        aru_res = asyncio.run(_aru_probe())
+        report["async_requestutils_fetch"] = _res_summary(aru_res)
+    except Exception as err:
+        report["async_requestutils_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}",
+                                              "trace": _tb.format_exc()[-600:]}
+
+    # 6. 动态发现蜘蛛类（v2.10 为 TorrentSpider，v2.14 可能改名/移位）
+    def _find_spider_cls():
+        import app.modules.indexer.spider as spider_pkg
+        candidates = []
+        for attr in dir(spider_pkg):
+            obj = getattr(spider_pkg, attr, None)
+            if isinstance(obj, type) and hasattr(obj, "get_torrents"):
+                candidates.append(obj)
+        for cls in candidates:
+            if cls.__name__ == "TorrentSpider":
+                return cls, [c.__name__ for c in candidates]
+        for module_info in pkgutil.iter_modules(spider_pkg.__path__):
+            try:
+                mod = importlib.import_module(f"app.modules.indexer.spider.{module_info.name}")
+            except Exception:
+                continue
+            for attr in dir(mod):
+                obj = getattr(mod, attr, None)
+                if isinstance(obj, type) and attr == "TorrentSpider" and hasattr(obj, "get_torrents"):
+                    return obj, [attr]
+                if isinstance(obj, type) and hasattr(obj, "get_torrents") and hasattr(obj, "parse"):
+                    candidates.append(obj)
+        return (candidates[0], [c.__name__ for c in candidates]) if candidates else (None, [])
+
+    # 7. 蜘蛛解析（对同步抓到的 HTML 跑解析，隔离"抓取失败"与"解析失败"）
+    probe_indexer = None
+    spider_cls = None
+    try:
+        spider_cls, spider_names = _find_spider_cls()
+        report["spider_class"] = {"picked": spider_cls.__name__ if spider_cls else None,
+                                  "candidates": spider_names}
+        if spider_cls and indexer and indexer.get("torrents"):
             probe_indexer = dict(indexer)
             probe_indexer.update({"cookie": site.cookie, "ua": ua, "proxy": site.proxy})
             if sync_html:
-                spider = TorrentSpider(probe_indexer)
+                spider = spider_cls(probe_indexer)
                 rows = spider.parse(sync_html)
                 report["spider_parse"] = {
                     "ok": True,
@@ -1129,16 +1171,16 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
             else:
                 report["spider_parse"] = {"ok": False, "error": "同步抓取无内容，跳过解析"}
         else:
-            report["spider_parse"] = {"ok": False, "error": "索引器缺失或没有 torrents 字段定义"}
+            report["spider_parse"] = {"ok": False,
+                                      "error": "未找到蜘蛛类" if not spider_cls else "索引器缺失或没有 torrents 字段定义"}
     except Exception as err:
         report["spider_parse"] = {"ok": False, "error": f"{type(err).__name__}: {err}",
                                   "trace": _tb.format_exc()[-800:]}
 
-    # 6. 蜘蛛完整流程（含请求），与核心刷流/搜索同路径
+    # 8. 蜘蛛完整流程（含请求），与核心刷流/搜索同路径
     try:
-        from app.modules.indexer.spider import TorrentSpider
-        if probe_indexer:
-            live = TorrentSpider(probe_indexer).get_torrents()
+        if spider_cls and probe_indexer:
+            live = spider_cls(probe_indexer).get_torrents()
             report["spider_live"] = {"count": len(live or [])}
     except Exception as err:
         report["spider_live"] = {"error": f"{type(err).__name__}: {err}"}
