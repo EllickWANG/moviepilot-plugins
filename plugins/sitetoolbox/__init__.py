@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.15"
+    plugin_version = "1.3.16"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1177,6 +1177,28 @@ def _api_probe_indexer(site_id: int) -> schemas.Response:
         }
     except Exception as err:
         report["async_fetch"] = {"ok": False, "error": f"{type(err).__name__}: {err}"}
+
+    # 4.5 httpx 请求特征矩阵：定位站点 WAF 对异步请求 404 的触发因子
+    async def _matrix_probe(verify: bool, with_content_type: bool):
+        import httpx
+        headers = {"User-Agent": ua, "Cookie": site.cookie or ""}
+        if with_content_type:
+            headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                     verify=verify) as client:
+            res = await client.get(target, headers=headers)
+            return res.status_code, len(res.text or "")
+
+    matrix = {}
+    for verify_flag in (True, False):
+        for ct_flag in (True, False):
+            key = f"verify={verify_flag},content_type={ct_flag}"
+            try:
+                status, length = asyncio.run(_matrix_probe(verify_flag, ct_flag))
+                matrix[key] = {"status": status, "length": length}
+            except Exception as err:
+                matrix[key] = {"error": f"{type(err).__name__}: {err}"}
+    report["httpx_matrix"] = matrix
 
     # 5. AsyncRequestUtils 原样复刻（与核心 async_get_torrents 完全相同的调用方式）
     try:
