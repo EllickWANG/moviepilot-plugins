@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.22"
+    plugin_version = "1.3.23"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -272,6 +272,14 @@ class sitetoolbox(_PluginBase):
                 "auth": "bear",
                 "summary": "按时间窗/关键字读取日志",
                 "description": "读取任意日志文件的历史段落（系统日志接口只能看尾部），支持时间窗与正则过滤。",
+            },
+            {
+                "path": "/probe/alembic",
+                "endpoint": _api_probe_alembic,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "诊断数据库迁移状态",
+                "description": "报告 alembic_version 表与迁移文件链 head，定位启动时数据库更新失败。",
             },
             {
                 "path": "/cleanup/missing/preview",
@@ -1456,6 +1464,53 @@ def _api_probe_logfile(logfile: str, keyword: Optional[str] = None,
         "file": str(path), "scanned_lines": scanned,
         "matched": len(matched), "truncated": truncated, "lines": matched,
     })
+
+
+def _api_probe_alembic() -> schemas.Response:
+    """
+    诊断数据库迁移状态：alembic_version 表内容 vs 迁移文件链的 head。
+    用于定位启动时"数据库更新失败：Multiple head revisions"。
+    """
+    from pathlib import Path as _Path
+
+    report: Dict[str, Any] = {}
+    # 1. 数据库中的版本记录
+    try:
+        from sqlalchemy import text as _text
+        from app.db import Engine
+        with Engine.connect() as conn:
+            rows = conn.execute(_text("SELECT version_num FROM alembic_version")).fetchall()
+        report["db_version_rows"] = [r[0] for r in rows]
+    except Exception as err:
+        report["db_version_rows_error"] = f"{type(err).__name__}: {err}"
+
+    # 2. 迁移文件链
+    try:
+        versions_dir = _Path(settings.ROOT_PATH) / "database" / "versions"
+        revisions: Dict[str, Optional[str]] = {}
+        for f in versions_dir.glob("*.py"):
+            content = f.read_text(encoding="utf-8", errors="ignore")
+            rev = re.search(r"^revision\s*=\s*['\"]([^'\"]+)['\"]", content, re.M)
+            down = re.search(r"^down_revision\s*=\s*['\"]([^'\"]+)['\"]", content, re.M)
+            if rev:
+                revisions[rev.group(1)] = down.group(1) if down else None
+        referenced = {d for d in revisions.values() if d}
+        heads = [r for r in revisions if r not in referenced]
+        report["versions_dir"] = str(versions_dir)
+        report["revision_count"] = len(revisions)
+        report["heads"] = heads
+        # head 对应文件名
+        head_files = {}
+        for f in versions_dir.glob("*.py"):
+            content = f.read_text(encoding="utf-8", errors="ignore")
+            for h in heads:
+                if re.search(rf"^revision\s*=\s*['\"]{re.escape(h)}['\"]", content, re.M):
+                    head_files[h] = f.name
+        report["head_files"] = head_files
+    except Exception as err:
+        report["versions_error"] = f"{type(err).__name__}: {err}"
+
+    return schemas.Response(success=True, data=report)
 
 
 def _api_preview_missing_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
