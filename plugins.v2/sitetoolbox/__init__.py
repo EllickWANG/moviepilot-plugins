@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.21"
+    plugin_version = "1.3.22"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -264,6 +264,14 @@ class sitetoolbox(_PluginBase):
                 "auth": "bear",
                 "summary": "诊断站点索引器",
                 "description": "分步报告索引器定义、同步/异步抓取和蜘蛛解析结果，定位搜索/刷流拿不到种子的问题。",
+            },
+            {
+                "path": "/probe/logfile",
+                "endpoint": _api_probe_logfile,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "按时间窗/关键字读取日志",
+                "description": "读取任意日志文件的历史段落（系统日志接口只能看尾部），支持时间窗与正则过滤。",
             },
             {
                 "path": "/cleanup/missing/preview",
@@ -1387,6 +1395,67 @@ def _api_probe_indexer(site_id: int, steps: Optional[str] = None) -> schemas.Res
         report["spider_live"] = {"error": f"{type(err).__name__}: {err}"}
 
     return schemas.Response(success=True, data=report)
+
+
+def _api_probe_logfile(logfile: str, keyword: Optional[str] = None,
+                       start: Optional[str] = None, end: Optional[str] = None,
+                       max_lines: int = 300) -> schemas.Response:
+    """
+    读取日志文件并按时间窗/关键字过滤（系统日志接口只能看尾部，这个探针可以挖历史段落）。
+    :param logfile: 相对 LOG_PATH 的文件名，如 moviepilot.log 或 plugins/xxx.log
+    :param keyword: 可选正则，命中才返回
+    :param start/end: 可选时间过滤，格式 "2026-07-25 02:00"（按行内时间戳前缀比较）
+    """
+    from pathlib import Path as _Path
+
+    base = _Path(settings.LOG_PATH).resolve()
+    path = (base / logfile).resolve()
+    if not str(path).startswith(str(base)):
+        return schemas.Response(success=False, message="非法路径")
+    if not path.exists():
+        return schemas.Response(success=False, message=f"日志不存在：{logfile}")
+
+    ts_re = re.compile(r"】(\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
+    kw_re = None
+    if keyword:
+        try:
+            kw_re = re.compile(keyword)
+        except re.error:
+            return schemas.Response(success=False, message="keyword 正则错误")
+
+    matched: List[str] = []
+    scanned = 0
+    truncated = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                scanned += 1
+                if scanned > 2_000_000:
+                    truncated = True
+                    break
+                if start or end:
+                    m = ts_re.search(line[:40])
+                    if m:
+                        ts = m.group(1)
+                        if start and ts < start:
+                            continue
+                        if end and ts > end:
+                            continue
+                    elif start or end:
+                        continue
+                if kw_re and not kw_re.search(line):
+                    continue
+                matched.append(line.rstrip("\n")[:500])
+                if len(matched) >= max_lines:
+                    truncated = True
+                    break
+    except Exception as err:
+        return schemas.Response(success=False, message=f"读取失败：{err}")
+
+    return schemas.Response(success=True, data={
+        "file": str(path), "scanned_lines": scanned,
+        "matched": len(matched), "truncated": truncated, "lines": matched,
+    })
 
 
 def _api_preview_missing_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
