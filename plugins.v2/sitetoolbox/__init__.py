@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.23"
+    plugin_version = "1.3.24"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1466,7 +1466,7 @@ def _api_probe_logfile(logfile: str, keyword: Optional[str] = None,
     })
 
 
-def _api_probe_alembic() -> schemas.Response:
+def _api_probe_alembic(detail: Optional[bool] = False) -> schemas.Response:
     """
     诊断数据库迁移状态：alembic_version 表内容 vs 迁移文件链的 head。
     用于定位启动时"数据库更新失败：Multiple head revisions"。
@@ -1507,6 +1507,18 @@ def _api_probe_alembic() -> schemas.Response:
                 if re.search(rf"^revision\s*=\s*['\"]{re.escape(h)}['\"]", content, re.M):
                     head_files[h] = f.name
         report["head_files"] = head_files
+
+        if detail:
+            details = {}
+            for h, fname in head_files.items():
+                fp = versions_dir / fname
+                st = fp.stat()
+                details[fname] = {
+                    "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+                    "size": st.st_size,
+                    "content": fp.read_text(encoding="utf-8", errors="ignore")[:4000],
+                }
+            report["head_file_details"] = details
     except Exception as err:
         report["versions_error"] = f"{type(err).__name__}: {err}"
 
