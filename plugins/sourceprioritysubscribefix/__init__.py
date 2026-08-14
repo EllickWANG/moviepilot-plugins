@@ -67,7 +67,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.5"
+    plugin_version = "1.2.6"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -797,6 +797,43 @@ def _normalize_bangumi_image_urls(value: Any) -> Any:
     return value
 
 
+def _bangumi_id_from_media_payload(data: dict) -> Optional[int]:
+    bangumi_info = data.get("bangumi_info")
+    return _int_or_none(
+        data.get("bangumi_id")
+        or data.get("bangumiid")
+        or ((bangumi_info or {}).get("id") if isinstance(bangumi_info, dict) else None)
+    )
+
+
+def _with_bangumi_calendar_identity(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    data = dict(item)
+    bangumiid = _bangumi_id_from_media_payload(data)
+    if not bangumiid:
+        return data
+    calendar_tmdbid = _bangumi_calendar_tmdbid(bangumiid)
+    data["source"] = data.get("source") or "bangumi"
+    data["bangumi_id"] = data.get("bangumi_id") or bangumiid
+    data["bangumiid"] = data.get("bangumiid") or bangumiid
+    data["mediaid_prefix"] = "bangumi"
+    data["media_id"] = str(bangumiid)
+    data["mediaid"] = f"bangumi:{bangumiid}"
+    if calendar_tmdbid:
+        # 前端部分入口只识别 tmdb_id；用负数伪 ID 保留外部源身份，避免标题回落到 TMDB。
+        data["tmdb_id"] = calendar_tmdbid
+        data["tmdbid"] = calendar_tmdbid
+    return data
+
+
+def _normalize_bangumi_calendar_payload(items: Any) -> Any:
+    items = _normalize_bangumi_image_urls(items)
+    if isinstance(items, list):
+        return [_with_bangumi_calendar_identity(item) for item in items]
+    return _with_bangumi_calendar_identity(items)
+
+
 def _patched_media_get_message_image(self: MediaInfo, default: Optional[bool] = None):
     return _external_proxy_image_url(
         sourceprioritysubscribefix._originals["media_get_message_image"](self, default=default)
@@ -817,7 +854,7 @@ def _patched_recommend_bangumi_calendar(
     items = sourceprioritysubscribefix._originals["recommend_bangumi_calendar"](
         self, page=page, count=count
     )
-    return _normalize_bangumi_image_urls(items)
+    return _normalize_bangumi_calendar_payload(items)
 
 
 async def _patched_recommend_async_bangumi_calendar(
@@ -828,7 +865,7 @@ async def _patched_recommend_async_bangumi_calendar(
     items = await sourceprioritysubscribefix._originals["recommend_async_bangumi_calendar"](
         self, page=page, count=count
     )
-    return _normalize_bangumi_image_urls(items)
+    return _normalize_bangumi_calendar_payload(items)
 
 
 def _patched_media_download_and_save_image(self: MediaChain, fileitem: schemas.FileItem,
@@ -5106,6 +5143,27 @@ def _media_seasons_from_info(mediainfo: MediaInfo, season: Optional[int] = None)
     return seasons_info
 
 
+def _bangumi_media_seasons_from_info(mediainfo: MediaInfo, season: Optional[int] = None) -> List[schemas.MediaSeason]:
+    seasons_info = _media_seasons_from_info(mediainfo, season=season)
+    if seasons_info or not mediainfo:
+        return seasons_info
+    season_number = season if season is not None else (mediainfo.season if mediainfo.season is not None else 1)
+    episodes = (mediainfo.seasons or {}).get(season_number) or []
+    episode_count = len(episodes) or mediainfo.number_of_episodes
+    bangumi_info = getattr(mediainfo, "bangumi_info", None) or {}
+    if not episode_count and isinstance(bangumi_info, dict):
+        episode_count = _int_or_none(bangumi_info.get("total_episodes"))
+    return [schemas.MediaSeason(
+        season_number=season_number,
+        poster_path=_season_poster_path(mediainfo.poster_path),
+        name=f"第 {season_number} 季",
+        air_date=mediainfo.release_date,
+        overview=mediainfo.overview,
+        vote_average=mediainfo.vote_average,
+        episode_count=episode_count,
+    )]
+
+
 async def _patched_media_seasons(mediaid: Optional[str] = None,
                                  title: Optional[str] = None,
                                  year: str = None,
@@ -5124,9 +5182,7 @@ async def _patched_media_seasons(mediaid: Optional[str] = None,
                 return seasons_info
         elif mediaid.startswith("bangumi:") and mediaid[8:].isdigit():
             mediainfo = await mediachain.async_recognize_media(bangumiid=int(mediaid[8:]), mtype=MediaType.TV)
-            seasons_info = _media_seasons_from_info(mediainfo, season=season)
-            if seasons_info:
-                return seasons_info
+            return _bangumi_media_seasons_from_info(mediainfo, season=season)
     if title:
         meta = MetaInfo(title)
         if year:
