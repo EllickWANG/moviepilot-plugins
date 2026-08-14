@@ -67,7 +67,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.7"
+    plugin_version = "1.2.8"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -223,6 +223,7 @@ class sourceprioritysubscribefix(_PluginBase):
             "search_async_process_stream": SearchChain.async_process_stream,
             "download_single": DownloadChain.download_single,
             "media_download_save_image": MediaChain._download_and_save_image,
+            "media_to_dict": MediaInfo.to_dict,
             "media_get_message_image": MediaInfo.get_message_image,
             "media_get_poster_image": MediaInfo.get_poster_image,
             "recommend_bangumi_calendar": RecommendChain.bangumi_calendar,
@@ -258,6 +259,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process_stream = _patched_search_async_process_stream
         DownloadChain.download_single = _patched_download_single
         MediaChain._download_and_save_image = _patched_media_download_and_save_image
+        MediaInfo.to_dict = _patched_media_to_dict
         MediaInfo.get_message_image = _patched_media_get_message_image
         MediaInfo.get_poster_image = _patched_media_get_poster_image
         RecommendChain.bangumi_calendar = _patched_recommend_bangumi_calendar
@@ -304,6 +306,7 @@ class sourceprioritysubscribefix(_PluginBase):
         SearchChain.async_process_stream = cls._originals["search_async_process_stream"]
         DownloadChain.download_single = cls._originals["download_single"]
         MediaChain._download_and_save_image = cls._originals["media_download_save_image"]
+        MediaInfo.to_dict = cls._originals["media_to_dict"]
         MediaInfo.get_message_image = cls._originals["media_get_message_image"]
         MediaInfo.get_poster_image = cls._originals["media_get_poster_image"]
         RecommendChain.bangumi_calendar = cls._originals["recommend_bangumi_calendar"]
@@ -838,6 +841,13 @@ def _patched_media_get_message_image(self: MediaInfo, default: Optional[bool] = 
     return _external_proxy_image_url(
         sourceprioritysubscribefix._originals["media_get_message_image"](self, default=default)
     )
+
+
+def _patched_media_to_dict(self: MediaInfo) -> dict:
+    data = sourceprioritysubscribefix._originals["media_to_dict"](self)
+    if data.get("source") != "bangumi" or not data.get("bangumi_id"):
+        return data
+    return _with_bangumi_calendar_identity(_normalize_bangumi_image_urls(data))
 
 
 def _patched_media_get_poster_image(self: MediaInfo, default: Optional[bool] = None):
