@@ -756,16 +756,26 @@ def _public_base_url() -> str:
     return domain
 
 
-def _douban_proxy_image_url(url: Any) -> Any:
+def _external_proxy_image_url(url: Any) -> Any:
     """
-    豆瓣图床防盗链，微信等外部服务拉不到图，改走插件自带的公网图片代理。
+    外部图床在移动端/通知端可能防盗链或直连失败，改走插件自带的公网图片代理。
     """
-    if not url or "doubanio.com" not in str(url):
+    if not url:
+        return url
+    url = _https_bangumi_image_url(url)
+    url_text = str(url)
+    if "/api/v1/plugin/sourceprioritysubscribefix/img" in url_text:
+        return url
+    if not ("doubanio.com" in url_text or "lain.bgm.tv" in url_text):
         return url
     return (
         f"{_public_base_url()}/api/v1/plugin/sourceprioritysubscribefix/img"
-        f"?apikey={settings.API_TOKEN}&url={quote(str(url), safe='')}"
+        f"?apikey={settings.API_TOKEN}&url={quote(url_text, safe='')}"
     )
+
+
+def _douban_proxy_image_url(url: Any) -> Any:
+    return _external_proxy_image_url(url)
 
 
 def _https_bangumi_image_url(url: Any) -> Any:
@@ -776,7 +786,7 @@ def _https_bangumi_image_url(url: Any) -> Any:
 
 def _normalize_bangumi_image_urls(value: Any) -> Any:
     if isinstance(value, str):
-        return _https_bangumi_image_url(value)
+        return _external_proxy_image_url(value)
     if isinstance(value, list):
         return [_normalize_bangumi_image_urls(item) for item in value]
     if isinstance(value, dict):
@@ -788,18 +798,14 @@ def _normalize_bangumi_image_urls(value: Any) -> Any:
 
 
 def _patched_media_get_message_image(self: MediaInfo, default: Optional[bool] = None):
-    return _https_bangumi_image_url(
-        _douban_proxy_image_url(
-            sourceprioritysubscribefix._originals["media_get_message_image"](self, default=default)
-        )
+    return _external_proxy_image_url(
+        sourceprioritysubscribefix._originals["media_get_message_image"](self, default=default)
     )
 
 
 def _patched_media_get_poster_image(self: MediaInfo, default: Optional[bool] = None):
-    return _https_bangumi_image_url(
-        _douban_proxy_image_url(
-            sourceprioritysubscribefix._originals["media_get_poster_image"](self, default=default)
-        )
+    return _external_proxy_image_url(
+        sourceprioritysubscribefix._originals["media_get_poster_image"](self, default=default)
     )
 
 
@@ -838,19 +844,26 @@ def _patched_media_download_and_save_image(self: MediaChain, fileitem: schemas.F
 
 def _plugin_douban_image_proxy(url: str) -> Any:
     """
-    豆瓣图片公网代理（apikey 鉴权），仅允许豆瓣图床域名。
+    图片公网代理（apikey 鉴权），仅允许已知图床域名。
     """
-    if not re.match(r"^https?://img\d*\.doubanio\.com/", url or ""):
+    url = _https_bangumi_image_url(url)
+    if re.match(r"^https?://img\d*\.doubanio\.com/", url or ""):
+        referer = "https://movie.douban.com/"
+        source_name = "豆瓣"
+    elif re.match(r"^https://lain\.bgm\.tv/", url or ""):
+        referer = "https://bgm.tv/"
+        source_name = "Bangumi"
+    else:
         return schemas.Response(success=False, message="不支持的图片地址")
     try:
         res = RequestUtils(
             ua=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
-            referer="https://movie.douban.com/",
+            referer=referer,
             timeout=15,
         ).get_res(url)
     except Exception as err:
-        logger.warn(f"豆瓣图片代理获取失败：{url} - {err}")
+        logger.warn(f"{source_name}图片代理获取失败：{url} - {err}")
         res = None
     if not res or not res.content:
         return schemas.Response(success=False, message="图片获取失败")
