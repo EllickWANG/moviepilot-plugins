@@ -67,7 +67,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.8"
+    plugin_version = "1.2.9"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -847,6 +847,14 @@ def _patched_media_to_dict(self: MediaInfo) -> dict:
     data = sourceprioritysubscribefix._originals["media_to_dict"](self)
     if data.get("source") != "bangumi" or not data.get("bangumi_id"):
         return data
+    subject_type = (getattr(self, "bangumi_info", None) or {}).get("type")
+    if subject_type and subject_type != 2:
+        data["type"] = MediaType.UNKNOWN.value
+        data["tmdb_id"] = None
+        data["tmdbid"] = None
+        data["seasons"] = {}
+        data["season_info"] = []
+        return _normalize_bangumi_image_urls(data)
     return _with_bangumi_calendar_identity(_normalize_bangumi_image_urls(data))
 
 
@@ -1572,6 +1580,13 @@ def _infer_bangumi_media_category(mediainfo: MediaInfo) -> Optional[str]:
 
 def _mark_bangumi_media_ready(mediainfo: Optional[MediaInfo]) -> Optional[MediaInfo]:
     if not mediainfo or not mediainfo.bangumi_id or mediainfo.tmdb_id or mediainfo.douban_id:
+        return mediainfo
+    subject_type = (mediainfo.bangumi_info or {}).get("type")
+    if subject_type and subject_type != 2:
+        mediainfo.type = MediaType.UNKNOWN
+        mediainfo.seasons = {}
+        mediainfo.season_info = []
+        mediainfo.number_of_episodes = None
         return mediainfo
     if mediainfo.type == MediaType.TV and mediainfo.year and not mediainfo.season_years:
         season = mediainfo.season
@@ -5173,10 +5188,12 @@ def _bangumi_media_seasons_from_info(mediainfo: MediaInfo, season: Optional[int]
     seasons_info = _media_seasons_from_info(mediainfo, season=season)
     if seasons_info or not mediainfo:
         return seasons_info
+    bangumi_info = getattr(mediainfo, "bangumi_info", None) or {}
+    if isinstance(bangumi_info, dict) and bangumi_info.get("type") and bangumi_info.get("type") != 2:
+        return []
     season_number = season if season is not None else (mediainfo.season if mediainfo.season is not None else 1)
     episodes = (mediainfo.seasons or {}).get(season_number) or []
     episode_count = len(episodes) or mediainfo.number_of_episodes
-    bangumi_info = getattr(mediainfo, "bangumi_info", None) or {}
     if not episode_count and isinstance(bangumi_info, dict):
         episode_count = _int_or_none(bangumi_info.get("total_episodes"))
     return [schemas.MediaSeason(
