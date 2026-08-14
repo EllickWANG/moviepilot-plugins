@@ -67,7 +67,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.9"
+    plugin_version = "1.2.10"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -91,11 +91,14 @@ class sourceprioritysubscribefix(_PluginBase):
     _original_tmdb_episode_routes: list[Any] = []
     _original_tmdb_episode_route_index: Optional[int] = None
     _plugin_tmdb_episode_route_registered = False
+    _qbit_scheme_patched = False
+    _qbit_client_original_init: Optional[Any] = None
 
     def init_plugin(self, config: dict = None):
         config = config or {}
         self._enabled = bool(config.get("enabled", True))
         if self._enabled:
+            self._patch_qbittorrent_scheme()
             self._patch()
         else:
             self._unpatch()
@@ -205,6 +208,69 @@ class sourceprioritysubscribefix(_PluginBase):
 
     def stop_service(self):
         self._unpatch()
+        self._unpatch_qbittorrent_scheme()
+
+    @classmethod
+    def _patch_qbittorrent_scheme(cls):
+        if cls._qbit_scheme_patched:
+            cls._reconnect_https_qbittorrent()
+            return
+        try:
+            from qbittorrentapi.client import Client
+        except Exception as err:
+            logger.warning(f"qBittorrent HTTPS 协议修复跳过，无法导入 qbittorrentapi：{err}")
+            return
+
+        original_init = Client.__init__
+
+        if getattr(original_init, "_sourceprioritysubscribefix_qbit_scheme", False):
+            cls._qbit_scheme_patched = True
+            cls._reconnect_https_qbittorrent()
+            return
+
+        def _patched_client_init(self, *args, **kwargs):
+            kwargs.setdefault("FORCE_SCHEME_FROM_HOST", True)
+            return original_init(self, *args, **kwargs)
+
+        _patched_client_init._sourceprioritysubscribefix_qbit_scheme = True
+        cls._qbit_client_original_init = original_init
+        Client.__init__ = _patched_client_init
+        cls._qbit_scheme_patched = True
+        logger.info("已启用 qBittorrent HTTPS 协议修复")
+        cls._reconnect_https_qbittorrent()
+
+    @classmethod
+    def _unpatch_qbittorrent_scheme(cls):
+        if not cls._qbit_scheme_patched or not cls._qbit_client_original_init:
+            return
+        try:
+            from qbittorrentapi.client import Client
+            Client.__init__ = cls._qbit_client_original_init
+        except Exception as err:
+            logger.warning(f"qBittorrent HTTPS 协议修复还原失败：{err}")
+        cls._qbit_client_original_init = None
+        cls._qbit_scheme_patched = False
+
+    @staticmethod
+    def _reconnect_https_qbittorrent():
+        try:
+            from app.core.module import ModuleManager
+        except Exception as err:
+            logger.warning(f"qBittorrent HTTPS 协议修复无法刷新下载器实例：{err}")
+            return
+
+        for module in ModuleManager().get_running_type_modules(ModuleType.Downloader):
+            if not module or getattr(module, "get_name", lambda: "")() != "Qbittorrent":
+                continue
+            for name, server in (module.get_instances() or {}).items():
+                host = str(getattr(server, "_host", "") or "")
+                if not host.startswith("https://"):
+                    continue
+                try:
+                    server.reconnect()
+                    logger.info(f"已刷新 HTTPS qBittorrent 下载器连接：{name}")
+                except Exception as err:
+                    logger.warning(f"刷新 HTTPS qBittorrent 下载器连接失败：{name} - {err}")
 
     @classmethod
     def _patch(cls):

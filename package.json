@@ -11,7 +11,7 @@
   "sourceprioritysubscribefix": {
     "name": "订阅外部源优先",
     "description": "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。",
-    "version": "1.2.9",
+    "version": "1.2.10",
     "icon": "mdi-heart-cog",
     "author": "Ellick",
     "level": 1,
