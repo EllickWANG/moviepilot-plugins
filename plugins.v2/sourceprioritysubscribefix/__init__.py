@@ -23,6 +23,7 @@ from app.chain import ChainBase
 from app.chain.download import DownloadChain
 from app.chain.mediaserver import MediaServerChain
 from app.chain.media import MediaChain
+from app.chain.recommend import RecommendChain
 from app.chain.search import SearchChain
 from app.chain.storage import StorageChain
 from app.chain.subscribe import SubscribeChain
@@ -66,7 +67,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -224,6 +225,8 @@ class sourceprioritysubscribefix(_PluginBase):
             "media_download_save_image": MediaChain._download_and_save_image,
             "media_get_message_image": MediaInfo.get_message_image,
             "media_get_poster_image": MediaInfo.get_poster_image,
+            "recommend_bangumi_calendar": RecommendChain.bangumi_calendar,
+            "recommend_async_bangumi_calendar": RecommendChain.async_bangumi_calendar,
             "chain_recognize_media": ChainBase.recognize_media,
             "chain_async_recognize_media": ChainBase.async_recognize_media,
             "media_recognize_by_meta": MediaChain.recognize_by_meta,
@@ -257,6 +260,8 @@ class sourceprioritysubscribefix(_PluginBase):
         MediaChain._download_and_save_image = _patched_media_download_and_save_image
         MediaInfo.get_message_image = _patched_media_get_message_image
         MediaInfo.get_poster_image = _patched_media_get_poster_image
+        RecommendChain.bangumi_calendar = _patched_recommend_bangumi_calendar
+        RecommendChain.async_bangumi_calendar = _patched_recommend_async_bangumi_calendar
         ChainBase.recognize_media = _patched_chain_recognize_media
         ChainBase.async_recognize_media = _patched_chain_async_recognize_media
         MediaChain.recognize_by_meta = _patched_media_recognize_by_meta
@@ -301,6 +306,8 @@ class sourceprioritysubscribefix(_PluginBase):
         MediaChain._download_and_save_image = cls._originals["media_download_save_image"]
         MediaInfo.get_message_image = cls._originals["media_get_message_image"]
         MediaInfo.get_poster_image = cls._originals["media_get_poster_image"]
+        RecommendChain.bangumi_calendar = cls._originals["recommend_bangumi_calendar"]
+        RecommendChain.async_bangumi_calendar = cls._originals["recommend_async_bangumi_calendar"]
         ChainBase.recognize_media = cls._originals["chain_recognize_media"]
         ChainBase.async_recognize_media = cls._originals["chain_async_recognize_media"]
         MediaChain.recognize_by_meta = cls._originals["media_recognize_by_meta"]
@@ -761,16 +768,61 @@ def _douban_proxy_image_url(url: Any) -> Any:
     )
 
 
+def _https_bangumi_image_url(url: Any) -> Any:
+    if isinstance(url, str) and url.startswith("http://lain.bgm.tv/"):
+        return url.replace("http://", "https://", 1)
+    return url
+
+
+def _normalize_bangumi_image_urls(value: Any) -> Any:
+    if isinstance(value, str):
+        return _https_bangumi_image_url(value)
+    if isinstance(value, list):
+        return [_normalize_bangumi_image_urls(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _normalize_bangumi_image_urls(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _patched_media_get_message_image(self: MediaInfo, default: Optional[bool] = None):
-    return _douban_proxy_image_url(
-        sourceprioritysubscribefix._originals["media_get_message_image"](self, default=default)
+    return _https_bangumi_image_url(
+        _douban_proxy_image_url(
+            sourceprioritysubscribefix._originals["media_get_message_image"](self, default=default)
+        )
     )
 
 
 def _patched_media_get_poster_image(self: MediaInfo, default: Optional[bool] = None):
-    return _douban_proxy_image_url(
-        sourceprioritysubscribefix._originals["media_get_poster_image"](self, default=default)
+    return _https_bangumi_image_url(
+        _douban_proxy_image_url(
+            sourceprioritysubscribefix._originals["media_get_poster_image"](self, default=default)
+        )
     )
+
+
+def _patched_recommend_bangumi_calendar(
+        self: RecommendChain,
+        page: Optional[int] = 1,
+        count: Optional[int] = 30,
+) -> List[dict]:
+    items = sourceprioritysubscribefix._originals["recommend_bangumi_calendar"](
+        self, page=page, count=count
+    )
+    return _normalize_bangumi_image_urls(items)
+
+
+async def _patched_recommend_async_bangumi_calendar(
+        self: RecommendChain,
+        page: Optional[int] = 1,
+        count: Optional[int] = 30,
+) -> List[dict]:
+    items = await sourceprioritysubscribefix._originals["recommend_async_bangumi_calendar"](
+        self, page=page, count=count
+    )
+    return _normalize_bangumi_image_urls(items)
 
 
 def _patched_media_download_and_save_image(self: MediaChain, fileitem: schemas.FileItem,
