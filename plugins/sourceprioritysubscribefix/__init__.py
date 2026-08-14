@@ -67,7 +67,7 @@ class sourceprioritysubscribefix(_PluginBase):
     plugin_name = "订阅外部源优先"
     plugin_desc = "接管豆瓣与 Bangumi 外部源媒体的订阅、识别、整理与刮削：订阅优先豆瓣来源，Bangumi-only 订阅使用 Bangumi 详情，豆瓣/Bangumi 媒体自动推断二级分类；不影响普通 TMDB 流程。"
     plugin_icon = "mdi-heart-cog"
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     plugin_author = "local"
     plugin_order = 1
     auth_level = 1
@@ -1227,7 +1227,7 @@ def _real_tmdb_id(tmdbid: Any) -> Optional[int]:
 def _ids_target_bangumi_only(tmdbid: Optional[int] = None,
                              doubanid: Optional[str] = None,
                              bangumiid: Optional[int] = None) -> bool:
-    return bool(_int_or_none(bangumiid) and not tmdbid and not doubanid)
+    return bool(_int_or_none(bangumiid) and not _real_tmdb_id(tmdbid) and not doubanid)
 
 
 def _source_only_subscribes() -> list[Subscribe]:
@@ -4743,6 +4743,14 @@ def _patched_subscribe_add(self: SubscribeChain, title: str, year: str, mtype: M
                            message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                            **kwargs) -> Tuple[Optional[int], str]:
     try:
+        pseudo_doubanid = _douban_id_from_calendar_tmdbid(tmdbid)
+        pseudo_bangumiid = _bangumi_id_from_calendar_tmdbid(tmdbid)
+        if pseudo_doubanid and not doubanid:
+            doubanid = pseudo_doubanid
+            tmdbid = None
+        elif pseudo_bangumiid and not bangumiid:
+            bangumiid = pseudo_bangumiid
+            tmdbid = None
         # TMDB 为最高优先级：有真实 TMDB ID 或既无豆瓣也非 Bangumi-only 时，交还原生流程
         if _real_tmdb_id(tmdbid) or (
                 not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid)):
@@ -4790,6 +4798,14 @@ async def _patched_subscribe_async_add(self: SubscribeChain, title: str, year: s
                                        message: Optional[bool] = True, exist_ok: Optional[bool] = False,
                                        **kwargs) -> Tuple[Optional[int], str]:
     try:
+        pseudo_doubanid = _douban_id_from_calendar_tmdbid(tmdbid)
+        pseudo_bangumiid = _bangumi_id_from_calendar_tmdbid(tmdbid)
+        if pseudo_doubanid and not doubanid:
+            doubanid = pseudo_doubanid
+            tmdbid = None
+        elif pseudo_bangumiid and not bangumiid:
+            bangumiid = pseudo_bangumiid
+            tmdbid = None
         # TMDB 为最高优先级：有真实 TMDB ID 或既无豆瓣也非 Bangumi-only 时，交还原生流程
         if _real_tmdb_id(tmdbid) or (
                 not doubanid and not _ids_target_bangumi_only(tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid)):
@@ -5172,7 +5188,19 @@ async def _patched_media_seasons(mediaid: Optional[str] = None,
     mediachain = MediaChain()
     if mediaid:
         if mediaid.startswith("tmdb:"):
-            seasons_info = await TmdbChain().async_tmdb_seasons(tmdbid=int(mediaid[5:]))
+            tmdbid = int(mediaid[5:])
+            doubanid = _douban_id_from_calendar_tmdbid(tmdbid)
+            if doubanid:
+                mediainfo = await mediachain.async_recognize_media(doubanid=doubanid, mtype=MediaType.TV)
+                seasons_info = _media_seasons_from_info(mediainfo, season=season)
+                if seasons_info:
+                    return seasons_info
+                return []
+            bangumiid = _bangumi_id_from_calendar_tmdbid(tmdbid)
+            if bangumiid:
+                mediainfo = await mediachain.async_recognize_media(bangumiid=bangumiid, mtype=MediaType.TV)
+                return _bangumi_media_seasons_from_info(mediainfo, season=season)
+            seasons_info = await TmdbChain().async_tmdb_seasons(tmdbid=tmdbid)
             if seasons_info:
                 return [sea for sea in seasons_info if sea.season_number == season] if season is not None else seasons_info
         elif mediaid.startswith("douban:"):
