@@ -44,6 +44,7 @@ HISTORY_KEY = "history"
 SEEN_KEY = "seen"
 RUN_KEY = "last_run"
 MAX_HISTORY = 300
+MAX_TASK_FORMS = 5
 
 _lock = threading.Lock()
 
@@ -52,7 +53,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "按自定义关键词直接搜索站点并自动下载，不依赖 TMDB、豆瓣或 Bangumi 识别。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -60,6 +61,7 @@ class directsearchsubscribe(_PluginBase):
     _enabled = False
     _cron = "*/30 * * * *"
     _tasks_json = ""
+    _task_forms: List[Dict[str, Any]] = []
     _dry_run = False
     _notify = False
 
@@ -67,7 +69,12 @@ class directsearchsubscribe(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled", False))
         self._cron = str(config.get("cron") or self._cron).strip()
-        self._tasks_json = config.get("tasks_json") or _default_tasks_json()
+        self._tasks_json = config.get("tasks_json") or ""
+        self._task_forms = _tasks_from_config(config)
+        if not self._task_forms and self._tasks_json:
+            self._task_forms = _task_forms_from_tasks(_parse_tasks_json(self._tasks_json))
+        if not self._task_forms:
+            self._task_forms = _task_forms_from_tasks(DEFAULT_TASKS)
         self._dry_run = bool(config.get("dry_run", False))
         self._notify = bool(config.get("notify", False))
 
@@ -99,98 +106,85 @@ class directsearchsubscribe(_PluginBase):
         ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
+        model = {
+            "enabled": self._enabled,
+            "cron": self._cron,
+            "dry_run": self._dry_run,
+            "notify": self._notify,
+        }
+        for index, task in enumerate(_pad_task_forms(self._task_forms), start=1):
+            model.update(_task_form_model(index, task))
+
         return [
             {
                 "component": "VForm",
                 "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "enabled", "label": "启用插件"},
-                                    }
-                                ],
+                    _section_card("运行设置", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "enabled",
+                                        "label": "启用插件",
+                                        "color": "primary",
+                                        "hint": "启用后按下方周期自动检查所有启用任务",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "dry_run",
+                                        "label": "演练模式",
+                                        "hint": "只记录命中结果，不添加下载",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "notify",
+                                        "label": "下载成功通知",
+                                        "hint": "预留通知开关，下载链仍会按系统规则通知",
+                                    },
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "cron",
+                                        "label": "执行周期",
+                                        "placeholder": "*/30 * * * *",
+                                        "hint": "Cron 表达式，默认每 30 分钟执行一次",
+                                    },
+                                }),
+                            ],
+                        },
+                    ]),
+                    _section_card("订阅任务", [
+                        {
+                            "component": "VAlert",
+                            "props": {
+                                "type": "info",
+                                "variant": "tonal",
+                                "class": "mb-3",
+                                "text": "每张卡是一条直搜任务。关键词会直接用于站点搜索，不经过 TMDB、豆瓣或 Bangumi 识别；最多保留 5 条常用任务。",
                             },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "dry_run", "label": "演练模式"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "notify", "label": "下载成功通知"},
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "cron",
-                                            "label": "执行周期",
-                                            "placeholder": "*/30 * * * *",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "tasks_json",
-                                            "label": "直搜订阅任务 JSON",
-                                            "rows": 18,
-                                            "auto-grow": True,
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
+                        },
+                        *[_task_card(index) for index in range(1, MAX_TASK_FORMS + 1)],
+                    ]),
                     {
                         "component": "VAlert",
-                        "props": {"type": "info", "variant": "tonal"},
-                        "text": "任务字段：id/name/keyword/type(tv|movie)/season/episodes/sites/include/exclude/downloader/save_path/label/max_downloads/pages/enabled。episodes 支持 1-12,14。",
+                        "props": {"type": "warning", "variant": "tonal"},
+                        "text": "直搜订阅不会做媒体库缺集判断，建议先用演练模式确认命中资源，再关闭演练正式下载。",
                     },
                 ],
             }
-        ], {
-            "enabled": False,
-            "cron": self._cron,
-            "dry_run": False,
-            "notify": False,
-            "tasks_json": _default_tasks_json(),
-        }
+        ], model
 
     def get_page(self) -> Optional[List[dict]]:
         tasks = self._load_tasks()
@@ -408,21 +402,348 @@ class directsearchsubscribe(_PluginBase):
         )
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
-        try:
-            raw = self._tasks_json or "[]"
-            tasks = json.loads(raw)
-            if isinstance(tasks, dict):
-                tasks = [tasks]
-            if not isinstance(tasks, list):
-                raise ValueError("任务 JSON 必须是数组或对象")
-            return [task for task in tasks if isinstance(task, dict)]
-        except Exception as err:
-            logger.error(f"直搜订阅任务配置解析失败：{err}")
-            return []
+        tasks = _tasks_from_forms(self._task_forms)
+        if tasks:
+            return tasks
+        return _parse_tasks_json(self._tasks_json)
 
 
 def _default_tasks_json() -> str:
     return json.dumps(DEFAULT_TASKS, ensure_ascii=False, indent=2)
+
+
+def _parse_tasks_json(raw: str) -> List[Dict[str, Any]]:
+    try:
+        tasks = json.loads(raw or "[]")
+        if isinstance(tasks, dict):
+            tasks = [tasks]
+        if not isinstance(tasks, list):
+            raise ValueError("任务配置必须是数组或对象")
+        return [task for task in tasks if isinstance(task, dict)]
+    except Exception as err:
+        logger.error(f"直搜订阅任务配置解析失败：{err}")
+        return []
+
+
+def _pad_task_forms(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    padded = list(tasks[:MAX_TASK_FORMS])
+    while len(padded) < MAX_TASK_FORMS:
+        padded.append({})
+    return padded
+
+
+def _task_forms_from_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    forms = []
+    for task in (tasks or [])[:MAX_TASK_FORMS]:
+        forms.append({
+            "enabled": bool(task.get("enabled", False)),
+            "id": str(task.get("id") or ""),
+            "name": str(task.get("name") or ""),
+            "keyword": str(task.get("keyword") or ""),
+            "type": "movie" if _parse_media_type(task.get("type")) == MediaType.MOVIE else "tv",
+            "season": task.get("season") if task.get("season") not in (None, "") else "",
+            "episodes": str(task.get("episodes") or ""),
+            "sites": _join_values(task.get("sites")),
+            "include": _join_values(task.get("include")),
+            "exclude": _join_values(task.get("exclude")),
+            "downloader": str(task.get("downloader") or ""),
+            "save_path": str(task.get("save_path") or ""),
+            "label": str(task.get("label") or "直搜订阅"),
+            "max_downloads": task.get("max_downloads") or 1,
+            "pages": task.get("pages") or 1,
+            "accept_unknown_episode": bool(task.get("accept_unknown_episode", False)),
+        })
+    return forms
+
+
+def _tasks_from_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    forms = []
+    for index in range(1, MAX_TASK_FORMS + 1):
+        prefix = f"task{index}_"
+        if not any(key.startswith(prefix) for key in config.keys()):
+            continue
+        forms.append({
+            "enabled": bool(config.get(f"{prefix}enabled", False)),
+            "id": str(config.get(f"{prefix}id") or ""),
+            "name": str(config.get(f"{prefix}name") or ""),
+            "keyword": str(config.get(f"{prefix}keyword") or ""),
+            "type": str(config.get(f"{prefix}type") or "tv"),
+            "season": config.get(f"{prefix}season") or "",
+            "episodes": str(config.get(f"{prefix}episodes") or ""),
+            "sites": config.get(f"{prefix}sites") or "",
+            "include": config.get(f"{prefix}include") or "",
+            "exclude": config.get(f"{prefix}exclude") or "",
+            "downloader": str(config.get(f"{prefix}downloader") or ""),
+            "save_path": str(config.get(f"{prefix}save_path") or ""),
+            "label": str(config.get(f"{prefix}label") or "直搜订阅"),
+            "max_downloads": config.get(f"{prefix}max_downloads") or 1,
+            "pages": config.get(f"{prefix}pages") or 1,
+            "accept_unknown_episode": bool(config.get(f"{prefix}accept_unknown_episode", False)),
+        })
+    return forms
+
+
+def _tasks_from_forms(forms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tasks = []
+    for index, form in enumerate(forms or [], start=1):
+        keyword = str(form.get("keyword") or "").strip()
+        name = str(form.get("name") or keyword).strip()
+        if not keyword and not name:
+            continue
+        task_id = str(form.get("id") or f"direct-search-{index}").strip()
+        tasks.append({
+            "id": task_id,
+            "name": name or keyword,
+            "keyword": keyword or name,
+            "type": str(form.get("type") or "tv"),
+            "season": form.get("season") or "",
+            "episodes": str(form.get("episodes") or "").strip(),
+            "sites": form.get("sites") or "",
+            "include": form.get("include") or "",
+            "exclude": form.get("exclude") or "",
+            "downloader": str(form.get("downloader") or "").strip(),
+            "save_path": str(form.get("save_path") or "").strip(),
+            "label": str(form.get("label") or "直搜订阅").strip(),
+            "max_downloads": form.get("max_downloads") or 1,
+            "pages": form.get("pages") or 1,
+            "accept_unknown_episode": bool(form.get("accept_unknown_episode", False)),
+            "enabled": bool(form.get("enabled", False)),
+        })
+    return tasks
+
+
+def _task_form_model(index: int, task: Dict[str, Any]) -> Dict[str, Any]:
+    prefix = f"task{index}_"
+    return {
+        f"{prefix}enabled": bool(task.get("enabled", False)),
+        f"{prefix}id": str(task.get("id") or f"direct-search-{index}"),
+        f"{prefix}name": str(task.get("name") or ""),
+        f"{prefix}keyword": str(task.get("keyword") or ""),
+        f"{prefix}type": str(task.get("type") or "tv"),
+        f"{prefix}season": task.get("season") or "",
+        f"{prefix}episodes": str(task.get("episodes") or ""),
+        f"{prefix}sites": task.get("sites") or "",
+        f"{prefix}include": task.get("include") or "",
+        f"{prefix}exclude": task.get("exclude") or "",
+        f"{prefix}downloader": str(task.get("downloader") or ""),
+        f"{prefix}save_path": str(task.get("save_path") or ""),
+        f"{prefix}label": str(task.get("label") or "直搜订阅"),
+        f"{prefix}max_downloads": int(task.get("max_downloads") or 1),
+        f"{prefix}pages": int(task.get("pages") or 1),
+        f"{prefix}accept_unknown_episode": bool(task.get("accept_unknown_episode", False)),
+    }
+
+
+def _join_values(value: Any) -> str:
+    if value in (None, "", []):
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if str(item).strip())
+    return str(value)
+
+
+def _col(cols: int, md: int, child: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "component": "VCol",
+        "props": {"cols": cols, "md": md},
+        "content": [child],
+    }
+
+
+def _section_card(title: str, content: List[dict]) -> Dict[str, Any]:
+    return {
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-4"},
+        "content": [
+            {"component": "VCardTitle", "text": title},
+            {"component": "VCardText", "content": content},
+        ],
+    }
+
+
+def _task_card(index: int) -> Dict[str, Any]:
+    prefix = f"task{index}_"
+    return {
+        "component": "VCard",
+        "props": {"variant": "tonal", "class": "mb-3"},
+        "content": [
+            {
+                "component": "VCardTitle",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            _col(12, 8, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}name",
+                                    "label": f"任务 {index} 名称",
+                                    "placeholder": "Re 从零开始的异世界生活 第四季",
+                                    "density": "comfortable",
+                                },
+                            }),
+                            _col(12, 4, {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": f"{prefix}enabled",
+                                    "label": "启用任务",
+                                    "color": "primary",
+                                },
+                            }),
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            _col(12, 8, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}keyword",
+                                    "label": "搜索关键词",
+                                    "placeholder": "站点搜索用词，越贴近站内标题越稳",
+                                    "hint": "这个词会直接送到站点搜索",
+                                },
+                            }),
+                            _col(12, 4, {
+                                "component": "VSelect",
+                                "props": {
+                                    "model": f"{prefix}type",
+                                    "label": "类型",
+                                    "items": [
+                                        {"title": "电视剧", "value": "tv"},
+                                        {"title": "电影", "value": "movie"},
+                                    ],
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            _col(12, 3, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}season",
+                                    "label": "季",
+                                    "type": "number",
+                                    "placeholder": "4",
+                                    "hint": "电影可留空",
+                                },
+                            }),
+                            _col(12, 3, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}episodes",
+                                    "label": "集数",
+                                    "placeholder": "1-12,14",
+                                    "hint": "留空则不过滤集数",
+                                },
+                            }),
+                            _col(12, 3, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}max_downloads",
+                                    "label": "单次最多下载",
+                                    "type": "number",
+                                    "min": 1,
+                                    "max": 10,
+                                },
+                            }),
+                            _col(12, 3, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}pages",
+                                    "label": "搜索页数",
+                                    "type": "number",
+                                    "min": 1,
+                                    "max": 5,
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            _col(12, 6, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}include",
+                                    "label": "必须包含",
+                                    "placeholder": "2160p, HEVC",
+                                    "hint": "逗号分隔，全部命中才下载",
+                                },
+                            }),
+                            _col(12, 6, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}exclude",
+                                    "label": "排除关键词",
+                                    "placeholder": "合集, 国语, 试看",
+                                    "hint": "逗号分隔，命中任意一个就跳过",
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            _col(12, 4, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}sites",
+                                    "label": "站点 ID",
+                                    "placeholder": "1, 2, 8",
+                                    "hint": "留空搜索全部站点",
+                                },
+                            }),
+                            _col(12, 4, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}downloader",
+                                    "label": "下载器",
+                                    "placeholder": "留空使用默认",
+                                },
+                            }),
+                            _col(12, 4, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}label",
+                                    "label": "下载标签",
+                                    "placeholder": "直搜订阅",
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            _col(12, 8, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{prefix}save_path",
+                                    "label": "保存路径",
+                                    "placeholder": "留空使用系统规则",
+                                },
+                            }),
+                            _col(12, 4, {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": f"{prefix}accept_unknown_episode",
+                                    "label": "接受无法识别集数",
+                                    "hint": "资源站标题解析不出 E01 时才需要打开",
+                                },
+                            }),
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
 
 
 def _now() -> str:
