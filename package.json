@@ -19,8 +19,8 @@
   },
   "directsearchsubscribe": {
     "name": "直搜订阅",
-    "description": "按自定义关键词直接搜索站点并自动下载，不依赖 TMDB、豆瓣或 Bangumi 识别。",
-    "version": "1.0.1",
+    "description": "从插件表单创建原生订阅，并让这些订阅直接按关键词搜索站点，不依赖 TMDB、豆瓣或 Bangumi 识别。",
+    "version": "1.1.0",
     "icon": "mdi-magnify-scan",
     "author": "Ellick",
     "level": 1,

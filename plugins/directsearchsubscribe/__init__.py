@@ -1,82 +1,69 @@
 from __future__ import annotations
 
-import json
 import re
+import time
 import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from apscheduler.triggers.cron import CronTrigger
-
 from app import schemas
 from app.chain.download import DownloadChain
 from app.chain.search import SearchChain
+from app.chain.subscribe import SubscribeChain
+from app.core.config import global_vars
 from app.core.context import Context, MediaInfo
 from app.core.metainfo import MetaInfo
+from app.db.models.subscribe import Subscribe
+from app.db.subscribe_oper import SubscribeOper
+from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import MediaType
-from app.utils.string import StringUtils
+from app.schemas.types import MediaType, SystemConfigKey
 
-
-DEFAULT_TASKS = [
-    {
-        "id": "rezero-s04",
-        "name": "Re 从零开始的异世界生活 第四季",
-        "keyword": "Re 从零开始的异世界生活 第四季",
-        "type": "tv",
-        "season": 4,
-        "episodes": "",
-        "sites": [],
-        "include": [],
-        "exclude": ["合集", "国语"],
-        "downloader": "",
-        "save_path": "",
-        "label": "直搜订阅",
-        "max_downloads": 1,
-        "pages": 1,
-        "enabled": False
-    }
-]
 
 PLUGIN_ID = "directsearchsubscribe"
+DIRECT_SUBS_KEY = "direct_subscribes"
 HISTORY_KEY = "history"
-SEEN_KEY = "seen"
-RUN_KEY = "last_run"
-MAX_HISTORY = 300
-MAX_TASK_FORMS = 5
+MAX_HISTORY = 200
+DIRECT_DOUBAN_PREFIX = "directsearch:"
 
 _lock = threading.Lock()
 
 
 class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
-    plugin_desc = "按自定义关键词直接搜索站点并自动下载，不依赖 TMDB、豆瓣或 Bangumi 识别。"
+    plugin_desc = "从插件表单创建原生订阅，并让这些订阅直接按关键词搜索站点，不依赖 TMDB、豆瓣或 Bangumi 识别。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
 
-    _enabled = False
-    _cron = "*/30 * * * *"
-    _tasks_json = ""
-    _task_forms: List[Dict[str, Any]] = []
-    _dry_run = False
-    _notify = False
+    _enabled = True
+    _config: Dict[str, Any] = {}
+    _patched = False
+    _original_search = None
 
     def init_plugin(self, config: dict = None):
         config = config or {}
-        self._enabled = bool(config.get("enabled", False))
-        self._cron = str(config.get("cron") or self._cron).strip()
-        self._tasks_json = config.get("tasks_json") or ""
-        self._task_forms = _tasks_from_config(config)
-        if not self._task_forms and self._tasks_json:
-            self._task_forms = _task_forms_from_tasks(_parse_tasks_json(self._tasks_json))
-        if not self._task_forms:
-            self._task_forms = _task_forms_from_tasks(DEFAULT_TASKS)
-        self._dry_run = bool(config.get("dry_run", False))
-        self._notify = bool(config.get("notify", False))
+        self._config = dict(config)
+        self._enabled = bool(config.get("enabled", True))
+
+        if self._enabled:
+            self._patch()
+        else:
+            self._unpatch()
+
+        if config.get("add_now"):
+            result = self.create_subscribe_from_config(config)
+            _append_history(self, result)
+            config["add_now"] = False
+            self.update_config(config)
+            self._config = dict(config)
+            if result.get("success") and config.get("run_after_add"):
+                sid = result.get("sid")
+                if sid:
+                    _run_direct_subscription(SubscribeChain(), sid=sid, manual=True)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -88,38 +75,29 @@ class directsearchsubscribe(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {
-                "path": "/run",
-                "endpoint": self.api_run,
+                "path": "/add",
+                "endpoint": self.api_add,
                 "methods": ["POST", "GET"],
                 "auth": "bear",
-                "summary": "运行直搜订阅",
-                "description": "立即执行所有启用的直搜订阅任务。",
+                "summary": "添加直搜订阅",
+                "description": "使用当前插件表单配置创建一条原生订阅。",
             },
             {
-                "path": "/reset/{task_id}",
-                "endpoint": self.api_reset,
-                "methods": ["POST", "DELETE"],
+                "path": "/search/{sid}",
+                "endpoint": self.api_search,
+                "methods": ["POST", "GET"],
                 "auth": "bear",
-                "summary": "重置直搜订阅去重",
-                "description": "清空指定任务的已下载去重记录。",
+                "summary": "搜索直搜订阅",
+                "description": "立即搜索指定直搜订阅。",
             },
         ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
-        model = {
-            "enabled": self._enabled,
-            "cron": self._cron,
-            "dry_run": self._dry_run,
-            "notify": self._notify,
-        }
-        for index, task in enumerate(_pad_task_forms(self._task_forms), start=1):
-            model.update(_task_form_model(index, task))
-
         return [
             {
                 "component": "VForm",
                 "content": [
-                    _section_card("运行设置", [
+                    _section_card("运行方式", [
                         {
                             "component": "VRow",
                             "content": [
@@ -127,25 +105,53 @@ class directsearchsubscribe(_PluginBase):
                                     "component": "VSwitch",
                                     "props": {
                                         "model": "enabled",
-                                        "label": "启用插件",
+                                        "label": "启用直搜接管",
                                         "color": "primary",
-                                        "hint": "启用后按下方周期自动检查所有启用任务",
+                                        "hint": "开启后，插件创建的订阅在原生订阅搜索时会直接搜索站点",
                                     },
                                 }),
                                 _col(12, 4, {
                                     "component": "VSwitch",
                                     "props": {
-                                        "model": "dry_run",
-                                        "label": "演练模式",
-                                        "hint": "只记录命中结果，不添加下载",
+                                        "model": "add_now",
+                                        "label": "添加到订阅",
+                                        "color": "success",
+                                        "hint": "打开后保存配置，会创建一条原生订阅并自动复位",
                                     },
                                 }),
                                 _col(12, 4, {
                                     "component": "VSwitch",
                                     "props": {
-                                        "model": "notify",
-                                        "label": "下载成功通知",
-                                        "hint": "预留通知开关，下载链仍会按系统规则通知",
+                                        "model": "run_after_add",
+                                        "label": "添加后立即搜索",
+                                        "hint": "创建订阅后立即走一次直搜",
+                                    },
+                                }),
+                            ],
+                        },
+                    ]),
+                    _section_card("订阅内容", [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 8, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "title",
+                                        "label": "订阅标题",
+                                        "placeholder": "Re 从零开始的异世界生活 第四季",
+                                        "hint": "会显示在原生订阅列表里",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "type",
+                                        "label": "类型",
+                                        "items": [
+                                            {"title": "电视剧", "value": "tv"},
+                                            {"title": "电影", "value": "movie"},
+                                        ],
                                     },
                                 }),
                             ],
@@ -153,612 +159,667 @@ class directsearchsubscribe(_PluginBase):
                         {
                             "component": "VRow",
                             "content": [
-                                _col(12, 6, {
+                                _col(12, 8, {
                                     "component": "VTextField",
                                     "props": {
-                                        "model": "cron",
-                                        "label": "执行周期",
-                                        "placeholder": "*/30 * * * *",
-                                        "hint": "Cron 表达式，默认每 30 分钟执行一次",
+                                        "model": "keyword",
+                                        "label": "站点搜索关键词",
+                                        "placeholder": "Re Zero S04 / 从零开始的异世界生活 第四季",
+                                        "hint": "订阅搜索时直接把这个词送到站点搜索",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "year",
+                                        "label": "年份",
+                                        "placeholder": "2026",
+                                    },
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 3, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "season",
+                                        "label": "季",
+                                        "type": "number",
+                                        "placeholder": "4",
+                                        "hint": "电影可留空",
+                                    },
+                                }),
+                                _col(12, 3, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "episodes",
+                                        "label": "指定集数",
+                                        "placeholder": "1-12,14",
+                                        "hint": "留空则按每次新命中的集数追更",
+                                    },
+                                }),
+                                _col(12, 3, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "total_episode",
+                                        "label": "总集数",
+                                        "type": "number",
+                                        "placeholder": "12",
+                                        "hint": "可留空；填了会在完成后移入订阅历史",
+                                    },
+                                }),
+                                _col(12, 3, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "search_pages",
+                                        "label": "搜索页数",
+                                        "type": "number",
+                                        "min": 1,
+                                        "max": 5,
                                     },
                                 }),
                             ],
                         },
                     ]),
-                    _section_card("订阅任务", [
+                    _section_card("筛选与下载", [
                         {
-                            "component": "VAlert",
-                            "props": {
-                                "type": "info",
-                                "variant": "tonal",
-                                "class": "mb-3",
-                                "text": "每张卡是一条直搜任务。关键词会直接用于站点搜索，不经过 TMDB、豆瓣或 Bangumi 识别；最多保留 5 条常用任务。",
-                            },
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "include",
+                                        "label": "必须包含",
+                                        "placeholder": "2160p, HEVC",
+                                        "hint": "逗号分隔，全部命中才会保留",
+                                    },
+                                }),
+                                _col(12, 6, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "exclude",
+                                        "label": "排除关键词",
+                                        "placeholder": "合集, 国语, 试看",
+                                        "hint": "逗号分隔，命中任意一个会跳过",
+                                    },
+                                }),
+                            ],
                         },
-                        *[_task_card(index) for index in range(1, MAX_TASK_FORMS + 1)],
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 4, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "sites",
+                                        "label": "站点 ID",
+                                        "placeholder": "1, 2, 8",
+                                        "hint": "留空使用系统默认订阅站点",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "downloader",
+                                        "label": "下载器",
+                                        "placeholder": "留空使用默认",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "media_category",
+                                        "label": "媒体类别",
+                                        "placeholder": "动漫 / 剧集",
+                                    },
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 8, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "save_path",
+                                        "label": "保存路径",
+                                        "placeholder": "留空使用系统规则",
+                                    },
+                                }),
+                                _col(12, 4, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "accept_unknown_episode",
+                                        "label": "接受无法识别集数",
+                                        "hint": "资源站标题解析不出 E01 时，允许下载最佳命中",
+                                    },
+                                }),
+                            ],
+                        },
                     ]),
                     {
                         "component": "VAlert",
-                        "props": {"type": "warning", "variant": "tonal"},
-                        "text": "直搜订阅不会做媒体库缺集判断，建议先用演练模式确认命中资源，再关闭演练正式下载。",
+                        "props": {"type": "info", "variant": "tonal"},
+                        "text": "创建后请到原生订阅列表查看；这类订阅的后续搜索、下载、入库仍由 MoviePilot 订阅流程触发，只是搜索阶段改为直接搜站点。",
                     },
                 ],
             }
-        ], model
+        ], {
+            "enabled": True,
+            "add_now": False,
+            "run_after_add": False,
+            "title": "",
+            "keyword": "",
+            "type": "tv",
+            "year": "",
+            "season": "",
+            "episodes": "",
+            "total_episode": "",
+            "search_pages": 1,
+            "include": "",
+            "exclude": "",
+            "sites": "",
+            "downloader": "",
+            "save_path": "",
+            "media_category": "",
+            "accept_unknown_episode": True,
+        }
 
     def get_page(self) -> Optional[List[dict]]:
-        tasks = self._load_tasks()
-        history = self.get_data(HISTORY_KEY) or []
-        last_run = self.get_data(RUN_KEY) or {}
-        task_rows = [
-            {
-                "任务": task.get("name") or task.get("keyword") or task.get("id"),
-                "类型": _media_type_label(task.get("type")),
-                "状态": "启用" if task.get("enabled", True) else "停用",
-                "关键词": task.get("keyword") or "",
+        direct_map = _direct_map(self)
+        rows = []
+        for sid, task in direct_map.items():
+            subscribe = SubscribeOper().get(int(sid)) if str(sid).isdigit() else None
+            if not subscribe:
+                continue
+            rows.append({
+                "ID": subscribe.id,
+                "标题": subscribe.name,
+                "类型": "电影" if subscribe.type == MediaType.MOVIE.value else "电视剧",
+                "状态": _state_label(subscribe.state),
+                "关键词": task.get("keyword") or subscribe.keyword or "",
+                "季": subscribe.season or "",
                 "集数": task.get("episodes") or "",
-            }
-            for task in tasks
-        ]
+                "已下载": ", ".join(str(item) for item in (subscribe.note or [])),
+            })
+        history = self.get_data(HISTORY_KEY) or []
         history_rows = [
             {
                 "时间": row.get("time"),
-                "任务": row.get("task_name"),
                 "结果": row.get("status"),
-                "资源": row.get("title"),
-                "站点": row.get("site"),
+                "标题": row.get("title"),
                 "说明": row.get("message"),
             }
-            for row in history[:30]
+            for row in history[:20]
         ]
         return [
             {
                 "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal"},
-                "text": f"上次运行：{last_run.get('time') or '未运行'}；命中 {last_run.get('matched', 0)}，下载 {last_run.get('downloaded', 0)}，跳过 {last_run.get('skipped', 0)}。",
+                "props": {"type": "success" if self._enabled else "warning", "variant": "tonal"},
+                "text": "直搜接管已启用。" if self._enabled else "直搜接管未启用，已创建订阅不会改用直搜。",
             },
-            _table("任务", task_rows),
-            _table("最近历史", history_rows),
+            _table("直搜订阅", rows),
+            _table("最近操作", history_rows),
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if not self._enabled or not self._cron:
-            return []
-        try:
-            trigger = CronTrigger.from_crontab(self._cron)
-        except ValueError as err:
-            logger.error(f"直搜订阅 cron 配置错误：{err}")
-            return []
-        return [{
-            "id": "DirectSearchSubscribe",
-            "name": "直搜订阅",
-            "trigger": trigger,
-            "func": self.run,
-            "kwargs": {},
-        }]
-
-    def stop_service(self):
-        pass
-
-    def api_run(self) -> schemas.Response:
-        return schemas.Response(success=True, data=self.run(manual=True))
-
-    def api_reset(self, task_id: str) -> schemas.Response:
-        seen = self.get_data(SEEN_KEY) or {}
-        if task_id in seen:
-            seen.pop(task_id, None)
-            self.save_data(SEEN_KEY, seen)
-        return schemas.Response(success=True, message=f"已重置任务 {task_id} 的去重记录")
-
-    def run(self, manual: bool = False) -> Dict[str, Any]:
-        if not _lock.acquire(blocking=False):
-            logger.info("直搜订阅正在运行，本次跳过")
-            return {"running": True}
-        try:
-            tasks = [task for task in self._load_tasks() if task.get("enabled", True)]
-            seen = self.get_data(SEEN_KEY) or {}
-            history = self.get_data(HISTORY_KEY) or []
-            summary = {
-                "time": _now(),
-                "manual": manual,
-                "tasks": len(tasks),
-                "matched": 0,
-                "downloaded": 0,
-                "skipped": 0,
-                "errors": 0,
-            }
-            for task in tasks:
-                try:
-                    result = self._run_task(task=task, seen=seen, history=history)
-                    for key in ("matched", "downloaded", "skipped", "errors"):
-                        summary[key] += result.get(key, 0)
-                except Exception as err:
-                    summary["errors"] += 1
-                    logger.error(f"直搜订阅任务执行失败：{task.get('name') or task.get('id')} - {err}")
-                    _append_history(history, task, None, "错误", str(err))
-
-            self.save_data(SEEN_KEY, seen)
-            self.save_data(HISTORY_KEY, history[:MAX_HISTORY])
-            self.save_data(RUN_KEY, summary)
-            logger.info(
-                f"直搜订阅运行完成：任务 {summary['tasks']}，命中 {summary['matched']}，"
-                f"下载 {summary['downloaded']}，跳过 {summary['skipped']}，错误 {summary['errors']}"
-            )
-            return summary
-        finally:
-            _lock.release()
-
-    def _run_task(self, task: Dict[str, Any], seen: Dict[str, Dict[str, Any]], history: List[dict]) -> Dict[str, int]:
-        task_id = _task_id(task)
-        task_seen = seen.setdefault(task_id, {})
-        keyword = str(task.get("keyword") or task.get("name") or "").strip()
-        if not keyword:
-            raise ValueError("keyword 不能为空")
-
-        sites = _parse_sites(task.get("sites"))
-        pages = max(1, min(int(task.get("pages") or 1), 5))
-        max_downloads = max(1, int(task.get("max_downloads") or 1))
-        desired_episodes = _parse_episodes(task.get("episodes"))
-        media_type = _parse_media_type(task.get("type"))
-
-        logger.info(f"直搜订阅开始搜索：{task.get('name') or keyword}，关键词：{keyword}")
-        candidates: List[Context] = []
-        for page in range(pages):
-            candidates.extend(SearchChain().search_by_title(title=keyword, page=page, sites=sites) or [])
-
-        matches = self._filter_candidates(
-            task=task,
-            candidates=candidates,
-            media_type=media_type,
-            desired_episodes=desired_episodes,
-        )
-        summary = {"matched": len(matches), "downloaded": 0, "skipped": 0, "errors": 0}
-        if not matches:
-            _append_history(history, task, None, "未命中", "没有符合条件的资源")
-            return summary
-
-        for context in matches:
-            fingerprint = _fingerprint(context)
-            if fingerprint in task_seen:
-                summary["skipped"] += 1
-                continue
-            if summary["downloaded"] >= max_downloads:
-                summary["skipped"] += 1
-                continue
-
-            context.media_info = _build_media_info(task, media_type)
-            episodes = _download_episodes(context.meta_info, desired_episodes)
-            if self._dry_run:
-                task_seen[fingerprint] = _seen_record(context, dry_run=True)
-                summary["downloaded"] += 1
-                _append_history(history, task, context, "演练", "演练模式未下载")
-                continue
-
-            download_id, error = DownloadChain().download_single(
-                context=context,
-                episodes=episodes,
-                source="DirectSearchSubscribe",
-                downloader=str(task.get("downloader") or "").strip() or None,
-                save_path=str(task.get("save_path") or "").strip() or None,
-                username=PLUGIN_ID,
-                label=str(task.get("label") or "直搜订阅").strip() or None,
-                return_detail=True,
-            )
-            if download_id:
-                task_seen[fingerprint] = _seen_record(context, download_id=download_id)
-                summary["downloaded"] += 1
-                _append_history(history, task, context, "已下载", str(download_id))
-                logger.info(f"直搜订阅已添加下载：{context.torrent_info.title}")
-            else:
-                summary["errors"] += 1
-                _append_history(history, task, context, "失败", error or "添加下载失败")
-
-        return summary
-
-    def _filter_candidates(
-            self,
-            task: Dict[str, Any],
-            candidates: List[Context],
-            media_type: MediaType,
-            desired_episodes: Set[int],
-    ) -> List[Context]:
-        include_words = _parse_words(task.get("include"))
-        exclude_words = _parse_words(task.get("exclude"))
-        season = _parse_int(task.get("season"))
-        accept_unknown_episode = bool(task.get("accept_unknown_episode", False))
-        results: List[Context] = []
-
-        for context in candidates:
-            torrent = context.torrent_info
-            if not torrent or not torrent.title:
-                continue
-            text = f"{torrent.title} {torrent.description or ''}".lower()
-            if include_words and not all(word.lower() in text for word in include_words):
-                continue
-            if exclude_words and any(word.lower() in text for word in exclude_words):
-                continue
-
-            meta = MetaInfo(title=torrent.title, subtitle=torrent.description)
-            if media_type == MediaType.TV:
-                if season is not None and meta.begin_season is not None and meta.begin_season != season:
-                    continue
-                if desired_episodes:
-                    parsed_episodes = set(meta.episode_list or [])
-                    if not parsed_episodes and not accept_unknown_episode:
-                        continue
-                    if parsed_episodes and not parsed_episodes.intersection(desired_episodes):
-                        continue
-            context.meta_info = meta
-            context.resource_source = "direct_search_subscribe"
-            results.append(context)
-
-        return sorted(
-            results,
-            key=lambda item: (
-                int(getattr(item.torrent_info, "seeders", 0) or 0),
-                int(getattr(item.torrent_info, "size", 0) or 0),
-            ),
-            reverse=True,
-        )
-
-    def _load_tasks(self) -> List[Dict[str, Any]]:
-        tasks = _tasks_from_forms(self._task_forms)
-        if tasks:
-            return tasks
-        return _parse_tasks_json(self._tasks_json)
-
-
-def _default_tasks_json() -> str:
-    return json.dumps(DEFAULT_TASKS, ensure_ascii=False, indent=2)
-
-
-def _parse_tasks_json(raw: str) -> List[Dict[str, Any]]:
-    try:
-        tasks = json.loads(raw or "[]")
-        if isinstance(tasks, dict):
-            tasks = [tasks]
-        if not isinstance(tasks, list):
-            raise ValueError("任务配置必须是数组或对象")
-        return [task for task in tasks if isinstance(task, dict)]
-    except Exception as err:
-        logger.error(f"直搜订阅任务配置解析失败：{err}")
         return []
 
+    def stop_service(self):
+        self._unpatch()
 
-def _pad_task_forms(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    padded = list(tasks[:MAX_TASK_FORMS])
-    while len(padded) < MAX_TASK_FORMS:
-        padded.append({})
-    return padded
+    def api_add(self) -> schemas.Response:
+        result = self.create_subscribe_from_config(self._config)
+        _append_history(self, result)
+        return schemas.Response(success=bool(result.get("success")), message=result.get("message"), data=result)
+
+    def api_search(self, sid: int) -> schemas.Response:
+        result = _run_direct_subscription(SubscribeChain(), sid=sid, manual=True)
+        return schemas.Response(success=bool(result.get("success")), message=result.get("message"), data=result)
+
+    def create_subscribe_from_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        title = str(config.get("title") or config.get("keyword") or "").strip()
+        keyword = str(config.get("keyword") or title).strip()
+        media_type = _parse_media_type(config.get("type"))
+        if not title:
+            return {"success": False, "status": "失败", "title": "", "message": "订阅标题不能为空"}
+        if not keyword:
+            return {"success": False, "status": "失败", "title": title, "message": "搜索关键词不能为空"}
+
+        season = _parse_int(config.get("season"))
+        episodes = sorted(_parse_episodes(config.get("episodes")))
+        total_episode = _parse_int(config.get("total_episode"))
+        if media_type == MediaType.TV and not total_episode and episodes:
+            total_episode = max(episodes)
+        start_episode = min(episodes) if episodes else 1
+        sites = _parse_sites(config.get("sites")) or []
+        task = {
+            "title": title,
+            "keyword": keyword,
+            "type": media_type.value,
+            "year": str(config.get("year") or "").strip(),
+            "season": season,
+            "episodes": str(config.get("episodes") or "").strip(),
+            "total_episode": total_episode,
+            "search_pages": max(1, min(_parse_int(config.get("search_pages")) or 1, 5)),
+            "include": str(config.get("include") or "").strip(),
+            "exclude": str(config.get("exclude") or "").strip(),
+            "sites": sites,
+            "downloader": str(config.get("downloader") or "").strip(),
+            "save_path": str(config.get("save_path") or "").strip(),
+            "media_category": str(config.get("media_category") or "").strip(),
+            "accept_unknown_episode": bool(config.get("accept_unknown_episode", True)),
+        }
+
+        direct_map = _direct_map(self)
+        for sid, item in direct_map.items():
+            subscribe = SubscribeOper().get(int(sid)) if str(sid).isdigit() else None
+            if not subscribe:
+                continue
+            if subscribe.name == title and subscribe.type == media_type.value and subscribe.season == season:
+                direct_map[str(subscribe.id)] = task
+                self.save_data(DIRECT_SUBS_KEY, direct_map)
+                return {
+                    "success": True,
+                    "status": "已存在",
+                    "sid": subscribe.id,
+                    "title": title,
+                    "message": f"直搜订阅已存在，已更新参数：{subscribe.id}",
+                }
+
+        direct_key = f"{DIRECT_DOUBAN_PREFIX}{int(time.time())}"
+        subscribe = Subscribe(
+            name=title,
+            year=task["year"] or None,
+            type=media_type.value,
+            keyword=keyword,
+            doubanid=direct_key,
+            season=season,
+            filter=None,
+            include=task["include"] or None,
+            exclude=task["exclude"] or None,
+            total_episode=total_episode,
+            start_episode=start_episode if media_type == MediaType.TV else None,
+            lack_episode=len(episodes) if episodes else total_episode,
+            note=[],
+            state="N",
+            date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            username="直搜订阅",
+            sites=sites,
+            downloader=task["downloader"] or None,
+            save_path=task["save_path"] or None,
+            manual_total_episode=1 if total_episode else 0,
+            media_category=task["media_category"] or None,
+            custom_words="[DirectSearchSubscribe]",
+        )
+        subscribe.create(SubscribeOper()._db)
+        created = Subscribe.get_by_doubanid(SubscribeOper()._db, direct_key)
+        if not created:
+            return {
+                "success": False,
+                "status": "失败",
+                "title": title,
+                "message": "订阅已写入但反查失败，请刷新订阅列表确认",
+            }
+        direct_map[str(created.id)] = task
+        self.save_data(DIRECT_SUBS_KEY, direct_map)
+        return {
+            "success": True,
+            "status": "已添加",
+            "sid": created.id,
+            "title": title,
+            "message": f"已添加到原生订阅：{created.id}",
+        }
+
+    @classmethod
+    def _patch(cls):
+        if cls._patched:
+            return
+        cls._original_search = SubscribeChain.search
+
+        def patched_search(chain_self, sid: Optional[int] = None, state: Optional[str] = "N",
+                           manual: Optional[bool] = False):
+            return _patched_subscribe_search(chain_self, sid=sid, state=state, manual=manual)
+
+        SubscribeChain.search = patched_search
+        cls._patched = True
+        logger.info("直搜订阅已接管原生订阅搜索")
+
+    @classmethod
+    def _unpatch(cls):
+        if cls._patched and cls._original_search:
+            SubscribeChain.search = cls._original_search
+        cls._patched = False
+        cls._original_search = None
 
 
-def _task_forms_from_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    forms = []
-    for task in (tasks or [])[:MAX_TASK_FORMS]:
-        forms.append({
-            "enabled": bool(task.get("enabled", False)),
-            "id": str(task.get("id") or ""),
-            "name": str(task.get("name") or ""),
-            "keyword": str(task.get("keyword") or ""),
-            "type": "movie" if _parse_media_type(task.get("type")) == MediaType.MOVIE else "tv",
-            "season": task.get("season") if task.get("season") not in (None, "") else "",
-            "episodes": str(task.get("episodes") or ""),
-            "sites": _join_values(task.get("sites")),
-            "include": _join_values(task.get("include")),
-            "exclude": _join_values(task.get("exclude")),
-            "downloader": str(task.get("downloader") or ""),
-            "save_path": str(task.get("save_path") or ""),
-            "label": str(task.get("label") or "直搜订阅"),
-            "max_downloads": task.get("max_downloads") or 1,
-            "pages": task.get("pages") or 1,
-            "accept_unknown_episode": bool(task.get("accept_unknown_episode", False)),
-        })
-    return forms
+def _patched_subscribe_search(chain: SubscribeChain, sid: Optional[int] = None,
+                              state: Optional[str] = "N", manual: Optional[bool] = False):
+    original = directsearchsubscribe._original_search
+    if not original:
+        return None
+
+    if sid:
+        subscribe = SubscribeOper().get(sid)
+        if _is_direct_subscribe(subscribe):
+            result = _run_direct_subscription(chain, subscribe=subscribe, manual=manual)
+            if manual:
+                chain.messagehelper.put(f"{subscribe.name} 搜索完成！", title="订阅搜索", role="system")
+            return result
+        return original(chain, sid=sid, state=state, manual=manual)
+
+    states = chain.get_states_for_search(state)
+    subscribes = SubscribeOper().list(states)
+    direct_ids = {item.id for item in subscribes if _is_direct_subscribe(item)}
+    if direct_ids:
+        for subscribe in subscribes:
+            if subscribe.id in direct_ids:
+                _run_direct_subscription(chain, subscribe=subscribe, manual=manual)
+
+    regular_ids = {item.id for item in subscribes if item.id not in direct_ids}
+    if regular_ids:
+        original_list = SubscribeOper.list
+
+        def filtered_list(oper_self, search_state: Optional[str] = None):
+            return [item for item in original_list(oper_self, search_state) if item.id in regular_ids]
+
+        SubscribeOper.list = filtered_list
+        try:
+            return original(chain, sid=None, state=state, manual=manual)
+        finally:
+            SubscribeOper.list = original_list
+
+    if manual:
+        chain.messagehelper.put("所有订阅搜索完成！", title="订阅搜索", role="system")
+    return None
 
 
-def _tasks_from_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    forms = []
-    for index in range(1, MAX_TASK_FORMS + 1):
-        prefix = f"task{index}_"
-        if not any(key.startswith(prefix) for key in config.keys()):
+def _run_direct_subscription(chain: SubscribeChain, sid: Optional[int] = None,
+                             subscribe: Optional[Subscribe] = None,
+                             manual: Optional[bool] = False) -> Dict[str, Any]:
+    if not _lock.acquire(blocking=False):
+        return {"success": False, "message": "直搜订阅正在运行，本次跳过"}
+    try:
+        subscribe = subscribe or SubscribeOper().get(sid)
+        if not subscribe:
+            return {"success": False, "message": "订阅不存在"}
+        task = _direct_task(subscribe)
+        if not task:
+            return {"success": False, "message": "不是直搜订阅"}
+        if subscribe.date and not manual:
+            try:
+                subscribe_time = datetime.strptime(subscribe.date, "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - subscribe_time).total_seconds() < 60:
+                    logger.debug(f"直搜订阅 {subscribe.name} 新增小于1分钟，暂不搜索")
+                    return {"success": True, "message": "新增小于1分钟，暂不搜索"}
+            except Exception:
+                pass
+
+        logger.info(f"开始直搜订阅：{subscribe.name}，关键词：{task.get('keyword') or subscribe.keyword}")
+        contexts = _search_direct_contexts(chain, subscribe, task)
+        if not contexts:
+            logger.warn(f"直搜订阅 {subscribe.name} 未搜索到资源")
+            if subscribe.state == "N":
+                SubscribeOper().update(subscribe.id, {"state": "R"})
+            return {"success": True, "message": "未搜索到资源", "matched": 0, "downloaded": 0}
+
+        downloads = _download_direct_contexts(chain, subscribe, task, contexts)
+        if subscribe.state == "N":
+            SubscribeOper().update(subscribe.id, {"state": "R"})
+        return {
+            "success": True,
+            "message": f"匹配 {len(contexts)}，下载 {len(downloads)}",
+            "matched": len(contexts),
+            "downloaded": len(downloads),
+        }
+    except Exception as err:
+        logger.error(f"直搜订阅执行失败：{err}")
+        return {"success": False, "message": str(err)}
+    finally:
+        _lock.release()
+
+
+def _search_direct_contexts(chain: SubscribeChain, subscribe: Subscribe, task: Dict[str, Any]) -> List[Context]:
+    keyword = str(task.get("keyword") or subscribe.keyword or subscribe.name).strip()
+    pages = max(1, min(_parse_int(task.get("search_pages")) or 1, 5))
+    sites = task.get("sites")
+    if not sites:
+        sites = chain.get_sub_sites(subscribe)
+    candidates: List[Context] = []
+    for page in range(pages):
+        candidates.extend(SearchChain().search_by_title(title=keyword, page=page, sites=sites) or [])
+    contexts = _filter_contexts(subscribe, task, candidates)
+    return contexts
+
+
+def _filter_contexts(subscribe: Subscribe, task: Dict[str, Any], candidates: List[Context]) -> List[Context]:
+    media_type = MediaType(subscribe.type)
+    include_words = _parse_words(task.get("include") or subscribe.include)
+    exclude_words = _parse_words(task.get("exclude") or subscribe.exclude)
+    desired = _parse_episodes(task.get("episodes"))
+    season = _parse_int(task.get("season"))
+    if season is None:
+        season = subscribe.season
+    accept_unknown = bool(task.get("accept_unknown_episode", True))
+    results = []
+    for context in candidates:
+        torrent = context.torrent_info
+        if not torrent or not torrent.title:
             continue
-        forms.append({
-            "enabled": bool(config.get(f"{prefix}enabled", False)),
-            "id": str(config.get(f"{prefix}id") or ""),
-            "name": str(config.get(f"{prefix}name") or ""),
-            "keyword": str(config.get(f"{prefix}keyword") or ""),
-            "type": str(config.get(f"{prefix}type") or "tv"),
-            "season": config.get(f"{prefix}season") or "",
-            "episodes": str(config.get(f"{prefix}episodes") or ""),
-            "sites": config.get(f"{prefix}sites") or "",
-            "include": config.get(f"{prefix}include") or "",
-            "exclude": config.get(f"{prefix}exclude") or "",
-            "downloader": str(config.get(f"{prefix}downloader") or ""),
-            "save_path": str(config.get(f"{prefix}save_path") or ""),
-            "label": str(config.get(f"{prefix}label") or "直搜订阅"),
-            "max_downloads": config.get(f"{prefix}max_downloads") or 1,
-            "pages": config.get(f"{prefix}pages") or 1,
-            "accept_unknown_episode": bool(config.get(f"{prefix}accept_unknown_episode", False)),
-        })
-    return forms
-
-
-def _tasks_from_forms(forms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    tasks = []
-    for index, form in enumerate(forms or [], start=1):
-        keyword = str(form.get("keyword") or "").strip()
-        name = str(form.get("name") or keyword).strip()
-        if not keyword and not name:
+        text = f"{torrent.title} {torrent.description or ''}".lower()
+        if include_words and not all(word.lower() in text for word in include_words):
             continue
-        task_id = str(form.get("id") or f"direct-search-{index}").strip()
-        tasks.append({
-            "id": task_id,
-            "name": name or keyword,
-            "keyword": keyword or name,
-            "type": str(form.get("type") or "tv"),
-            "season": form.get("season") or "",
-            "episodes": str(form.get("episodes") or "").strip(),
-            "sites": form.get("sites") or "",
-            "include": form.get("include") or "",
-            "exclude": form.get("exclude") or "",
-            "downloader": str(form.get("downloader") or "").strip(),
-            "save_path": str(form.get("save_path") or "").strip(),
-            "label": str(form.get("label") or "直搜订阅").strip(),
-            "max_downloads": form.get("max_downloads") or 1,
-            "pages": form.get("pages") or 1,
-            "accept_unknown_episode": bool(form.get("accept_unknown_episode", False)),
-            "enabled": bool(form.get("enabled", False)),
+        if exclude_words and any(word.lower() in text for word in exclude_words):
+            continue
+        meta = MetaInfo(title=torrent.title, subtitle=torrent.description)
+        if media_type == MediaType.TV:
+            if season is not None and meta.begin_season is not None and meta.begin_season != season:
+                continue
+            if desired:
+                parsed = set(meta.episode_list or [])
+                if not parsed and not accept_unknown:
+                    continue
+                if parsed and not parsed.intersection(desired):
+                    continue
+        context.meta_info = meta
+        context.media_info = _build_media_info(subscribe, task)
+        context.resource_source = "direct_search_subscribe"
+        results.append(context)
+    return sorted(
+        results,
+        key=lambda item: (
+            int(getattr(item.torrent_info, "seeders", 0) or 0),
+            int(getattr(item.torrent_info, "size", 0) or 0),
+        ),
+        reverse=True,
+    )
+
+
+def _download_direct_contexts(
+        chain: SubscribeChain,
+        subscribe: Subscribe,
+        task: Dict[str, Any],
+        contexts: List[Context],
+) -> List[Context]:
+    media_type = MediaType(subscribe.type)
+    source = chain.get_subscribe_source_keyword(subscribe)
+    downloader = task.get("downloader") or subscribe.downloader
+    save_path = task.get("save_path") or subscribe.save_path
+    if media_type == MediaType.MOVIE:
+        downloads, _ = DownloadChain().batch_download(
+            contexts=contexts[:1],
+            no_exists=None,
+            username=subscribe.username,
+            save_path=save_path,
+            downloader=downloader,
+            source=source,
+        )
+        if downloads:
+            _native_update_note(chain, subscribe, downloads)
+            subscribe = SubscribeOper().get(subscribe.id)
+            getattr(chain, "_SubscribeChain__finish_subscribe")(subscribe=subscribe,
+                                                                 meta=contexts[0].meta_info,
+                                                                 mediainfo=contexts[0].media_info)
+        return downloads
+
+    note = set(int(item) for item in (subscribe.note or []) if str(item).isdigit())
+    desired = _parse_episodes(task.get("episodes"))
+    total_episode = _parse_int(task.get("total_episode")) or subscribe.total_episode
+    known_goal = bool(desired or total_episode)
+    if desired:
+        target_episodes = sorted(desired.difference(note))
+    elif total_episode:
+        start = subscribe.start_episode or 1
+        target_episodes = sorted(set(range(start, total_episode + 1)).difference(note))
+    else:
+        target_episodes = sorted(_episodes_from_contexts(contexts).difference(note))
+
+    if target_episodes:
+        media_key = subscribe.doubanid or f"{DIRECT_DOUBAN_PREFIX}{subscribe.id}"
+        season = subscribe.season or _parse_int(task.get("season")) or 1
+        no_exists = {
+            media_key: {
+                season: schemas.NotExistMediaInfo(
+                    season=season,
+                    episodes=target_episodes,
+                    total_episode=total_episode or max(target_episodes),
+                    start_episode=min(target_episodes),
+                )
+            }
+        }
+        downloads, lefts = DownloadChain().batch_download(
+            contexts=contexts,
+            no_exists=no_exists,
+            username=subscribe.username,
+            save_path=save_path,
+            downloader=downloader,
+            source=source,
+        )
+        if downloads:
+            _native_update_note(chain, subscribe, downloads)
+        _finish_or_update_direct(chain, subscribe.id, task, contexts, known_goal, lefts)
+        return downloads
+
+    if task.get("accept_unknown_episode", True):
+        for context in contexts[:1]:
+            download_id = DownloadChain().download_single(
+                context=context,
+                save_path=save_path,
+                source=source,
+                downloader=downloader,
+                username=subscribe.username,
+            )
+            if download_id:
+                SubscribeOper().update(subscribe.id, {
+                    "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "state": "R",
+                })
+                return [context]
+    return []
+
+
+def _finish_or_update_direct(chain: SubscribeChain, sid: int, task: Dict[str, Any],
+                             contexts: List[Context], known_goal: bool, lefts: Dict[str, Any]):
+    subscribe = SubscribeOper().get(sid)
+    if not subscribe:
+        return
+    if not known_goal:
+        SubscribeOper().update(sid, {
+            "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "state": "R",
         })
-    return tasks
+        return
+    desired = _parse_episodes(task.get("episodes"))
+    if not desired and subscribe.total_episode:
+        desired = set(range(subscribe.start_episode or 1, subscribe.total_episode + 1))
+    downloaded = set(int(item) for item in (subscribe.note or []) if str(item).isdigit())
+    lack = len(desired.difference(downloaded)) if desired else 0
+    SubscribeOper().update(sid, {
+        "lack_episode": lack,
+        "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "state": "R",
+    })
+    if lack == 0 and contexts and subscribe.state != "P":
+        subscribe = SubscribeOper().get(sid)
+        getattr(chain, "_SubscribeChain__finish_subscribe")(subscribe=subscribe,
+                                                             meta=contexts[0].meta_info,
+                                                             mediainfo=contexts[0].media_info)
 
 
-def _task_form_model(index: int, task: Dict[str, Any]) -> Dict[str, Any]:
-    prefix = f"task{index}_"
-    return {
-        f"{prefix}enabled": bool(task.get("enabled", False)),
-        f"{prefix}id": str(task.get("id") or f"direct-search-{index}"),
-        f"{prefix}name": str(task.get("name") or ""),
-        f"{prefix}keyword": str(task.get("keyword") or ""),
-        f"{prefix}type": str(task.get("type") or "tv"),
-        f"{prefix}season": task.get("season") or "",
-        f"{prefix}episodes": str(task.get("episodes") or ""),
-        f"{prefix}sites": task.get("sites") or "",
-        f"{prefix}include": task.get("include") or "",
-        f"{prefix}exclude": task.get("exclude") or "",
-        f"{prefix}downloader": str(task.get("downloader") or ""),
-        f"{prefix}save_path": str(task.get("save_path") or ""),
-        f"{prefix}label": str(task.get("label") or "直搜订阅"),
-        f"{prefix}max_downloads": int(task.get("max_downloads") or 1),
-        f"{prefix}pages": int(task.get("pages") or 1),
-        f"{prefix}accept_unknown_episode": bool(task.get("accept_unknown_episode", False)),
-    }
+def _native_update_note(chain: SubscribeChain, subscribe: Subscribe, downloads: List[Context]):
+    getattr(chain, "_SubscribeChain__update_subscribe_note")(subscribe=subscribe, downloads=downloads)
 
 
-def _join_values(value: Any) -> str:
-    if value in (None, "", []):
-        return ""
-    if isinstance(value, list):
-        return ", ".join(str(item) for item in value if str(item).strip())
-    return str(value)
+def _build_media_info(subscribe: Subscribe, task: Dict[str, Any]) -> MediaInfo:
+    media = MediaInfo()
+    media.type = MediaType(subscribe.type)
+    media.title = subscribe.name
+    media.year = subscribe.year
+    media.season = subscribe.season
+    media.douban_id = subscribe.doubanid or f"{DIRECT_DOUBAN_PREFIX}{subscribe.id}"
+    media.category = task.get("media_category") or subscribe.media_category or ""
+    media.source = PLUGIN_ID
+    return media
 
 
-def _col(cols: int, md: int, child: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "component": "VCol",
-        "props": {"cols": cols, "md": md},
-        "content": [child],
-    }
+def _direct_task(subscribe: Subscribe) -> Optional[Dict[str, Any]]:
+    if not subscribe:
+        return None
+    direct_map = _direct_map()
+    task = direct_map.get(str(subscribe.id))
+    if task:
+        return task
+    if str(subscribe.doubanid or "").startswith(DIRECT_DOUBAN_PREFIX):
+        return {
+            "title": subscribe.name,
+            "keyword": subscribe.keyword or subscribe.name,
+            "type": subscribe.type,
+            "year": subscribe.year,
+            "season": subscribe.season,
+            "episodes": "",
+            "total_episode": subscribe.total_episode,
+            "search_pages": 1,
+            "include": subscribe.include or "",
+            "exclude": subscribe.exclude or "",
+            "sites": subscribe.sites or [],
+            "downloader": subscribe.downloader or "",
+            "save_path": subscribe.save_path or "",
+            "media_category": subscribe.media_category or "",
+            "accept_unknown_episode": True,
+        }
+    return None
 
 
-def _section_card(title: str, content: List[dict]) -> Dict[str, Any]:
-    return {
-        "component": "VCard",
-        "props": {"variant": "outlined", "class": "mb-4"},
-        "content": [
-            {"component": "VCardTitle", "text": title},
-            {"component": "VCardText", "content": content},
-        ],
-    }
+def _is_direct_subscribe(subscribe: Optional[Subscribe]) -> bool:
+    return bool(_direct_task(subscribe))
 
 
-def _task_card(index: int) -> Dict[str, Any]:
-    prefix = f"task{index}_"
-    return {
-        "component": "VCard",
-        "props": {"variant": "tonal", "class": "mb-3"},
-        "content": [
-            {
-                "component": "VCardTitle",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 8, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}name",
-                                    "label": f"任务 {index} 名称",
-                                    "placeholder": "Re 从零开始的异世界生活 第四季",
-                                    "density": "comfortable",
-                                },
-                            }),
-                            _col(12, 4, {
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": f"{prefix}enabled",
-                                    "label": "启用任务",
-                                    "color": "primary",
-                                },
-                            }),
-                        ],
-                    },
-                ],
-            },
-            {
-                "component": "VCardText",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 8, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}keyword",
-                                    "label": "搜索关键词",
-                                    "placeholder": "站点搜索用词，越贴近站内标题越稳",
-                                    "hint": "这个词会直接送到站点搜索",
-                                },
-                            }),
-                            _col(12, 4, {
-                                "component": "VSelect",
-                                "props": {
-                                    "model": f"{prefix}type",
-                                    "label": "类型",
-                                    "items": [
-                                        {"title": "电视剧", "value": "tv"},
-                                        {"title": "电影", "value": "movie"},
-                                    ],
-                                },
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 3, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}season",
-                                    "label": "季",
-                                    "type": "number",
-                                    "placeholder": "4",
-                                    "hint": "电影可留空",
-                                },
-                            }),
-                            _col(12, 3, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}episodes",
-                                    "label": "集数",
-                                    "placeholder": "1-12,14",
-                                    "hint": "留空则不过滤集数",
-                                },
-                            }),
-                            _col(12, 3, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}max_downloads",
-                                    "label": "单次最多下载",
-                                    "type": "number",
-                                    "min": 1,
-                                    "max": 10,
-                                },
-                            }),
-                            _col(12, 3, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}pages",
-                                    "label": "搜索页数",
-                                    "type": "number",
-                                    "min": 1,
-                                    "max": 5,
-                                },
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 6, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}include",
-                                    "label": "必须包含",
-                                    "placeholder": "2160p, HEVC",
-                                    "hint": "逗号分隔，全部命中才下载",
-                                },
-                            }),
-                            _col(12, 6, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}exclude",
-                                    "label": "排除关键词",
-                                    "placeholder": "合集, 国语, 试看",
-                                    "hint": "逗号分隔，命中任意一个就跳过",
-                                },
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 4, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}sites",
-                                    "label": "站点 ID",
-                                    "placeholder": "1, 2, 8",
-                                    "hint": "留空搜索全部站点",
-                                },
-                            }),
-                            _col(12, 4, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}downloader",
-                                    "label": "下载器",
-                                    "placeholder": "留空使用默认",
-                                },
-                            }),
-                            _col(12, 4, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}label",
-                                    "label": "下载标签",
-                                    "placeholder": "直搜订阅",
-                                },
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            _col(12, 8, {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": f"{prefix}save_path",
-                                    "label": "保存路径",
-                                    "placeholder": "留空使用系统规则",
-                                },
-                            }),
-                            _col(12, 4, {
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": f"{prefix}accept_unknown_episode",
-                                    "label": "接受无法识别集数",
-                                    "hint": "资源站标题解析不出 E01 时才需要打开",
-                                },
-                            }),
-                        ],
-                    },
-                ],
-            },
-        ],
-    }
+def _direct_map(plugin: Optional[directsearchsubscribe] = None) -> Dict[str, Dict[str, Any]]:
+    if plugin:
+        data = plugin.get_data(DIRECT_SUBS_KEY) or {}
+    else:
+        data = directsearchsubscribe().get_data(DIRECT_SUBS_KEY) or {}
+    return data if isinstance(data, dict) else {}
 
 
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _append_history(plugin: directsearchsubscribe, result: Dict[str, Any]):
+    history = plugin.get_data(HISTORY_KEY) or []
+    history.insert(0, {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": result.get("status") or ("成功" if result.get("success") else "失败"),
+        "title": result.get("title"),
+        "message": result.get("message"),
+    })
+    plugin.save_data(HISTORY_KEY, history[:MAX_HISTORY])
 
 
 def _parse_media_type(value: Any) -> MediaType:
     text = str(value or "tv").strip().lower()
-    if text in {"movie", "电影", "m"}:
+    if text in {"movie", "电影", "m", MediaType.MOVIE.value}:
         return MediaType.MOVIE
     return MediaType.TV
-
-
-def _media_type_label(value: Any) -> str:
-    return "电影" if _parse_media_type(value) == MediaType.MOVIE else "电视剧"
 
 
 def _parse_int(value: Any) -> Optional[int]:
@@ -774,7 +835,7 @@ def _parse_sites(value: Any) -> Optional[List[int]]:
     if value in (None, "", []):
         return None
     if isinstance(value, str):
-        items = re.split(r"[,，\\s]+", value.strip())
+        items = re.split(r"[,，\s]+", value.strip())
     elif isinstance(value, list):
         items = value
     else:
@@ -794,7 +855,7 @@ def _parse_words(value: Any) -> List[str]:
         return []
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
-    return [item.strip() for item in re.split(r"[,，\\n]+", str(value)) if item.strip()]
+    return [item.strip() for item in re.split(r"[,，\n]+", str(value)) if item.strip()]
 
 
 def _parse_episodes(value: Any) -> Set[int]:
@@ -803,13 +864,13 @@ def _parse_episodes(value: Any) -> Set[int]:
     if isinstance(value, list):
         raw_parts = [str(item) for item in value]
     else:
-        raw_parts = re.split(r"[,，\\s]+", str(value))
+        raw_parts = re.split(r"[,，\s]+", str(value))
     episodes: Set[int] = set()
     for part in raw_parts:
         part = part.strip()
         if not part:
             continue
-        match = re.match(r"^(\\d+)\\s*-\\s*(\\d+)$", part)
+        match = re.match(r"^(\d+)\s*-\s*(\d+)$", part)
         if match:
             start, end = int(match.group(1)), int(match.group(2))
             if start > end:
@@ -821,66 +882,26 @@ def _parse_episodes(value: Any) -> Set[int]:
     return episodes
 
 
-def _download_episodes(meta: MetaInfo, desired: Set[int]) -> Optional[Set[int]]:
-    if not desired:
-        return None
-    parsed = set(meta.episode_list or [])
-    return parsed.intersection(desired) or desired
+def _episodes_from_contexts(contexts: List[Context]) -> Set[int]:
+    episodes = set()
+    for context in contexts:
+        episodes.update(context.meta_info.episode_list or [])
+    return episodes
 
 
-def _build_media_info(task: Dict[str, Any], media_type: MediaType) -> MediaInfo:
-    media = MediaInfo()
-    media.type = media_type
-    media.title = str(task.get("name") or task.get("keyword") or "").strip()
-    media.season = _parse_int(task.get("season"))
-    media.category = str(task.get("category") or "").strip()
-    return media
+def _col(cols: int, md: int, child: Dict[str, Any]) -> Dict[str, Any]:
+    return {"component": "VCol", "props": {"cols": cols, "md": md}, "content": [child]}
 
 
-def _task_id(task: Dict[str, Any]) -> str:
-    return str(task.get("id") or task.get("name") or task.get("keyword") or "default").strip()
-
-
-def _fingerprint(context: Context) -> str:
-    torrent = context.torrent_info
-    return "|".join([
-        str(torrent.site_name or ""),
-        str(torrent.title or ""),
-        str(torrent.description or ""),
-        str(torrent.enclosure or torrent.page_url or ""),
-    ])
-
-
-def _seen_record(context: Context, download_id: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
-    torrent = context.torrent_info
+def _section_card(title: str, content: List[dict]) -> Dict[str, Any]:
     return {
-        "time": _now(),
-        "title": torrent.title,
-        "site": torrent.site_name,
-        "download_id": download_id,
-        "dry_run": dry_run,
+        "component": "VCard",
+        "props": {"variant": "outlined", "class": "mb-4"},
+        "content": [
+            {"component": "VCardTitle", "text": title},
+            {"component": "VCardText", "content": content},
+        ],
     }
-
-
-def _append_history(
-        history: List[dict],
-        task: Dict[str, Any],
-        context: Optional[Context],
-        status: str,
-        message: str = "",
-):
-    torrent = context.torrent_info if context else None
-    history.insert(0, {
-        "time": _now(),
-        "task_id": _task_id(task),
-        "task_name": task.get("name") or task.get("keyword") or _task_id(task),
-        "status": status,
-        "message": message,
-        "title": torrent.title if torrent else "",
-        "site": torrent.site_name if torrent else "",
-        "size": StringUtils.str_filesize(torrent.size) if torrent and torrent.size else "",
-    })
-    del history[MAX_HISTORY:]
 
 
 def _table(title: str, rows: List[dict]) -> dict:
@@ -902,3 +923,12 @@ def _table(title: str, rows: List[dict]) -> dict:
             },
         ],
     }
+
+
+def _state_label(state: str) -> str:
+    return {
+        "N": "新建",
+        "R": "订阅中",
+        "P": "待定",
+        "S": "暂停",
+    }.get(state or "", state or "")
