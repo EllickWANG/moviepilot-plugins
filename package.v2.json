@@ -15,6 +15,14 @@
     "author": "Ellick",
     "level": 1
   },
+  "directsearchsubscribe": {
+    "name": "直搜订阅",
+    "description": "按自定义关键词直接搜索站点并自动下载，不依赖 TMDB、豆瓣或 Bangumi 识别。",
+    "version": "1.0.0",
+    "icon": "mdi-magnify-scan",
+    "author": "Ellick",
+    "level": 1
+  },
   "siteadapter": {
     "name": "站点适配器",
     "description": "配置化站点索引与用户数据解析适配。",
