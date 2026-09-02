@@ -22,6 +22,7 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 
 | 插件 ID | 名称 | 状态 | 说明文档 |
 | --- | --- | --- | --- |
+| `directsearchsubscribe` | 直搜订阅 | 正式使用 | [README](plugins.v2/directsearchsubscribe/README.md) |
 | `sourceprioritysubscribefix` | 订阅外部源优先 | 正式使用 | [README](plugins.v2/sourceprioritysubscribefix/README.md) |
 | `siteadapter` | 站点适配器 | 已整合到站点工具箱 | [README](plugins.v2/siteadapter/README.md) |
 | `sitetoolbox` | 站点工具箱 | 正式使用 | [README](plugins.v2/sitetoolbox/README.md) |
@@ -29,6 +30,21 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 | `sourceprioritysubscribe` | 订阅外部源优先 | 旧兼容版 | [README](plugins.v2/sourceprioritysubscribe/README.md) |
 
 ## 插件说明
+
+### 直搜订阅
+
+`directsearchsubscribe` 完全在插件内维护人工节目任务、目标集数、下载进度和候选结果，并按独立 cron 定时直搜站点。它不会创建系统订阅，也不使用 TMDB、豆瓣或 Bangumi 完成搜索。
+
+主要能力：
+
+- 自定义电影或电视剧任务、季、总集数、指定集数和已有集数。
+- 多搜索词、标题别名、包含词、排除词和站点范围。
+- 默认只预览候选，可按任务单独开启自动下载。
+- 未知集数默认拒绝自动下载，成功资源使用指纹防重。
+- 插件详情页维护进度、运行状态、候选列表和可恢复回收站。
+- 旧版创建的系统订阅不自动迁移或删除，升级后会给出人工清理提示。
+
+详细用法见 [plugins.v2/directsearchsubscribe/README.md](plugins.v2/directsearchsubscribe/README.md)。
 
 ### 订阅外部源优先
 
