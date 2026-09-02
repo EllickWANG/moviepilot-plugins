@@ -12,7 +12,7 @@ from fastapi import Body
 from app import schemas
 from app.chain.download import DownloadChain
 from app.chain.search import SearchChain
-from app.core.config import global_vars
+from app.core.config import global_vars, settings
 from app.core.context import Context, MediaInfo
 from app.core.metainfo import MetaInfo
 from app.db.site_oper import SiteOper
@@ -52,7 +52,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；不创建系统订阅，也不访问媒体信息源。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -566,7 +566,9 @@ class directsearchsubscribe(_PluginBase):
                     source=f"DirectSearchSubscribe|{task_id}",
                     downloader=task.get("downloader") or None,
                     username=self.plugin_name,
-                    label="直搜订阅",
+                    # MoviePilot 的下载管理只展示带系统 TORRENT_TAG 的任务；
+                    # 自定义标签会替代下载模块的默认标签，因此必须显式同时传入。
+                    label=_download_labels(),
                     return_detail=True,
                 )
             except Exception as err:
@@ -740,6 +742,17 @@ def _same_identity(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
 def _response(result: Dict[str, Any]) -> schemas.Response:
     return schemas.Response(success=bool(result.get("success")), message=result.get("message"),
                             data=result.get("task") or result)
+
+
+def _download_labels() -> str:
+    """组合 MoviePilot 系统标签和插件标签，并保持顺序去重。"""
+    labels = []
+    for raw in (settings.TORRENT_TAG, "直搜订阅"):
+        for label in str(raw or "").split(","):
+            label = label.strip()
+            if label and label not in labels:
+                labels.append(label)
+    return ",".join(labels)
 
 
 def _api(path: str, endpoint: Any, methods: List[str], summary: str) -> Dict[str, Any]:

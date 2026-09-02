@@ -91,7 +91,13 @@ class ArchitectureBoundaryTest(unittest.TestCase):
     def test_manifest_versions_match_plugin(self):
         for filename in ("package.v2.json", "package.json"):
             package = json.loads((ROOT / filename).read_text(encoding="utf-8"))
-            self.assertEqual(package["directsearchsubscribe"]["version"], "2.0.0")
+            self.assertEqual(package["directsearchsubscribe"]["version"], "2.0.1")
+
+    def test_downloads_keep_moviepilot_system_tag(self):
+        source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("from app.core.config import global_vars, settings", source)
+        self.assertIn("label=_download_labels()", source)
+        self.assertIn("settings.TORRENT_TAG", source)
 
 
 if __name__ == "__main__":
