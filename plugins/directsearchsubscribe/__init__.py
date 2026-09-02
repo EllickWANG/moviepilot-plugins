@@ -52,7 +52,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；不创建系统订阅，也不访问媒体信息源。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.0.1"
+    plugin_version = "2.0.2"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -88,6 +88,10 @@ class directsearchsubscribe(_PluginBase):
         self.__class__._max_downloads = self._max_downloads
         self.__class__._task_gap = self._task_gap
         self._config = config
+
+        # 2.0.0 创建的任务只有插件标签，MoviePilot 下载管理会将其过滤掉。
+        # 标签追加是幂等操作，每次加载时顺便修复仍保留在下载器中的历史任务。
+        self._repair_download_tags()
 
         if parse_bool(config.get("save_task_now"), False):
             result = self.create_task(_task_payload_from_config(config), update_same=True)
@@ -643,6 +647,29 @@ class directsearchsubscribe(_PluginBase):
             task["updated_at"] = now_text()
             tasks[task_id] = task
             self._save_tasks(tasks)
+
+    def _repair_download_tags(self):
+        """为旧版插件已添加的下载任务补充 MoviePilot 系统标签。"""
+        system_tag = str(settings.TORRENT_TAG or "").strip()
+        if not system_tag:
+            return
+        for task in self._load_tasks().values():
+            hashes = list(dict.fromkeys(
+                str(record.get("hash") or "").strip()
+                for record in task.get("download_records") or []
+                if record.get("hash")
+            ))
+            if not hashes:
+                continue
+            try:
+                DownloadChain().set_torrents_tag(
+                    hashs=hashes,
+                    tags=[system_tag],
+                    downloader=task.get("downloader") or None,
+                )
+                logger.info(f"直搜订阅已为 {len(hashes)} 个历史下载补充系统标签：{system_tag}")
+            except Exception as err:
+                logger.warning(f"直搜订阅补充历史下载系统标签失败：{err}")
 
 
 def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
