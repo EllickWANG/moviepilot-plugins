@@ -47,6 +47,9 @@ class TaskSafetyTest(unittest.TestCase):
         self.assertFalse(task["auto_download"])
         self.assertFalse(task["accept_unknown_episode"])
         self.assertTrue(task["strict_title_match"])
+        self.assertTrue(task["dedupe_history"])
+        self.assertEqual(task["priority_mode"], "seeders")
+        self.assertEqual(task["min_seeders"], 0)
 
     def test_alias_title_and_word_filters(self):
         task = CORE.normalize_task({
@@ -70,6 +73,33 @@ class TaskSafetyTest(unittest.TestCase):
         popular = CORE.candidate_score({1}, {1, 2, 3}, seeders=100000, free_factor=0, size=10)
         self.assertGreater(broad, popular)
 
+    def test_cross_site_identity_and_duplicate_messages(self):
+        self.assertEqual(
+            CORE.resource_identity("Show.S01E01 1080p"),
+            CORE.resource_identity("show s01e01 1080P"),
+        )
+        self.assertTrue(CORE.is_duplicate_download_message("下载任务已存在"))
+        self.assertTrue(CORE.is_duplicate_download_message("Torrent already exists"))
+        self.assertFalse(CORE.is_duplicate_download_message("添加下载成功"))
+
+    def test_configurable_candidate_priorities(self):
+        missing = {1}
+        low_seeds = CORE.candidate_sort_key("seeders", {1}, missing, 2, 1, 100, "2026-01-01")
+        high_seeds = CORE.candidate_sort_key("seeders", {1}, missing, 20, 1, 100, "2025-01-01")
+        self.assertGreater(high_seeds, low_seeds)
+
+        paid = CORE.candidate_sort_key("free", {1}, missing, 100, 1, 100, "2026-01-01")
+        free = CORE.candidate_sort_key("free", {1}, missing, 1, 0, 100, "2025-01-01")
+        self.assertGreater(free, paid)
+
+        small = CORE.candidate_sort_key("smallest", {1}, missing, 1, 1, 100, "2026-01-01")
+        large = CORE.candidate_sort_key("smallest", {1}, missing, 1, 1, 1000, "2026-01-01")
+        self.assertGreater(small, large)
+
+        known = CORE.candidate_sort_key("seeders", {1}, missing, 1, 1, 100, "2025-01-01")
+        unknown = CORE.candidate_sort_key("seeders", set(), missing, 100000, 0, 100, "2026-01-01")
+        self.assertGreater(known, unknown)
+
 
 class ArchitectureBoundaryTest(unittest.TestCase):
     def test_plugin_does_not_use_native_subscription_classes(self):
@@ -91,7 +121,7 @@ class ArchitectureBoundaryTest(unittest.TestCase):
     def test_manifest_versions_match_plugin(self):
         for filename in ("package.v2.json", "package.json"):
             package = json.loads((ROOT / filename).read_text(encoding="utf-8"))
-            self.assertEqual(package["directsearchsubscribe"]["version"], "2.0.2")
+            self.assertEqual(package["directsearchsubscribe"]["version"], "2.1.0")
 
     def test_downloads_keep_moviepilot_system_tag(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
@@ -100,6 +130,8 @@ class ArchitectureBoundaryTest(unittest.TestCase):
         self.assertIn("settings.TORRENT_TAG", source)
         self.assertIn("self._repair_download_tags()", source)
         self.assertIn("DownloadChain().set_torrents_tag", source)
+        self.assertIn("DownloadHistoryOper().list_by_page", source)
+        self.assertIn("unknown_downloaded", source)
 
 
 if __name__ == "__main__":

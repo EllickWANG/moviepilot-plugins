@@ -15,6 +15,7 @@ from app.chain.search import SearchChain
 from app.core.config import global_vars, settings
 from app.core.context import Context, MediaInfo
 from app.core.metainfo import MetaInfo
+from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.site_oper import SiteOper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -23,14 +24,18 @@ from app.schemas.types import MediaType, NotificationType
 from .core import (
     MAX_RESOURCE_HISTORY,
     candidate_score,
+    candidate_sort_key,
     episodes_text,
+    is_duplicate_download_message,
     missing_episodes,
     normalize_task,
+    normalize_priority_mode,
     now_text,
     parse_bool,
     parse_episodes,
     parse_int,
     resource_fingerprint,
+    resource_identity,
     target_episodes,
     task_search_keywords,
     title_matches,
@@ -52,7 +57,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；不创建系统订阅，也不访问媒体信息源。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.0.2"
+    plugin_version = "2.1.0"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -66,6 +71,7 @@ class directsearchsubscribe(_PluginBase):
     _config: Dict[str, Any] = {}
     _data_lock = threading.RLock()
     _running_lock = threading.Lock()
+    _download_lock = threading.Lock()
     _running_ids: Set[str] = set()
     _active_stop_event = threading.Event()
     _stop_event: threading.Event
@@ -217,6 +223,28 @@ class directsearchsubscribe(_PluginBase):
                             _col(12, 4, _number("search_pages", "每个关键词搜索页数", 1, 5)),
                         ]),
                         _row([
+                            _col(12, 4, {
+                                "component": "VSelect",
+                                "props": {
+                                    "model": "priority_mode",
+                                    "label": "种子优先规则",
+                                    "items": [
+                                        {"title": "做种数优先", "value": "seeders"},
+                                        {"title": "综合优先", "value": "balanced"},
+                                        {"title": "免费优先", "value": "free"},
+                                        {"title": "发布时间优先", "value": "latest"},
+                                        {"title": "小体积优先", "value": "smallest"},
+                                        {"title": "大体积优先", "value": "largest"},
+                                    ],
+                                },
+                            }),
+                            _col(12, 4, _number("min_seeders", "最低做种数", 0, 1000000)),
+                            _col(12, 4, _switch(
+                                "dedupe_history", "下载历史去重",
+                                "检查插件记录和 MoviePilot 下载历史，避免跨任务重复下载",
+                            )),
+                        ]),
+                        _row([
                             _col(12, 4, _field("downloader", "下载器（可选）", "留空使用站点或系统默认")),
                             _col(12, 4, _field("save_path", "保存路径（可选）", "/media/downloads")),
                             _col(12, 4, _field("media_category", "二级分类（可选）", "日番")),
@@ -229,7 +257,7 @@ class directsearchsubscribe(_PluginBase):
                         _row([
                             _col(12, 4, _switch(
                                 "accept_unknown_episode", "允许未知集数下载",
-                                "高风险：标题解析不出集数时也可自动下载",
+                                "高风险：标题解析不出集数时也可自动下载；每个任务最多选择一个",
                             )),
                             _col(12, 4, _switch("save_task_now", "保存为插件任务", "保存配置时执行一次并自动复位")),
                             _col(12, 4, _switch("run_after_save", "保存后立即检查", "创建或更新成功后启动后台检查")),
@@ -260,6 +288,9 @@ class directsearchsubscribe(_PluginBase):
             "exclude": "",
             "sites": [],
             "search_pages": 1,
+            "priority_mode": "seeders",
+            "min_seeders": 0,
+            "dedupe_history": True,
             "downloader": "",
             "save_path": "",
             "media_category": "",
@@ -456,10 +487,32 @@ class directsearchsubscribe(_PluginBase):
             return
         if not manual and (not task.get("enabled") or task.get("status") == "completed"):
             return
+
+        known_identities = self._known_resource_identities()
+        if parse_bool(task.get("dedupe_history"), True):
+            history_identities, history_episodes, history_has_movie = self._history_snapshot(task)
+            known_identities.update(history_identities)
+            downloaded = parse_episodes(task.get("downloaded_episodes"))
+            recovered = history_episodes.difference(downloaded)
+            if recovered:
+                downloaded.update(recovered)
+                self._update_runtime(task_id, downloaded_episodes=sorted(downloaded))
+                task = self._load_tasks().get(task_id) or task
+            target = target_episodes(task)
+            if history_has_movie or target and target.issubset(downloaded):
+                message = "下载历史已覆盖全部目标，未重复搜索下载"
+                self._update_runtime(
+                    task_id, status="completed", last_status="success", last_run_at=now_text(),
+                    last_message=message, last_download_count=0, last_duplicate_count=len(recovered),
+                )
+                return
+
         self._update_runtime(task_id, status="running", last_status="running",
                              last_run_at=now_text(), last_message="正在直接搜索站点")
         try:
-            candidates, search_errors = self._search_task(task, stop_event)
+            candidates, search_errors, duplicate_count = self._search_task(
+                task, stop_event, known_identities
+            )
             results = [item[1] for item in candidates]
             self._update_runtime(
                 task_id,
@@ -470,7 +523,13 @@ class directsearchsubscribe(_PluginBase):
             task = self._load_tasks().get(task_id)
             if not task:
                 return
-            downloads = self._download_candidates(task, candidates, stop_event) if task.get("auto_download") else []
+            if task.get("auto_download"):
+                downloads, runtime_duplicates = self._download_candidates(
+                    task, candidates, stop_event, known_identities
+                )
+                duplicate_count += runtime_duplicates
+            else:
+                downloads = []
             latest = self._load_tasks().get(task_id)
             if not latest:
                 return
@@ -485,13 +544,16 @@ class directsearchsubscribe(_PluginBase):
             else:
                 status = "paused"
             message = f"候选 {len(results)}，新增下载 {len(downloads)}"
+            if duplicate_count:
+                message += f"，跳过重复 {duplicate_count}"
             if not latest.get("auto_download"):
                 message += "（预览模式）"
             if search_errors:
                 message += f"，搜索异常 {len(search_errors)} 个"
             self._update_runtime(task_id, status=status,
                                  last_status="success" if not search_errors or results else "warning",
-                                 last_message=message, last_download_count=len(downloads))
+                                 last_message=message, last_download_count=len(downloads),
+                                 last_duplicate_count=duplicate_count)
             if downloads and self._notify:
                 self.post_message(mtype=NotificationType.Plugin,
                                   title=f"直搜订阅：{latest.get('name')}", text=message)
@@ -500,10 +562,12 @@ class directsearchsubscribe(_PluginBase):
             logger.error(f"直搜订阅 {task.get('name')} 执行失败：{err}", exc_info=True)
             self._update_runtime(task_id, status="error", last_status="error", last_message=str(err))
 
-    def _search_task(self, task: Dict[str, Any], stop_event: threading.Event) \
-            -> Tuple[List[Tuple[Context, Dict[str, Any]]], List[str]]:
+    def _search_task(self, task: Dict[str, Any], stop_event: threading.Event,
+                     known_identities: Set[str]) \
+            -> Tuple[List[Tuple[Context, Dict[str, Any]]], List[str], int]:
         contexts: Dict[str, Tuple[Context, Dict[str, Any]]] = {}
         errors = []
+        duplicate_count = 0
         missing = missing_episodes(task)
         downloaded = parse_episodes(task.get("downloaded_episodes"))
         downloaded_fingerprints = set(task.get("downloaded_fingerprints") or [])
@@ -524,23 +588,55 @@ class directsearchsubscribe(_PluginBase):
                     if not prepared:
                         continue
                     fingerprint = prepared[1]["fingerprint"]
-                    if fingerprint in downloaded_fingerprints or fingerprint in contexts:
+                    identity = prepared[1]["resource_identity"] or fingerprint
+                    if fingerprint in downloaded_fingerprints or identity in known_identities:
+                        duplicate_count += 1
                         continue
-                    contexts[fingerprint] = prepared
-        ordered = sorted(contexts.values(), key=lambda item: int(item[1].get("score") or 0), reverse=True)
-        return ordered[:50], errors
+                    existing = contexts.get(identity)
+                    if existing:
+                        duplicate_count += 1
+                        if _candidate_priority_key(task, prepared[1], missing) \
+                                > _candidate_priority_key(task, existing[1], missing):
+                            contexts[identity] = prepared
+                        continue
+                    contexts[identity] = prepared
+        ordered = sorted(
+            contexts.values(),
+            key=lambda item: _candidate_priority_key(task, item[1], missing),
+            reverse=True,
+        )
+        return ordered[:50], errors, duplicate_count
 
     def _download_candidates(self, task: Dict[str, Any],
                              candidates: List[Tuple[Context, Dict[str, Any]]],
-                             stop_event: threading.Event) -> List[Dict[str, Any]]:
+                             stop_event: threading.Event,
+                             known_identities: Set[str]) -> Tuple[List[Dict[str, Any]], int]:
+        """串行执行跨任务下载，避免两个手动任务竞态添加同一资源。"""
+        with self.__class__._download_lock:
+            known_identities.update(self._known_resource_identities())
+            return self._download_candidates_locked(
+                task, candidates, stop_event, known_identities
+            )
+
+    def _download_candidates_locked(self, task: Dict[str, Any],
+                                    candidates: List[Tuple[Context, Dict[str, Any]]],
+                                    stop_event: threading.Event,
+                                    known_identities: Set[str]) -> Tuple[List[Dict[str, Any]], int]:
         task_id = str(task["id"])
         downloaded = parse_episodes(task.get("downloaded_episodes"))
         target = target_episodes(task)
         fingerprints = set(task.get("downloaded_fingerprints") or [])
         records = list(task.get("download_records") or [])
         downloads = []
+        duplicate_count = 0
+        unknown_downloaded = any(
+            not parse_episodes(record.get("episodes")) for record in records
+            if not record.get("duplicate")
+        )
         for context, result in candidates:
             if len(downloads) >= self._max_downloads:
+                break
+            if task.get("type") == MediaType.MOVIE.value and downloads:
                 break
             if stop_event.is_set() or global_vars.is_system_stopped:
                 break
@@ -548,7 +644,9 @@ class directsearchsubscribe(_PluginBase):
             if not current or not current.get("auto_download"):
                 break
             fingerprint = result["fingerprint"]
-            if fingerprint in fingerprints:
+            identity = result.get("resource_identity") or fingerprint
+            if fingerprint in fingerprints or identity in known_identities:
+                duplicate_count += 1
                 continue
             candidate_episodes = set(result.get("episode_numbers") or [])
             selected: Optional[Set[int]] = None
@@ -561,6 +659,10 @@ class directsearchsubscribe(_PluginBase):
                 if not candidate_episodes and not task.get("accept_unknown_episode"):
                     continue
                 if not candidate_episodes:
+                    if unknown_downloaded:
+                        result["skip_reason"] = "已选择过未知集数资源"
+                        duplicate_count += 1
+                        continue
                     selected = None
             try:
                 download_hash, error = DownloadChain().download_single(
@@ -579,18 +681,39 @@ class directsearchsubscribe(_PluginBase):
                 logger.warning(f"直搜订阅添加候选失败：{result.get('title')} - {err}")
                 result["download_error"] = str(err)
                 continue
+            if is_duplicate_download_message(error):
+                result["duplicate"] = True
+                result["skip_reason"] = error or "下载任务已存在"
+                duplicate_count += 1
+                fingerprints.add(fingerprint)
+                known_identities.add(identity)
+                if selected:
+                    downloaded.update(selected)
+                if not candidate_episodes and task.get("type") == MediaType.TV.value:
+                    unknown_downloaded = True
+                self._update_runtime(
+                    task_id,
+                    downloaded_episodes=sorted(downloaded),
+                    downloaded_fingerprints=list(fingerprints)[-MAX_RESOURCE_HISTORY:],
+                    last_results=[item[1] for item in candidates],
+                )
+                continue
             if not download_hash:
                 result["download_error"] = error or "添加下载失败"
                 continue
             if selected:
                 downloaded.update(selected)
             fingerprints.add(fingerprint)
+            known_identities.add(identity)
             record = {
                 "time": now_text(), "fingerprint": fingerprint, "hash": download_hash,
                 "site": result.get("site"), "title": result.get("title"),
-                "episodes": episodes_text(selected or []),
+                "episodes": episodes_text(selected or []), "size": result.get("size") or 0,
+                "resource_identity": identity,
             }
             records.append(record)
+            if not candidate_episodes and task.get("type") == MediaType.TV.value:
+                unknown_downloaded = True
             result["downloaded"] = True
             downloads.append(record)
             self._update_runtime(
@@ -601,7 +724,7 @@ class directsearchsubscribe(_PluginBase):
                 last_results=[item[1] for item in candidates],
             )
         self._update_runtime(task_id, last_results=[item[1] for item in candidates])
-        return downloads
+        return downloads, duplicate_count
 
     @classmethod
     def _claim_task(cls, task_id: str) -> bool:
@@ -648,6 +771,64 @@ class directsearchsubscribe(_PluginBase):
             tasks[task_id] = task
             self._save_tasks(tasks)
 
+    def _known_resource_identities(self) -> Set[str]:
+        """汇总活动任务和回收站记录，任务删除重建后仍然可以去重。"""
+        identities: Set[str] = set()
+        stored_tasks = [*self._load_tasks().values(), *self._load_trash().values()]
+        for task in stored_tasks:
+            for record in task.get("download_records") or []:
+                identity = str(record.get("resource_identity") or "") \
+                    or resource_identity(record.get("title"))
+                if identity:
+                    identities.add(identity)
+        return identities
+
+    @staticmethod
+    def _history_snapshot(task: Dict[str, Any]) -> Tuple[Set[str], Set[int], bool]:
+        """读取 MoviePilot 下载历史中的资源标识和本任务已有集数。"""
+        identities: Set[str] = set()
+        episodes: Set[int] = set()
+        matched_movie = False
+        try:
+            histories = DownloadHistoryOper().list_by_page(page=1, count=5000) or []
+        except Exception as err:
+            logger.warning(f"直搜订阅读取下载历史失败，继续仅按插件记录去重：{err}")
+            return identities, episodes, matched_movie
+
+        strict_task = dict(task)
+        strict_task["strict_title_match"] = True
+        task_season = parse_int(task.get("season"), minimum=1)
+        for history in histories:
+            torrent_title = str(getattr(history, "torrent_name", "") or "").strip()
+            identity = resource_identity(torrent_title)
+            if identity:
+                identities.add(identity)
+            if not torrent_title:
+                continue
+            description = " ".join(filter(None, (
+                str(getattr(history, "torrent_description", "") or ""),
+                str(getattr(history, "title", "") or ""),
+            )))
+            if not title_matches(strict_task, torrent_title, description):
+                continue
+            history_type = str(getattr(history, "type", "") or "")
+            if history_type and history_type != task.get("type"):
+                continue
+            if task.get("type") == MediaType.MOVIE.value:
+                matched_movie = True
+                continue
+            torrent_meta = MetaInfo(title=torrent_title, subtitle=description)
+            stored_meta = MetaInfo(
+                title=f"{getattr(history, 'seasons', '') or ''}"
+                      f"{getattr(history, 'episodes', '') or ''}"
+            )
+            parsed_season = torrent_meta.begin_season or stored_meta.begin_season
+            if task_season and parsed_season and task_season != parsed_season:
+                continue
+            episodes.update(torrent_meta.episode_list or [])
+            episodes.update(stored_meta.episode_list or [])
+        return identities, episodes, matched_movie
+
     def _repair_download_tags(self):
         """为旧版插件已添加的下载任务补充 MoviePilot 系统标签。"""
         system_tag = str(settings.TORRENT_TAG or "").strip()
@@ -681,6 +862,8 @@ def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "keywords": config.get("keywords") or config.get("keyword"), "aliases": config.get("aliases"),
         "include": config.get("include"), "exclude": config.get("exclude"), "sites": config.get("sites"),
         "search_pages": config.get("search_pages"), "downloader": config.get("downloader"),
+        "priority_mode": config.get("priority_mode"), "min_seeders": config.get("min_seeders"),
+        "dedupe_history": config.get("dedupe_history"),
         "save_path": config.get("save_path"), "media_category": config.get("media_category"),
         "enabled": config.get("task_enabled"), "auto_download": config.get("auto_download"),
         "strict_title_match": config.get("strict_title_match"),
@@ -719,8 +902,12 @@ def _prepare_candidate(task: Dict[str, Any], context: Context, missing: Set[int]
         needed = missing if target else episodes.difference(downloaded)
         if not episodes.intersection(needed):
             return None
+    seeders = int(torrent.seeders or 0)
+    if seeders < (parse_int(task.get("min_seeders"), 0, minimum=0) or 0):
+        return None
     fingerprint = resource_fingerprint(torrent.site, torrent.enclosure, torrent.page_url,
                                        torrent.title, torrent.size)
+    identity = resource_identity(torrent.title)
     context.meta_info = meta
     context.media_info = _manual_media_info(task)
     context.media_info.season = meta.begin_season
@@ -728,12 +915,13 @@ def _prepare_candidate(task: Dict[str, Any], context: Context, missing: Set[int]
     context.match_source = "plugin"
     context.candidate_recognized = False
     context.media_info_is_target = True
-    score = candidate_score(episodes, missing, int(torrent.seeders or 0),
+    score = candidate_score(episodes, missing, seeders,
                             torrent.downloadvolumefactor, int(torrent.size or 0))
     return context, {
-        "fingerprint": fingerprint, "site_id": torrent.site,
+        "fingerprint": fingerprint, "resource_identity": identity, "site_id": torrent.site,
         "site": torrent.site_name or str(torrent.site or ""), "title": torrent.title,
-        "size": int(torrent.size or 0), "seeders": int(torrent.seeders or 0),
+        "size": int(torrent.size or 0), "seeders": seeders,
+        "free": torrent.downloadvolumefactor == 0,
         "pubdate": torrent.pubdate or "",
         "season": meta.begin_season, "episodes": episodes_text(episodes),
         "episode_numbers": sorted(episodes),
@@ -741,6 +929,19 @@ def _prepare_candidate(task: Dict[str, Any], context: Context, missing: Set[int]
                         or parse_bool(task.get("accept_unknown_episode"), False),
         "downloaded": False, "score": score,
     }
+
+
+def _candidate_priority_key(task: Dict[str, Any], result: Dict[str, Any],
+                            missing: Set[int]) -> Tuple[int, ...]:
+    return candidate_sort_key(
+        priority_mode=task.get("priority_mode"),
+        episodes=set(result.get("episode_numbers") or []),
+        missing=missing,
+        seeders=int(result.get("seeders") or 0),
+        free_factor=0 if result.get("free") else 1,
+        size=int(result.get("size") or 0),
+        pubdate=result.get("pubdate"),
+    )
 
 
 def _manual_media_info(task: Dict[str, Any]) -> MediaInfo:
@@ -831,6 +1032,12 @@ def _task_card(task: Dict[str, Any]) -> Dict[str, Any]:
     toggle_text = "暂停" if task.get("enabled") else "恢复"
     toggle_icon = "mdi-pause" if task.get("enabled") else "mdi-play"
     auto_text = "关闭自动下载" if task.get("auto_download") else "开启自动下载"
+    priority_text = {
+        "seeders": "做种数优先", "balanced": "综合优先", "free": "免费优先",
+        "latest": "发布时间优先", "smallest": "小体积优先", "largest": "大体积优先",
+    }[normalize_priority_mode(task.get("priority_mode"))]
+    priority_text += f" · 最低做种 {parse_int(task.get('min_seeders'), 0, minimum=0) or 0}"
+    priority_text += " · 下载历史去重" if parse_bool(task.get("dedupe_history"), True) else ""
     return {
         "component": "VCard", "props": {"variant": "outlined", "class": "mb-3"},
         "content": [
@@ -845,6 +1052,7 @@ def _task_card(task: Dict[str, Any]) -> Dict[str, Any]:
             {"component": "VCardText", "content": [
                 _line("进度", progress), _line("搜索词", " / ".join(task_search_keywords(task))),
                 _line("站点", ", ".join(str(item) for item in task.get("sites") or []) or "系统活动站点"),
+                _line("择优", priority_text),
                 _line("最近结果", str(task.get("last_message") or "尚未运行")),
                 _line("最近检查", str(task.get("last_run_at") or "-")),
                 {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-3"}, "content": [
@@ -862,10 +1070,14 @@ def _recent_results(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
     rows = []
     for task in tasks:
         for result in (task.get("last_results") or [])[:10]:
+            state = "已下载" if result.get("downloaded") else (
+                "重复跳过" if result.get("duplicate") or result.get("skip_reason") else "候选"
+            )
             rows.append({"节目": task.get("name"), "站点": result.get("site"), "标题": result.get("title"),
                          "集数": result.get("episodes") or "未知", "做种": result.get("seeders") or 0,
-                         "已下载": "是" if result.get("downloaded") else "否"})
-    headers = [{"title": key, "key": key} for key in ["节目", "站点", "标题", "集数", "做种", "已下载"]]
+                         "促销": "免费" if result.get("free") else "-", "状态": state})
+    headers = [{"title": key, "key": key}
+               for key in ["节目", "站点", "标题", "集数", "做种", "促销", "状态"]]
     return {
         "component": "VCard", "props": {"variant": "outlined", "class": "mb-4"},
         "content": [{"component": "VCardTitle", "text": "最近候选"},

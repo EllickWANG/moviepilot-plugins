@@ -7,12 +7,13 @@ import re
 import unicodedata
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-TASK_SCHEMA_VERSION = 2
+TASK_SCHEMA_VERSION = 3
 MAX_RESULTS = 50
 MAX_RESOURCE_HISTORY = 500
+PRIORITY_MODES = {"seeders", "balanced", "free", "latest", "smallest", "largest"}
 
 
 def now_text() -> str:
@@ -229,6 +230,60 @@ def resource_fingerprint(site_id: Any, enclosure: Any, page_url: Any,
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def resource_identity(title: Any) -> str:
+    """生成跨站点资源标识；相同发布标题只允许下载一次。"""
+    normalized = normalize_text(title)
+    return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest() \
+        if normalized else ""
+
+
+def normalize_priority_mode(value: Any) -> str:
+    """归一化候选资源优先规则。"""
+    mode = str(value or "seeders").strip().lower()
+    aliases = {
+        "综合": "balanced", "做种": "seeders", "做种数": "seeders",
+        "免费": "free", "最新": "latest", "小体积": "smallest", "大体积": "largest",
+    }
+    mode = aliases.get(mode, mode)
+    return mode if mode in PRIORITY_MODES else "seeders"
+
+
+def _pubdate_rank(value: Any) -> int:
+    """把常见发布时间转换为可排序整数，无法识别时返回 0。"""
+    if isinstance(value, datetime):
+        return int(value.strftime("%Y%m%d%H%M%S"))
+    digits = re.sub(r"\D", "", str(value or ""))[:14]
+    return int(digits.ljust(14, "0")) if len(digits) >= 8 else 0
+
+
+def candidate_sort_key(priority_mode: Any, episodes: Set[int], missing: Set[int],
+                       seeders: int, free_factor: Optional[float], size: int,
+                       pubdate: Any = None) -> Tuple[int, ...]:
+    """生成候选排序键；缺集覆盖和可识别集数始终优先，再应用用户规则。"""
+    covered = len(episodes.intersection(missing)) if missing else len(episodes)
+    known = 1 if episodes else 0
+    seeds = max(int(seeders or 0), 0)
+    free = 1 if free_factor == 0 else 0
+    bytes_size = max(int(size or 0), 0)
+    latest = _pubdate_rank(pubdate)
+    mode = normalize_priority_mode(priority_mode)
+    priorities = {
+        "seeders": (seeds, free, latest, -bytes_size),
+        "balanced": (free, seeds, latest, -bytes_size),
+        "free": (free, seeds, latest, -bytes_size),
+        "latest": (latest, seeds, free, -bytes_size),
+        "smallest": (-bytes_size, seeds, free, latest),
+        "largest": (bytes_size, seeds, free, latest),
+    }
+    return covered, known, *priorities[mode]
+
+
+def is_duplicate_download_message(value: Any) -> bool:
+    """识别下载器返回的“任务已存在”结果。"""
+    text = str(value or "").casefold()
+    return any(marker in text for marker in ("已存在", "already exists", "duplicate"))
+
+
 def candidate_score(episodes: Set[int], missing: Set[int], seeders: int,
                     free_factor: Optional[float], size: int) -> int:
     """按缺集覆盖、可识别性、促销和做种数计算候选分数。"""
@@ -277,6 +332,9 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
         "auto_download": parse_bool(source.get("auto_download"), False),
         "strict_title_match": parse_bool(source.get("strict_title_match"), True),
         "accept_unknown_episode": parse_bool(source.get("accept_unknown_episode"), False),
+        "dedupe_history": parse_bool(source.get("dedupe_history"), True),
+        "priority_mode": normalize_priority_mode(source.get("priority_mode")),
+        "min_seeders": parse_int(source.get("min_seeders"), 0, minimum=0, maximum=1000000) or 0,
         "owned_episodes": episodes_text(owned),
         "downloaded_episodes": sorted(downloaded),
         "downloaded_fingerprints": list(dict.fromkeys(source.get("downloaded_fingerprints") or []))[-MAX_RESOURCE_HISTORY:],
@@ -288,6 +346,7 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
         "last_message": str(source.get("last_message") or ""),
         "last_match_count": parse_int(source.get("last_match_count"), 0, minimum=0) or 0,
         "last_download_count": parse_int(source.get("last_download_count"), 0, minimum=0) or 0,
+        "last_duplicate_count": parse_int(source.get("last_duplicate_count"), 0, minimum=0) or 0,
         "created_at": created_at,
         "updated_at": now_text(),
     }
