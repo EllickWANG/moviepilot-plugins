@@ -61,7 +61,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.2.0"
+    plugin_version = "2.2.1"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -80,6 +80,7 @@ class directsearchsubscribe(_PluginBase):
     _active_stop_event = threading.Event()
     _stop_event: threading.Event
     _transfer_patch_lock = threading.RLock()
+    _transfer_retry_lock = threading.Lock()
     _transfer_context = threading.local()
     _transfer_patched = False
     _transfer_originals: Dict[str, Any] = {}
@@ -110,6 +111,11 @@ class directsearchsubscribe(_PluginBase):
         # 2.0.0 创建的任务只有插件标签，MoviePilot 下载管理会将其过滤掉。
         # 标签追加是幂等操作，每次加载时顺便修复仍保留在下载器中的历史任务。
         self._repair_download_tags()
+
+        # 2.2 之前已经完成下载的任务可能因缺少外部媒体 ID 留下“未识别”失败历史。
+        # 只自动补偿从未登记过整理状态的旧记录，明确失败的新记录留给用户手工重试。
+        if self._enabled:
+            self._start_failed_transfer_retry(legacy_only=True)
 
         if parse_bool(config.get("save_task_now"), False):
             result = self.create_task(_task_payload_from_config(config), update_same=True)
@@ -155,6 +161,7 @@ class directsearchsubscribe(_PluginBase):
             _api("/tasks/{task_id}/delete", self.api_delete_task, ["POST", "DELETE"], "移入回收站"),
             _api("/trash/{task_id}/restore", self.api_restore_task, ["POST"], "恢复直搜任务"),
             _api("/tasks/{task_id}/results", self.api_task_results, ["GET"], "查询最近候选"),
+            _api("/transfers/retry-failed", self.api_retry_failed_transfers, ["POST"], "重试失败整理"),
         ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -493,6 +500,11 @@ class directsearchsubscribe(_PluginBase):
         if not task:
             return schemas.Response(success=False, message="任务不存在")
         return schemas.Response(success=True, data=task.get("last_results") or [])
+
+    def api_retry_failed_transfers(self) -> schemas.Response:
+        if not self._start_failed_transfer_retry(legacy_only=False):
+            return schemas.Response(success=True, message="失败整理重试已在运行")
+        return schemas.Response(success=True, message="已开始在后台重试本插件的失败整理")
 
     def create_task(self, payload: Dict[str, Any], update_same: bool = False) -> Dict[str, Any]:
         task = normalize_task(payload)
@@ -893,6 +905,74 @@ class directsearchsubscribe(_PluginBase):
                 if changed:
                     saver(tasks)
                     return
+
+    def _start_failed_transfer_retry(self, legacy_only: bool) -> bool:
+        """后台重试本插件下载产生的失败整理记录。"""
+        if not self.__class__._transfer_retry_lock.acquire(blocking=False):
+            return False
+
+        def runner():
+            try:
+                count = self._retry_failed_transfers(legacy_only=legacy_only)
+                if count:
+                    logger.info(f"直搜订阅已重新提交 {count} 个失败整理文件")
+            except Exception as err:
+                logger.error(f"直搜订阅重试失败整理异常：{err}", exc_info=True)
+            finally:
+                self.__class__._transfer_retry_lock.release()
+
+        threading.Thread(
+            target=runner, name="direct-search-transfer-retry", daemon=True
+        ).start()
+        return True
+
+    def _retry_failed_transfers(self, legacy_only: bool = False) -> int:
+        """按插件下载记录定位失败历史，并重新送入已接管的转移链。"""
+        submitted = 0
+        seen_sources: Set[Tuple[str, str]] = set()
+        tasks = [*self._load_tasks().values(), *self._load_trash().values()]
+        for task in tasks:
+            if self._stop_event.is_set() or global_vars.is_system_stopped:
+                break
+            for record in task.get("download_records") or []:
+                transfer_status = str(record.get("transfer_status") or "")
+                if transfer_status in {"completed", "queued", "waiting"}:
+                    continue
+                if legacy_only and transfer_status:
+                    continue
+                download_hash = str(record.get("hash") or "").strip()
+                if not download_hash:
+                    continue
+                try:
+                    histories = TransferHistoryOper().list_by_hash(download_hash) or []
+                except Exception as err:
+                    logger.warning(f"直搜订阅读取失败整理历史异常：{download_hash[:12]} - {err}")
+                    continue
+                for history in histories:
+                    if bool(getattr(history, "status", False)) or not getattr(history, "src_fileitem", None):
+                        continue
+                    source_key = (download_hash.casefold(), str(getattr(history, "src", "") or ""))
+                    if source_key in seen_sources:
+                        continue
+                    seen_sources.add(source_key)
+                    try:
+                        state, message = TransferChain().do_transfer(
+                            fileitem=schemas.FileItem(**history.src_fileitem),
+                            downloader=getattr(history, "downloader", None),
+                            download_hash=download_hash,
+                            force=True,
+                            scrape=False,
+                            background=True,
+                        )
+                    except Exception as err:
+                        state, message = False, str(err)
+                    if state:
+                        submitted += 1
+                    else:
+                        self._update_transfer_record(
+                            download_hash, "failed", message or "重新提交整理失败"
+                        )
+        return submitted
 
     def _known_resource_identities(self) -> Set[str]:
         """汇总活动任务和回收站记录，任务删除重建后仍然可以去重。"""
@@ -1329,6 +1409,10 @@ def _hero(plugin: directsearchsubscribe, total: int, active: int, auto: int) -> 
                 ]},
                 {"component": "div", "props": {"class": "text-caption mt-3"},
                  "text": "新建或更新节目请打开插件配置；本页可立即检查、暂停、切换自动下载或移入回收站。"},
+                {"component": "div", "props": {"class": "mt-3"}, "content": [
+                    _action("重试失败整理", "mdi-folder-refresh", "secondary",
+                            f"plugin/{PLUGIN_ID}/transfers/retry-failed"),
+                ]},
             ]},
         ],
     }

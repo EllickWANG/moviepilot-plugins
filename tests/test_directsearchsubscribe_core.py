@@ -122,7 +122,7 @@ class ArchitectureBoundaryTest(unittest.TestCase):
     def test_manifest_versions_match_plugin(self):
         for filename in ("package.v2.json", "package.json"):
             package = json.loads((ROOT / filename).read_text(encoding="utf-8"))
-            self.assertEqual(package["directsearchsubscribe"]["version"], "2.2.0")
+            self.assertEqual(package["directsearchsubscribe"]["version"], "2.2.1")
 
     def test_downloads_keep_moviepilot_system_tag(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
@@ -144,6 +144,9 @@ class ArchitectureBoundaryTest(unittest.TestCase):
         self.assertIn("DirectSearchSubscribe|", source)
         self.assertIn("EventType.TransferComplete", source)
         self.assertIn('"transfer_status": "waiting"', source)
+        self.assertIn("_retry_failed_transfers", source)
+        self.assertIn("TransferHistoryOper().list_by_hash", source)
+        self.assertIn("force=True", source)
 
 
 if __name__ == "__main__":

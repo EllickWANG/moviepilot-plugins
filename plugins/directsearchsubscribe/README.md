@@ -45,6 +45,7 @@
 - 整理目标目录、转移方式和重命名格式继续使用 MoviePilot 的媒体库目录配置。
 - 元数据刮削对这些下载强制关闭，因此不会在整理完成后再次拉取海报或剧情信息。
 - 插件下载记录会显示等待整理、已加入队列、整理完成或整理失败状态。任务即使已移入插件回收站，已开始的下载完成后仍可按原记录整理。
+- 升级时会自动重新提交 2.2 以前因“未识别媒体信息”留下的旧失败记录；详情页也提供“重试失败整理”按钮处理之后的失败记录。
 
 ## 定时检查
 
@@ -72,6 +73,7 @@
 - `POST|DELETE /plugin/directsearchsubscribe/tasks/{task_id}/delete`
 - `POST /plugin/directsearchsubscribe/trash/{task_id}/restore`
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/results`
+- `POST /plugin/directsearchsubscribe/transfers/retry-failed`
 
 ## 使用前提
 
