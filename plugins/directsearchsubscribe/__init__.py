@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
@@ -12,14 +13,17 @@ from fastapi import Body
 from app import schemas
 from app.chain.download import DownloadChain
 from app.chain.search import SearchChain
+from app.chain.transfer import JobManager, TransferChain
 from app.core.config import global_vars, settings
 from app.core.context import Context, MediaInfo
+from app.core.event import Event as MPEvent, eventmanager
 from app.core.metainfo import MetaInfo
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.site_oper import SiteOper
+from app.db.transferhistory_oper import TransferHistoryOper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import MediaType, NotificationType
+from app.schemas.types import EventType, MediaType, NotificationType
 
 from .core import (
     MAX_RESOURCE_HISTORY,
@@ -55,9 +59,9 @@ class directsearchsubscribe(_PluginBase):
     """自包含的直搜订阅插件。"""
 
     plugin_name = "直搜订阅"
-    plugin_desc = "手工维护节目与集数，定时直搜站点；不创建系统订阅，也不访问媒体信息源。"
+    plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -75,6 +79,10 @@ class directsearchsubscribe(_PluginBase):
     _running_ids: Set[str] = set()
     _active_stop_event = threading.Event()
     _stop_event: threading.Event
+    _transfer_patch_lock = threading.RLock()
+    _transfer_context = threading.local()
+    _transfer_patched = False
+    _transfer_originals: Dict[str, Any] = {}
 
     def init_plugin(self, config: dict = None):
         """加载全局配置，并处理配置页的一次性建任务动作。"""
@@ -94,6 +102,10 @@ class directsearchsubscribe(_PluginBase):
         self.__class__._max_downloads = self._max_downloads
         self.__class__._task_gap = self._task_gap
         self._config = config
+
+        # 下载完成后仍使用 MoviePilot 的转移链，但只为本插件下载注入手工媒体信息，
+        # 并阻止电视剧整理阶段再次读取 TMDB 集信息。
+        self._patch_transfer_chain()
 
         # 2.0.0 创建的任务只有插件标签，MoviePilot 下载管理会将其过滤掉。
         # 标签追加是幂等操作，每次加载时顺便修复仍保留在下载器中的历史任务。
@@ -321,6 +333,75 @@ class directsearchsubscribe(_PluginBase):
     def stop_service(self):
         """通知正在运行的任务尽快停止。"""
         getattr(self, "_stop_event", self.__class__._active_stop_event).set()
+        self._unpatch_transfer_chain()
+
+    @classmethod
+    def _patch_transfer_chain(cls):
+        """为本插件下载安装最小范围的手工整理钩子。"""
+        with cls._transfer_patch_lock:
+            if cls._transfer_patched:
+                return
+            handle_name = "_TransferChain__handle_transfer"
+            media_id_name = "_JobManager__get_media_id"
+            if not hasattr(TransferChain, handle_name) or not hasattr(JobManager, media_id_name):
+                logger.error("直搜订阅无法启用手工整理：当前 MoviePilot 转移链接口不兼容")
+                return
+            cls._transfer_originals = {
+                "do_transfer": TransferChain.do_transfer,
+                "handle_transfer": getattr(TransferChain, handle_name),
+                "job_media_id": JobManager.__dict__[media_id_name],
+                "history_media": TransferHistoryOper.get_by_type_tmdbid,
+            }
+            TransferChain.do_transfer = _patched_transfer_do_transfer
+            setattr(TransferChain, handle_name, _patched_transfer_handle)
+            setattr(JobManager, media_id_name, staticmethod(_patched_job_media_id))
+            TransferHistoryOper.get_by_type_tmdbid = _patched_transfer_history_media
+            cls._transfer_patched = True
+            logger.info("直搜订阅已启用下载完成后的手工媒体信息整理")
+
+    @classmethod
+    def _unpatch_transfer_chain(cls):
+        """卸载时恢复转移链，避免影响非本插件下载。"""
+        with cls._transfer_patch_lock:
+            if not cls._transfer_patched:
+                return
+            handle_name = "_TransferChain__handle_transfer"
+            media_id_name = "_JobManager__get_media_id"
+            originals = cls._transfer_originals
+            if TransferChain.do_transfer is _patched_transfer_do_transfer:
+                TransferChain.do_transfer = originals["do_transfer"]
+            if getattr(TransferChain, handle_name) is _patched_transfer_handle:
+                setattr(TransferChain, handle_name, originals["handle_transfer"])
+            if getattr(JobManager, media_id_name) is _patched_job_media_id:
+                setattr(JobManager, media_id_name, originals["job_media_id"])
+            if TransferHistoryOper.get_by_type_tmdbid is _patched_transfer_history_media:
+                TransferHistoryOper.get_by_type_tmdbid = originals["history_media"]
+            cls._transfer_originals = {}
+            cls._transfer_patched = False
+            logger.info("直搜订阅已恢复 MoviePilot 默认整理流程")
+
+    @eventmanager.register([EventType.TransferComplete, EventType.TransferFailed])
+    def on_transfer_result(self, event: MPEvent):
+        """把本插件下载的整理结果回写到插件记录。"""
+        data = event.event_data or {}
+        download_hash = str(data.get("download_hash") or "").strip()
+        if not download_hash:
+            return
+        direct_task = _direct_transfer_task(download_hash=download_hash)
+        if not direct_task:
+            return
+        transferinfo = data.get("transferinfo")
+        if event.event_type == EventType.TransferComplete:
+            status = "completed"
+            target_item = getattr(transferinfo, "target_item", None) \
+                or getattr(transferinfo, "target_diritem", None)
+            target = str(getattr(target_item, "path", "") or "")
+            message = f"已整理到 {target}" if target else "整理完成"
+        else:
+            status = "failed"
+            message = str(getattr(transferinfo, "message", "") or "整理失败")
+            target = ""
+        self._update_transfer_record(download_hash, status, message, target)
 
     def api_list_tasks(self) -> schemas.Response:
         return schemas.Response(success=True, data=list(self._load_tasks().values()))
@@ -709,7 +790,7 @@ class directsearchsubscribe(_PluginBase):
                 "time": now_text(), "fingerprint": fingerprint, "hash": download_hash,
                 "site": result.get("site"), "title": result.get("title"),
                 "episodes": episodes_text(selected or []), "size": result.get("size") or 0,
-                "resource_identity": identity,
+                "resource_identity": identity, "transfer_status": "waiting",
             }
             records.append(record)
             if not candidate_episodes and task.get("type") == MediaType.TV.value:
@@ -721,6 +802,8 @@ class directsearchsubscribe(_PluginBase):
                 downloaded_episodes=sorted(downloaded),
                 downloaded_fingerprints=list(fingerprints)[-MAX_RESOURCE_HISTORY:],
                 download_records=records[-MAX_RESOURCE_HISTORY:],
+                last_transfer_status="waiting",
+                last_transfer_message="等待下载完成",
                 last_results=[item[1] for item in candidates],
             )
         self._update_runtime(task_id, last_results=[item[1] for item in candidates])
@@ -770,6 +853,46 @@ class directsearchsubscribe(_PluginBase):
             task["updated_at"] = now_text()
             tasks[task_id] = task
             self._save_tasks(tasks)
+
+    def _update_transfer_record(self, download_hash: str, status: str,
+                                message: str = "", target: str = ""):
+        """按下载 Hash 更新活动任务或回收站中的整理状态。"""
+        normalized_hash = str(download_hash or "").strip().casefold()
+        if not normalized_hash:
+            return
+        with self.__class__._data_lock:
+            for loader, saver in (
+                    (self._load_tasks, self._save_tasks),
+                    (self._load_trash, self._save_trash),
+            ):
+                tasks = loader()
+                changed = False
+                for task_id, task in tasks.items():
+                    records = list(task.get("download_records") or [])
+                    for record in records:
+                        if str(record.get("hash") or "").strip().casefold() != normalized_hash:
+                            continue
+                        # 调度器可能在事件完成后再次扫描；不能把 completed 降级回 queued。
+                        if record.get("transfer_status") == "completed" and status == "queued":
+                            return
+                        record["transfer_status"] = status
+                        record["transfer_message"] = message
+                        record["transfer_updated_at"] = now_text()
+                        if target:
+                            record["transfer_target"] = target
+                        task["download_records"] = records
+                        task["last_transfer_status"] = status
+                        task["last_transfer_message"] = message
+                        task["last_transfer_at"] = now_text()
+                        task["updated_at"] = now_text()
+                        tasks[task_id] = task
+                        changed = True
+                        break
+                    if changed:
+                        break
+                if changed:
+                    saver(tasks)
+                    return
 
     def _known_resource_identities(self) -> Set[str]:
         """汇总活动任务和回收站记录，任务删除重建后仍然可以去重。"""
@@ -851,6 +974,198 @@ class directsearchsubscribe(_PluginBase):
                 logger.info(f"直搜订阅已为 {len(hashes)} 个历史下载补充系统标签：{system_tag}")
             except Exception as err:
                 logger.warning(f"直搜订阅补充历史下载系统标签失败：{err}")
+
+
+def _download_history_for_transfer(download_hash: Optional[str], fileitem: Any = None) -> Optional[Any]:
+    """定位 MoviePilot 下载历史，仅用于确认下载是否来自本插件。"""
+    downloadhis = DownloadHistoryOper()
+    if download_hash:
+        history = downloadhis.get_by_hash(str(download_hash))
+        if history:
+            return history
+    file_path = str(getattr(fileitem, "path", "") or "")
+    if not file_path:
+        return None
+    try:
+        download_file = downloadhis.get_file_by_fullpath(Path(file_path).as_posix())
+    except Exception:
+        download_file = None
+    if download_file and getattr(download_file, "download_hash", None):
+        return downloadhis.get_by_hash(download_file.download_hash)
+    return None
+
+
+def _task_from_download_history(history: Any, task_id: str) -> Dict[str, Any]:
+    """插件记录丢失时，从本插件写入的下载历史恢复最小手工整理上下文。"""
+    season_raw = getattr(history, "seasons", None)
+    season_meta = MetaInfo(str(season_raw or ""))
+    season = parse_int(season_raw, minimum=1) or season_meta.begin_season
+    downloaded = parse_episodes(getattr(history, "episodes", None))
+    return {
+        "id": task_id,
+        "name": str(getattr(history, "title", "") or getattr(history, "torrent_name", "") or "未命名"),
+        "type": str(getattr(history, "type", "") or MediaType.TV.value),
+        "year": str(getattr(history, "year", "") or ""),
+        "season": season,
+        "episodes": episodes_text(downloaded),
+        "start_episode": min(downloaded) if downloaded else 1,
+        "total_episode": max(downloaded) if downloaded else None,
+        "media_category": str(getattr(history, "media_category", "") or ""),
+        "aliases": [],
+        "download_records": [{
+            "hash": str(getattr(history, "download_hash", "") or ""),
+            "episodes": episodes_text(downloaded),
+        }],
+    }
+
+
+def _direct_transfer_task(download_hash: Optional[str], fileitem: Any = None) -> Optional[Dict[str, Any]]:
+    """仅为明确由 DirectSearchSubscribe 创建的下载返回任务上下文。"""
+    plugin = directsearchsubscribe._instance
+    if not plugin:
+        return None
+    normalized_hash = str(download_hash or "").strip().casefold()
+    stored_tasks = [*plugin._load_tasks().values(), *plugin._load_trash().values()]
+    if normalized_hash:
+        for task in stored_tasks:
+            if any(
+                    str(record.get("hash") or "").strip().casefold() == normalized_hash
+                    for record in task.get("download_records") or []
+            ):
+                return task
+
+    history = _download_history_for_transfer(download_hash, fileitem)
+    note = getattr(history, "note", None) if history else None
+    source = str(note.get("source") or "") if isinstance(note, dict) else ""
+    prefix = "DirectSearchSubscribe|"
+    if not source.startswith(prefix):
+        return None
+    task_id = source[len(prefix):].strip()
+    for task in stored_tasks:
+        if str(task.get("id") or "") == task_id:
+            return task
+    return _task_from_download_history(history, task_id)
+
+
+def _call_arg(args: List[Any], kwargs: Dict[str, Any], name: str, index: int) -> Any:
+    return args[index] if len(args) > index else kwargs.get(name)
+
+
+def _set_call_arg(args: List[Any], kwargs: Dict[str, Any], name: str, index: int, value: Any):
+    if len(args) > index:
+        args[index] = value
+    else:
+        kwargs[name] = value
+
+
+def _record_episodes(task: Dict[str, Any], download_hash: Optional[str]) -> Set[int]:
+    normalized_hash = str(download_hash or "").strip().casefold()
+    for record in task.get("download_records") or []:
+        if str(record.get("hash") or "").strip().casefold() == normalized_hash:
+            return parse_episodes(record.get("episodes"))
+    return set()
+
+
+def _manual_episode_infos(task: Dict[str, Any], download_hash: Optional[str], meta: Any) -> List[Any]:
+    """生成本地剧集占位信息，使转移链无需请求 TMDB 季集接口。"""
+    season = parse_int(task.get("season"), 1, minimum=1) or 1
+    episodes = target_episodes(task) or _record_episodes(task, download_hash)
+    if not episodes and getattr(meta, "begin_episode", None) is not None:
+        begin = int(meta.begin_episode)
+        end = int(getattr(meta, "end_episode", None) or begin)
+        episodes = set(range(begin, end + 1))
+    # TransferChain 以 truthy 判断是否需要请求 TMDB；0 只作本地哨兵，不参与命名匹配。
+    episode_numbers = sorted(episodes) or [0]
+    return [schemas.TmdbEpisode(season_number=season, episode_number=episode)
+            for episode in episode_numbers]
+
+
+def _prepare_manual_transfer_task(transfer_task: Any, direct_task: Dict[str, Any]):
+    """把人工任务信息写入单个转移任务，同时保留文件名解析出的集数和技术参数。"""
+    transfer_task.mediainfo = _manual_media_info(direct_task)
+    transfer_task.scrape = False
+    meta = transfer_task.meta
+    if meta:
+        meta.name = str(direct_task.get("name") or meta.name or "")
+        meta.type = MediaType(direct_task.get("type") or MediaType.TV.value)
+        if direct_task.get("year"):
+            meta.year = str(direct_task.get("year"))
+        season = parse_int(direct_task.get("season"), minimum=1)
+        if season is not None:
+            meta.begin_season = season
+        selected = _record_episodes(direct_task, transfer_task.download_hash)
+        if meta.type == MediaType.TV and meta.begin_episode is None and len(selected) == 1:
+            meta.begin_episode = next(iter(selected))
+    if transfer_task.mediainfo.type == MediaType.TV:
+        transfer_task.episodes_info = _manual_episode_infos(
+            direct_task, transfer_task.download_hash, meta
+        )
+
+
+def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
+    """在 MoviePilot 建立转移任务前为本插件下载注入手工媒体上下文。"""
+    args_list = list(args)
+    fileitem = _call_arg(args_list, kwargs, "fileitem", 0)
+    download_hash = _call_arg(args_list, kwargs, "download_hash", 14)
+    direct_task = _direct_transfer_task(download_hash, fileitem)
+    original = directsearchsubscribe._transfer_originals["do_transfer"]
+    if not direct_task:
+        return original(self, *args_list, **kwargs)
+
+    _set_call_arg(args_list, kwargs, "mediainfo", 2, _manual_media_info(direct_task))
+    _set_call_arg(args_list, kwargs, "scrape", 7, False)
+    season = parse_int(direct_task.get("season"), minimum=1)
+    if season is not None:
+        _set_call_arg(args_list, kwargs, "season", 10, season)
+    result = original(self, *args_list, **kwargs)
+    plugin = directsearchsubscribe._instance
+    if plugin and download_hash:
+        state = bool(result[0]) if isinstance(result, tuple) and result else bool(result)
+        message = str(result[1] or "") if isinstance(result, tuple) and len(result) > 1 else ""
+        plugin._update_transfer_record(
+            str(download_hash), "queued" if state else "failed",
+            message or ("已加入整理队列" if state else "加入整理队列失败"),
+        )
+    logger.info(
+        f"直搜订阅使用手工媒体信息整理：{direct_task.get('name')} "
+        f"{getattr(fileitem, 'name', '')}"
+    )
+    return result
+
+
+def _patched_transfer_handle(self: TransferChain, task: Any, callback: Any = None):
+    """在实际整理前补齐本地剧集信息，跳过 TMDB 季集查询和元数据刮削。"""
+    direct_task = _direct_transfer_task(task.download_hash, task.fileitem)
+    original = directsearchsubscribe._transfer_originals["handle_transfer"]
+    if not direct_task:
+        return original(self, task, callback)
+    _prepare_manual_transfer_task(task, direct_task)
+    directsearchsubscribe._transfer_context.active = True
+    try:
+        return original(self, task, callback)
+    finally:
+        directsearchsubscribe._transfer_context.active = False
+
+
+def _patched_job_media_id(media: MediaInfo = None, season: Optional[int] = None) -> Tuple[Any, Optional[int]]:
+    """无外部 ID 的手工节目使用稳定插件标识，避免不同节目共用同一整理作业。"""
+    if media and getattr(media, "source", None) == PLUGIN_ID:
+        identity = resource_identity(
+            f"{media.type.value if media.type else ''}|{media.title}|{media.year or ''}"
+        )
+        return f"{PLUGIN_ID}:{identity}", season
+    descriptor = directsearchsubscribe._transfer_originals["job_media_id"]
+    original = descriptor.__func__ if isinstance(descriptor, staticmethod) else descriptor
+    return original(media, season)
+
+
+def _patched_transfer_history_media(self: TransferHistoryOper, mtype: Optional[str] = None,
+                                    tmdbid: Optional[int] = None) -> Any:
+    """手工整理没有 TMDB ID，不允许 NULL 查询误用另一部手工节目的历史标题。"""
+    if getattr(directsearchsubscribe._transfer_context, "active", False) and tmdbid is None:
+        return None
+    original = directsearchsubscribe._transfer_originals["history_media"]
+    return original(self, mtype=mtype, tmdbid=tmdbid)
 
 
 def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -955,6 +1270,8 @@ def _manual_media_info(task: Dict[str, Any]) -> MediaInfo:
     media.number_of_episodes = parse_int(task.get("total_episode"), minimum=1)
     media.category = str(task.get("media_category") or "")
     media.names = [str(item) for item in task.get("aliases") or []]
+    if media.type == MediaType.TV and media.season is not None:
+        media.seasons[media.season] = sorted(target_episodes(task))
     # MoviePilot 会把空 genre_ids 视为媒体信息不完整并调用识别器。
     # 自定义来源没有外部 ID，用专用哨兵声明手工信息已经完整。
     media.genre_ids = [-1]
@@ -1002,12 +1319,13 @@ def _hero(plugin: directsearchsubscribe, total: int, active: int, auto: int) -> 
     return {
         "component": "VCard", "props": {"variant": "tonal", "color": "primary", "class": "mb-4"},
         "content": [
-            {"component": "VCardTitle", "text": f"直搜订阅 2.0 · {state}"},
+            {"component": "VCardTitle", "text": f"直搜订阅 {plugin.plugin_version} · {state}"},
             {"component": "VCardSubtitle", "text": "插件独立维护 · 站点直搜 · 不使用外部媒体信息源"},
             {"component": "VCardText", "content": [
                 {"component": "div", "props": {"class": "d-flex flex-wrap ga-2"}, "content": [
                     _chip(f"任务 {total}", "primary"), _chip(f"活动 {active}", "success"),
-                    _chip(f"自动下载 {auto}", "warning"), _chip(f"周期 {plugin._cron}", "info"),
+                    _chip(f"自动下载 {auto}", "warning"), _chip("下载后手工信息整理", "success"),
+                    _chip(f"周期 {plugin._cron}", "info"),
                 ]},
                 {"component": "div", "props": {"class": "text-caption mt-3"},
                  "text": "新建或更新节目请打开插件配置；本页可立即检查、暂停、切换自动下载或移入回收站。"},
@@ -1038,6 +1356,12 @@ def _task_card(task: Dict[str, Any]) -> Dict[str, Any]:
     }[normalize_priority_mode(task.get("priority_mode"))]
     priority_text += f" · 最低做种 {parse_int(task.get('min_seeders'), 0, minimum=0) or 0}"
     priority_text += " · 下载历史去重" if parse_bool(task.get("dedupe_history"), True) else ""
+    transfer_status = {
+        "waiting": "等待下载完成", "queued": "已加入整理队列", "completed": "整理完成",
+        "failed": "整理失败",
+    }.get(str(task.get("last_transfer_status") or ""), "尚无整理记录")
+    if task.get("last_transfer_message"):
+        transfer_status += f" · {task.get('last_transfer_message')}"
     return {
         "component": "VCard", "props": {"variant": "outlined", "class": "mb-3"},
         "content": [
@@ -1054,6 +1378,7 @@ def _task_card(task: Dict[str, Any]) -> Dict[str, Any]:
                 _line("站点", ", ".join(str(item) for item in task.get("sites") or []) or "系统活动站点"),
                 _line("择优", priority_text),
                 _line("最近结果", str(task.get("last_message") or "尚未运行")),
+                _line("下载后整理", transfer_status),
                 _line("最近检查", str(task.get("last_run_at") or "-")),
                 {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-3"}, "content": [
                     _action("立即检查", "mdi-magnify", "primary", f"plugin/{PLUGIN_ID}/tasks/{task['id']}/run"),

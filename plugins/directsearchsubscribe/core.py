@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-TASK_SCHEMA_VERSION = 3
+TASK_SCHEMA_VERSION = 4
 MAX_RESULTS = 50
 MAX_RESOURCE_HISTORY = 500
 PRIORITY_MODES = {"seeders", "balanced", "free", "latest", "smallest", "largest"}
@@ -347,6 +347,9 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
         "last_match_count": parse_int(source.get("last_match_count"), 0, minimum=0) or 0,
         "last_download_count": parse_int(source.get("last_download_count"), 0, minimum=0) or 0,
         "last_duplicate_count": parse_int(source.get("last_duplicate_count"), 0, minimum=0) or 0,
+        "last_transfer_status": str(source.get("last_transfer_status") or ""),
+        "last_transfer_message": str(source.get("last_transfer_message") or ""),
+        "last_transfer_at": str(source.get("last_transfer_at") or ""),
         "created_at": created_at,
         "updated_at": now_text(),
     }

@@ -50,6 +50,7 @@ class TaskSafetyTest(unittest.TestCase):
         self.assertTrue(task["dedupe_history"])
         self.assertEqual(task["priority_mode"], "seeders")
         self.assertEqual(task["min_seeders"], 0)
+        self.assertEqual(task["schema_version"], 4)
 
     def test_alias_title_and_word_filters(self):
         task = CORE.normalize_task({
@@ -121,7 +122,7 @@ class ArchitectureBoundaryTest(unittest.TestCase):
     def test_manifest_versions_match_plugin(self):
         for filename in ("package.v2.json", "package.json"):
             package = json.loads((ROOT / filename).read_text(encoding="utf-8"))
-            self.assertEqual(package["directsearchsubscribe"]["version"], "2.1.0")
+            self.assertEqual(package["directsearchsubscribe"]["version"], "2.2.0")
 
     def test_downloads_keep_moviepilot_system_tag(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
@@ -132,6 +133,17 @@ class ArchitectureBoundaryTest(unittest.TestCase):
         self.assertIn("DownloadChain().set_torrents_tag", source)
         self.assertIn("DownloadHistoryOper().list_by_page", source)
         self.assertIn("unknown_downloaded", source)
+
+    def test_direct_downloads_use_manual_transfer_context(self):
+        source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("TransferChain.do_transfer = _patched_transfer_do_transfer", source)
+        self.assertIn("_patched_transfer_handle", source)
+        self.assertIn("transfer_task.scrape = False", source)
+        self.assertIn("schemas.TmdbEpisode", source)
+        self.assertIn("_direct_transfer_task", source)
+        self.assertIn("DirectSearchSubscribe|", source)
+        self.assertIn("EventType.TransferComplete", source)
+        self.assertIn('"transfer_status": "waiting"', source)
 
 
 if __name__ == "__main__":
