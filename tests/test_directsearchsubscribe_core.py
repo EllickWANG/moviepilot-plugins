@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -170,9 +171,24 @@ class ArchitectureBoundaryTest(unittest.TestCase):
             self.assertEqual(current.read_bytes(), compatible.read_bytes())
 
     def test_manifest_versions_match_plugin(self):
+        source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
+        declared = re.search(r'plugin_version = "([^"]+)"', source)
+        self.assertIsNotNone(declared)
         for filename in ("package.v2.json", "package.json"):
             package = json.loads((ROOT / filename).read_text(encoding="utf-8"))
-            self.assertEqual(package["directsearchsubscribe"]["version"], "2.3.2")
+            self.assertEqual(package["directsearchsubscribe"]["version"], declared.group(1))
+
+    def test_search_prefers_core_async_path(self):
+        source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
+        # 站点搜索必须经由统一入口，而不是直接调同步接口。
+        self.assertIn("found = _search_site_titles(search_chain, keyword, page, sites)", source)
+        self.assertIn("async_search_by_title", source)
+        # 协程要交回 app 主事件循环，不能自己新建循环。
+        self.assertIn("asyncio.run_coroutine_threadsafe", source)
+        self.assertIn('getattr(global_vars, "loop", None)', source)
+        self.assertNotIn("asyncio.run(", source)
+        # 核心不支持异步搜索时的同步回退必须保留。
+        self.assertIn("return search_chain.search_by_title(keyword, page=page, sites=sites) or []", source)
 
     def test_downloads_keep_moviepilot_system_tag(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")

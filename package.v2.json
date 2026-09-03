@@ -18,7 +18,7 @@
   "directsearchsubscribe": {
     "name": "直搜订阅",
     "description": "插件独立维护节目、集数、进度与候选，定时直搜站点；下载完成后按人工信息整理，不依赖外部媒体信息源。",
-    "version": "2.3.2",
+    "version": "2.3.3",
     "icon": "mdi-magnify-scan",
     "author": "Ellick",
     "level": 1

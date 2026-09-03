@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import re
 import threading
@@ -57,6 +58,7 @@ TASKS_KEY = "tasks_v2"
 TRASH_KEY = "tasks_v2_trash"
 LEGACY_TASKS_KEY = "direct_subscribes"
 MAX_TRASH = 100
+SEARCH_TIMEOUT = 300
 
 
 class directsearchsubscribe(_PluginBase):
@@ -65,7 +67,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.3.2"
+    plugin_version = "2.3.3"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -798,7 +800,7 @@ class directsearchsubscribe(_PluginBase):
                 if stop_event.is_set() or global_vars.is_system_stopped:
                     break
                 try:
-                    found = search_chain.search_by_title(keyword, page=page, sites=sites) or []
+                    found = _search_site_titles(search_chain, keyword, page, sites)
                 except Exception as err:
                     errors.append(f"{keyword} 第{page + 1}页：{err}")
                     _audit(audit, run_id, "搜索", "异常",
@@ -1772,6 +1774,38 @@ def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "strict_title_match": config.get("strict_title_match"),
         "accept_unknown_episode": config.get("accept_unknown_episode"),
     }
+
+
+def _search_site_titles(search_chain: SearchChain, keyword: str, page: int,
+                        sites: Optional[List[int]]) -> List[Context]:
+    """取站点搜索结果，优先走核心的异步搜索路径。
+
+    同步的 search_by_title 在部分部署上每个站点都会在 5 秒后返回空结果，而前端和订阅
+    使用的 async_search_by_title 用同样的关键词与站点列表能正常拿到数据。这里沿用核心
+    自身从工作线程调用协程的做法，把协程交回 app 主事件循环执行；异步 HTTP 客户端绑定
+    在主循环上，另起事件循环（asyncio.run）会让它们失效，因此必须复用 global_vars.loop。
+    核心没有异步搜索或主循环未运行时回退到同步实现。
+    """
+    async_search = getattr(search_chain, "async_search_by_title", None)
+    loop = getattr(global_vars, "loop", None)
+    if async_search and loop is not None and loop.is_running():
+        coro = None
+        future = None
+        try:
+            coro = async_search(title=keyword, page=page, sites=sites, cache_local=False)
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            # 协程已交给事件循环，后续由 future 负责，不再需要本地关闭。
+            coro = None
+            return future.result(timeout=SEARCH_TIMEOUT) or []
+        except Exception as err:
+            # 等待超时时协程仍在主循环上运行，取消掉避免它继续请求站点并与回退搜索重叠。
+            if future is not None:
+                future.cancel()
+            logger.warning(f"直搜订阅异步搜索失败，回退同步搜索：{err}")
+        finally:
+            if coro is not None:
+                coro.close()
+    return search_chain.search_by_title(keyword, page=page, sites=sites) or []
 
 
 def _prepare_candidate(task: Dict[str, Any], context: Context, missing: Set[int],
