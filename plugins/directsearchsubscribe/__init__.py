@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import re
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,9 +29,11 @@ from app.schemas.types import EventType, MediaType, NotificationType
 
 from .core import (
     MAX_RESOURCE_HISTORY,
+    MAX_TASK_LOGS,
     candidate_score,
     candidate_sort_key,
     episodes_text,
+    extract_episode_numbers,
     is_duplicate_download_message,
     missing_episodes,
     normalize_task,
@@ -44,7 +48,7 @@ from .core import (
     task_search_keywords,
     title_matches,
     validate_task,
-    words_match,
+    word_filter_reason,
 )
 
 
@@ -61,7 +65,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.2.1"
+    plugin_version = "2.3.0"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -158,9 +162,18 @@ class directsearchsubscribe(_PluginBase):
             _api("/tasks/{task_id}/toggle", self.api_toggle_task, ["POST"], "暂停或恢复直搜任务"),
             _api("/tasks/{task_id}/auto", self.api_toggle_auto_download, ["POST"], "切换自动下载"),
             _api("/tasks/{task_id}/reset", self.api_reset_task, ["POST"], "重置直搜任务进度"),
+            _api("/tasks/{task_id}/cleanup/prepare", self.api_prepare_cleanup,
+                 ["POST"], "准备清理下载任务并重新处理"),
+            _api("/tasks/{task_id}/cleanup/prepare-files", self.api_prepare_cleanup_files,
+                 ["POST"], "准备清理下载任务和下载文件并重新处理"),
+            _api("/tasks/{task_id}/cleanup/confirm", self.api_confirm_cleanup,
+                 ["POST"], "确认清理并重新处理"),
+            _api("/tasks/{task_id}/cleanup/cancel", self.api_cancel_cleanup,
+                 ["POST"], "取消清理"),
             _api("/tasks/{task_id}/delete", self.api_delete_task, ["POST", "DELETE"], "移入回收站"),
             _api("/trash/{task_id}/restore", self.api_restore_task, ["POST"], "恢复直搜任务"),
             _api("/tasks/{task_id}/results", self.api_task_results, ["GET"], "查询最近候选"),
+            _api("/tasks/{task_id}/logs", self.api_task_logs, ["GET"], "查询任务详细日志"),
             _api("/transfers/retry-failed", self.api_retry_failed_transfers, ["POST"], "重试失败整理"),
         ]
 
@@ -274,12 +287,16 @@ class directsearchsubscribe(_PluginBase):
                             _col(12, 4, _switch("strict_title_match", "严格标题匹配", "要求标题命中节目名称、别名或搜索词")),
                         ]),
                         _row([
-                            _col(12, 4, _switch(
+                            _col(12, 3, _switch(
+                                "prefer_full_pack", "优先整包下载",
+                                "整包覆盖任一缺集时，下载整包全部文件并覆盖记录整段集数",
+                            )),
+                            _col(12, 3, _switch(
                                 "accept_unknown_episode", "允许未知集数下载",
                                 "高风险：标题解析不出集数时也可自动下载；每个任务最多选择一个",
                             )),
-                            _col(12, 4, _switch("save_task_now", "保存为插件任务", "保存配置时执行一次并自动复位")),
-                            _col(12, 4, _switch("run_after_save", "保存后立即检查", "创建或更新成功后启动后台检查")),
+                            _col(12, 3, _switch("save_task_now", "保存为插件任务", "保存配置时执行一次并自动复位")),
+                            _col(12, 3, _switch("run_after_save", "保存后立即检查", "创建或更新成功后启动后台检查")),
                         ]),
                         _alert("warning", "同名、同类型、同季任务已存在时会更新配置并保留下载进度。"),
                     ]),
@@ -317,6 +334,7 @@ class directsearchsubscribe(_PluginBase):
             "auto_download": False,
             "strict_title_match": True,
             "accept_unknown_episode": False,
+            "prefer_full_pack": True,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -326,7 +344,10 @@ class directsearchsubscribe(_PluginBase):
         legacy = self.get_data(LEGACY_TASKS_KEY) or {}
         active = sum(1 for task in tasks if task.get("enabled") and task.get("status") != "completed")
         auto = sum(1 for task in tasks if task.get("auto_download"))
-        contents = [_hero(self, len(tasks), active, auto), _task_collection(tasks), _recent_results(tasks)]
+        contents = [
+            _hero(self, len(tasks), active, auto), _task_collection(tasks),
+            _recent_results(tasks), _run_log_table(tasks),
+        ]
         if legacy:
             contents.insert(1, _alert(
                 "warning",
@@ -465,6 +486,75 @@ class directsearchsubscribe(_PluginBase):
             self._save_tasks(tasks)
         return schemas.Response(success=True, message="任务进度已重置", data=task)
 
+    def api_prepare_cleanup(self, task_id: str) -> schemas.Response:
+        return self._prepare_cleanup(task_id, delete_files=False)
+
+    def api_prepare_cleanup_files(self, task_id: str) -> schemas.Response:
+        return self._prepare_cleanup(task_id, delete_files=True)
+
+    def _prepare_cleanup(self, task_id: str, delete_files: bool) -> schemas.Response:
+        """进入五分钟的两步清理确认期，第一次调用不会删除任何内容。"""
+        with self.__class__._data_lock:
+            tasks = self._load_tasks()
+            task = tasks.get(task_id)
+            if not task:
+                return schemas.Response(success=False, message="任务不存在")
+            pending = {
+                "delete_files": delete_files,
+                "prepared_at": now_text(),
+                "expires_at": (datetime.now() + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            task["cleanup_pending"] = pending
+            scope = "下载任务及下载文件" if delete_files else "下载任务（保留下载文件）"
+            task["run_logs"] = [_audit_entry(
+                "清理", "等待确认", f"已准备清理{scope}；五分钟内再次确认才会执行", level="warning"
+            ), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
+            task["updated_at"] = now_text()
+            tasks[task_id] = task
+            self._save_tasks(tasks)
+        return schemas.Response(
+            success=True,
+            message=f"已准备清理{scope}，请在五分钟内点击“确认清理并重处理”",
+            data=task,
+        )
+
+    def api_cancel_cleanup(self, task_id: str) -> schemas.Response:
+        with self.__class__._data_lock:
+            tasks = self._load_tasks()
+            task = tasks.get(task_id)
+            if not task:
+                return schemas.Response(success=False, message="任务不存在")
+            task["cleanup_pending"] = {}
+            task["run_logs"] = [_audit_entry(
+                "清理", "已取消", "用户取消了待确认的清理操作"
+            ), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
+            task["updated_at"] = now_text()
+            tasks[task_id] = task
+            self._save_tasks(tasks)
+        return schemas.Response(success=True, message="已取消清理", data=task)
+
+    def api_confirm_cleanup(self, task_id: str) -> schemas.Response:
+        task = self._load_tasks().get(task_id)
+        if not task:
+            return schemas.Response(success=False, message="任务不存在")
+        pending = task.get("cleanup_pending") or {}
+        if not _cleanup_pending_active(pending):
+            self._update_runtime(task_id, cleanup_pending={})
+            return schemas.Response(success=False, message="清理确认已失效，请重新准备清理")
+        if not self._claim_task(task_id):
+            return schemas.Response(success=False, message="任务正在运行，请稍后再清理")
+        try:
+            result = self._cleanup_task(task, delete_files=parse_bool(pending.get("delete_files"), False))
+        finally:
+            self._release_task(task_id)
+        if not result.get("success"):
+            return _response(result)
+        started = self._start_task_thread(task_id)
+        message = str(result.get("message") or "清理完成")
+        if started.get("success"):
+            message += "；已开始重新检查和处理"
+        return schemas.Response(success=True, message=message, data=self._load_tasks().get(task_id))
+
     def api_delete_task(self, task_id: str) -> schemas.Response:
         with self.__class__._data_lock:
             tasks = self._load_tasks()
@@ -500,6 +590,12 @@ class directsearchsubscribe(_PluginBase):
         if not task:
             return schemas.Response(success=False, message="任务不存在")
         return schemas.Response(success=True, data=task.get("last_results") or [])
+
+    def api_task_logs(self, task_id: str) -> schemas.Response:
+        task = self._load_tasks().get(task_id)
+        if not task:
+            return schemas.Response(success=False, message="任务不存在")
+        return schemas.Response(success=True, data=task.get("run_logs") or [])
 
     def api_retry_failed_transfers(self) -> schemas.Response:
         if not self._start_failed_transfer_retry(legacy_only=False):
@@ -581,12 +677,26 @@ class directsearchsubscribe(_PluginBase):
         if not manual and (not task.get("enabled") or task.get("status") == "completed"):
             return
 
+        run_id = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{threading.get_ident()}"
+        audit: List[Dict[str, Any]] = []
+        initial_missing = missing_episodes(task)
+        _audit(audit, run_id, "运行", "开始", (
+            f"{'手动' if manual else '定时'}检查；缺集 {episodes_text(initial_missing) or '持续追更'}；"
+            f"优先规则 {normalize_priority_mode(task.get('priority_mode'))}；"
+            f"整包优先 {'开启' if parse_bool(task.get('prefer_full_pack'), True) else '关闭'}；"
+            f"自动下载 {'开启' if task.get('auto_download') else '关闭'}"
+        ))
         known_identities = self._known_resource_identities()
+        known_identities.difference_update(task.get("ignored_resource_identities") or [])
         if parse_bool(task.get("dedupe_history"), True):
             history_identities, history_episodes, history_has_movie = self._history_snapshot(task)
             known_identities.update(history_identities)
             downloaded = parse_episodes(task.get("downloaded_episodes"))
             recovered = history_episodes.difference(downloaded)
+            _audit(audit, run_id, "历史", "检查", (
+                f"命中 {len(history_identities)} 个历史发布标识；"
+                f"恢复集数 {episodes_text(recovered) or '无'}"
+            ))
             if recovered:
                 downloaded.update(recovered)
                 self._update_runtime(task_id, downloaded_episodes=sorted(downloaded))
@@ -594,17 +704,20 @@ class directsearchsubscribe(_PluginBase):
             target = target_episodes(task)
             if history_has_movie or target and target.issubset(downloaded):
                 message = "下载历史已覆盖全部目标，未重复搜索下载"
+                _audit(audit, run_id, "运行", "完成", message)
                 self._update_runtime(
                     task_id, status="completed", last_status="success", last_run_at=now_text(),
-                    last_message=message, last_download_count=0, last_duplicate_count=len(recovered),
+                    last_message=message, last_reason_summary=message,
+                    last_download_count=0, last_duplicate_count=len(recovered),
                 )
+                self._save_run_logs(task_id, audit)
                 return
 
         self._update_runtime(task_id, status="running", last_status="running",
                              last_run_at=now_text(), last_message="正在直接搜索站点")
         try:
             candidates, search_errors, duplicate_count = self._search_task(
-                task, stop_event, known_identities
+                task, stop_event, known_identities, audit, run_id
             )
             results = [item[1] for item in candidates]
             self._update_runtime(
@@ -618,11 +731,15 @@ class directsearchsubscribe(_PluginBase):
                 return
             if task.get("auto_download"):
                 downloads, runtime_duplicates = self._download_candidates(
-                    task, candidates, stop_event, known_identities
+                    task, candidates, stop_event, known_identities, audit, run_id
                 )
                 duplicate_count += runtime_duplicates
             else:
                 downloads = []
+                for _, result in candidates:
+                    result["skip_reason"] = "预览模式，自动下载已关闭"
+                    _audit(audit, run_id, "下载", "跳过", result["skip_reason"], result=result)
+                self._update_runtime(task_id, last_results=results)
             latest = self._load_tasks().get(task_id)
             if not latest:
                 return
@@ -643,20 +760,27 @@ class directsearchsubscribe(_PluginBase):
                 message += "（预览模式）"
             if search_errors:
                 message += f"，搜索异常 {len(search_errors)} 个"
+            reason_summary = _reason_summary(results, downloads, duplicate_count, search_errors)
+            _audit(audit, run_id, "运行", "完成", f"{message}；{reason_summary}")
             self._update_runtime(task_id, status=status,
                                  last_status="success" if not search_errors or results else "warning",
                                  last_message=message, last_download_count=len(downloads),
-                                 last_duplicate_count=duplicate_count)
+                                 last_duplicate_count=duplicate_count,
+                                 last_reason_summary=reason_summary)
+            self._save_run_logs(task_id, audit)
             if downloads and self._notify:
                 self.post_message(mtype=NotificationType.Plugin,
                                   title=f"直搜订阅：{latest.get('name')}", text=message)
             logger.info(f"直搜订阅 {latest.get('name')} 完成：{message}")
         except Exception as err:
             logger.error(f"直搜订阅 {task.get('name')} 执行失败：{err}", exc_info=True)
-            self._update_runtime(task_id, status="error", last_status="error", last_message=str(err))
+            _audit(audit, run_id, "运行", "失败", str(err), level="error")
+            self._update_runtime(task_id, status="error", last_status="error",
+                                 last_message=str(err), last_reason_summary=str(err))
+            self._save_run_logs(task_id, audit)
 
     def _search_task(self, task: Dict[str, Any], stop_event: threading.Event,
-                     known_identities: Set[str]) \
+                     known_identities: Set[str], audit: List[Dict[str, Any]], run_id: str) \
             -> Tuple[List[Tuple[Context, Dict[str, Any]]], List[str], int]:
         contexts: Dict[str, Tuple[Context, Dict[str, Any]]] = {}
         errors = []
@@ -675,15 +799,27 @@ class directsearchsubscribe(_PluginBase):
                     found = search_chain.search_by_title(keyword, page=page, sites=sites) or []
                 except Exception as err:
                     errors.append(f"{keyword} 第{page + 1}页：{err}")
+                    _audit(audit, run_id, "搜索", "异常",
+                           f"关键词“{keyword}”第 {page + 1} 页：{err}", level="error")
                     continue
+                _audit(audit, run_id, "搜索", "返回",
+                       f"关键词“{keyword}”第 {page + 1} 页返回 {len(found)} 条")
                 for context in found:
-                    prepared = _prepare_candidate(task, context, missing, downloaded)
+                    prepared, reason = _prepare_candidate(task, context, missing, downloaded)
                     if not prepared:
+                        torrent = getattr(context, "torrent_info", None)
+                        _audit(audit, run_id, "筛选", "排除", reason,
+                               title=getattr(torrent, "title", ""),
+                               site=getattr(torrent, "site_name", "") or getattr(torrent, "site", ""),
+                               seeders=getattr(torrent, "seeders", 0))
                         continue
+                    prepared[1]["reason"] = reason
                     fingerprint = prepared[1]["fingerprint"]
                     identity = prepared[1]["resource_identity"] or fingerprint
                     if fingerprint in downloaded_fingerprints or identity in known_identities:
                         duplicate_count += 1
+                        _audit(audit, run_id, "去重", "跳过",
+                               "发布标题已存在于插件记录或 MoviePilot 下载历史", result=prepared[1])
                         continue
                     existing = contexts.get(identity)
                     if existing:
@@ -691,8 +827,14 @@ class directsearchsubscribe(_PluginBase):
                         if _candidate_priority_key(task, prepared[1], missing) \
                                 > _candidate_priority_key(task, existing[1], missing):
                             contexts[identity] = prepared
+                            _audit(audit, run_id, "去重", "替换",
+                                   "同一发布标题重复，保留排序优先级更高的候选", result=prepared[1])
+                        else:
+                            _audit(audit, run_id, "去重", "跳过",
+                                   "同一发布标题重复，已有候选优先级更高", result=prepared[1])
                         continue
                     contexts[identity] = prepared
+                    _audit(audit, run_id, "筛选", "保留", reason, result=prepared[1])
         ordered = sorted(
             contexts.values(),
             key=lambda item: _candidate_priority_key(task, item[1], missing),
@@ -703,18 +845,21 @@ class directsearchsubscribe(_PluginBase):
     def _download_candidates(self, task: Dict[str, Any],
                              candidates: List[Tuple[Context, Dict[str, Any]]],
                              stop_event: threading.Event,
-                             known_identities: Set[str]) -> Tuple[List[Dict[str, Any]], int]:
+                             known_identities: Set[str], audit: List[Dict[str, Any]],
+                             run_id: str) -> Tuple[List[Dict[str, Any]], int]:
         """串行执行跨任务下载，避免两个手动任务竞态添加同一资源。"""
         with self.__class__._download_lock:
             known_identities.update(self._known_resource_identities())
+            known_identities.difference_update(task.get("ignored_resource_identities") or [])
             return self._download_candidates_locked(
-                task, candidates, stop_event, known_identities
+                task, candidates, stop_event, known_identities, audit, run_id
             )
 
     def _download_candidates_locked(self, task: Dict[str, Any],
                                     candidates: List[Tuple[Context, Dict[str, Any]]],
                                     stop_event: threading.Event,
-                                    known_identities: Set[str]) -> Tuple[List[Dict[str, Any]], int]:
+                                    known_identities: Set[str], audit: List[Dict[str, Any]],
+                                    run_id: str) -> Tuple[List[Dict[str, Any]], int]:
         task_id = str(task["id"])
         downloaded = parse_episodes(task.get("downloaded_episodes"))
         target = target_episodes(task)
@@ -728,35 +873,64 @@ class directsearchsubscribe(_PluginBase):
         )
         for context, result in candidates:
             if len(downloads) >= self._max_downloads:
+                _audit(audit, run_id, "下载", "停止", f"已达到单次下载上限 {self._max_downloads}")
                 break
             if task.get("type") == MediaType.MOVIE.value and downloads:
+                _audit(audit, run_id, "下载", "停止", "电影任务每轮只选择一个发布")
                 break
             if stop_event.is_set() or global_vars.is_system_stopped:
+                _audit(audit, run_id, "下载", "停止", "插件或系统已收到停止信号", level="warning")
                 break
             current = self._load_tasks().get(task_id)
             if not current or not current.get("auto_download"):
+                _audit(audit, run_id, "下载", "停止", "运行期间任务被删除或自动下载被关闭", level="warning")
                 break
             fingerprint = result["fingerprint"]
             identity = result.get("resource_identity") or fingerprint
             if fingerprint in fingerprints or identity in known_identities:
                 duplicate_count += 1
+                result["skip_reason"] = "运行期间再次命中插件记录或下载历史"
+                _audit(audit, run_id, "去重", "跳过", result["skip_reason"], result=result)
                 continue
             candidate_episodes = set(result.get("episode_numbers") or [])
             selected: Optional[Set[int]] = None
+            progress_episodes: Set[int] = set()
             if task.get("type") == MediaType.TV.value:
-                selected = candidate_episodes.difference(downloaded)
+                missing_overlap = candidate_episodes.difference(downloaded)
                 if target:
-                    selected.intersection_update(target)
-                if candidate_episodes and not selected:
+                    missing_overlap.intersection_update(target)
+                if candidate_episodes and not missing_overlap:
+                    result["skip_reason"] = "资源集数未覆盖当前缺集"
+                    _audit(audit, run_id, "下载", "跳过", result["skip_reason"], result=result)
                     continue
                 if not candidate_episodes and not task.get("accept_unknown_episode"):
+                    result["skip_reason"] = "未解析出具体集数，且“允许未知集数下载”已关闭"
+                    _audit(audit, run_id, "下载", "跳过", result["skip_reason"], result=result)
                     continue
                 if not candidate_episodes:
                     if unknown_downloaded:
                         result["skip_reason"] = "已选择过未知集数资源"
                         duplicate_count += 1
+                        _audit(audit, run_id, "下载", "跳过", result["skip_reason"], result=result)
                         continue
                     selected = None
+                    result["selection_reason"] = "未知集数下载已开启，本任务尚未选择未知集数资源"
+                elif parse_bool(task.get("prefer_full_pack"), True) and len(candidate_episodes) > 1:
+                    # episodes=None 表示不做文件级选集，整包中的所有文件都交给下载器。
+                    selected = None
+                    progress_episodes = set(candidate_episodes)
+                    result["download_scope"] = "full_pack"
+                    result["selection_reason"] = (
+                        f"整包 {episodes_text(candidate_episodes)} 覆盖缺集 "
+                        f"{episodes_text(missing_overlap)}，按整包下载全部文件"
+                    )
+                else:
+                    selected = missing_overlap
+                    progress_episodes = set(missing_overlap)
+                    result["download_scope"] = "selected_episodes"
+                    result["selection_reason"] = f"下载缺集 {episodes_text(missing_overlap)}"
+            _audit(audit, run_id, "下载", "选择",
+                   result.get("selection_reason") or "候选满足下载条件", result=result)
             try:
                 download_hash, error = DownloadChain().download_single(
                     context=context,
@@ -773,6 +947,7 @@ class directsearchsubscribe(_PluginBase):
             except Exception as err:
                 logger.warning(f"直搜订阅添加候选失败：{result.get('title')} - {err}")
                 result["download_error"] = str(err)
+                _audit(audit, run_id, "下载", "失败", str(err), level="error", result=result)
                 continue
             if is_duplicate_download_message(error):
                 result["duplicate"] = True
@@ -780,10 +955,11 @@ class directsearchsubscribe(_PluginBase):
                 duplicate_count += 1
                 fingerprints.add(fingerprint)
                 known_identities.add(identity)
-                if selected:
-                    downloaded.update(selected)
+                downloaded.update(progress_episodes)
                 if not candidate_episodes and task.get("type") == MediaType.TV.value:
                     unknown_downloaded = True
+                _audit(audit, run_id, "下载", "重复",
+                       result["skip_reason"], level="warning", result=result)
                 self._update_runtime(
                     task_id,
                     downloaded_episodes=sorted(downloaded),
@@ -793,33 +969,146 @@ class directsearchsubscribe(_PluginBase):
                 continue
             if not download_hash:
                 result["download_error"] = error or "添加下载失败"
+                _audit(audit, run_id, "下载", "失败", result["download_error"],
+                       level="error", result=result)
                 continue
-            if selected:
-                downloaded.update(selected)
+            downloaded.update(progress_episodes)
             fingerprints.add(fingerprint)
             known_identities.add(identity)
+            normalized_hash = str(download_hash).strip().casefold()
+            ignored_hashes = {
+                str(item).strip().casefold() for item in current.get("ignored_history_hashes") or []
+            }
+            ignored_hashes.discard(normalized_hash)
+            ignored_identities = set(current.get("ignored_resource_identities") or [])
+            ignored_identities.discard(identity)
             record = {
                 "time": now_text(), "fingerprint": fingerprint, "hash": download_hash,
                 "site": result.get("site"), "title": result.get("title"),
-                "episodes": episodes_text(selected or []), "size": result.get("size") or 0,
+                "episodes": episodes_text(progress_episodes), "size": result.get("size") or 0,
                 "resource_identity": identity, "transfer_status": "waiting",
+                "download_scope": result.get("download_scope") or "all",
+                "selection_reason": result.get("selection_reason") or "",
             }
             records.append(record)
             if not candidate_episodes and task.get("type") == MediaType.TV.value:
                 unknown_downloaded = True
             result["downloaded"] = True
             downloads.append(record)
+            _audit(audit, run_id, "下载", "成功",
+                   f"已加入下载器；{result.get('selection_reason') or '下载全部内容'}；"
+                   f"Hash {normalized_hash[:12]}", result=result)
             self._update_runtime(
                 task_id,
                 downloaded_episodes=sorted(downloaded),
                 downloaded_fingerprints=list(fingerprints)[-MAX_RESOURCE_HISTORY:],
                 download_records=records[-MAX_RESOURCE_HISTORY:],
+                ignored_history_hashes=sorted(ignored_hashes)[-MAX_RESOURCE_HISTORY:],
+                ignored_resource_identities=sorted(ignored_identities)[-MAX_RESOURCE_HISTORY:],
                 last_transfer_status="waiting",
                 last_transfer_message="等待下载完成",
                 last_results=[item[1] for item in candidates],
             )
         self._update_runtime(task_id, last_results=[item[1] for item in candidates])
         return downloads, duplicate_count
+
+    def _cleanup_task(self, task: Dict[str, Any], delete_files: bool) -> Dict[str, Any]:
+        """只清理当前插件任务关联的下载器项目，然后重置任务供重新处理。"""
+        task_id = str(task.get("id") or "")
+        record_hashes = {
+            str(record.get("hash") or "").strip().casefold()
+            for record in task.get("download_records") or []
+            if str(record.get("hash") or "").strip()
+        }
+        history_hashes = self._matching_plugin_history_hashes(task)
+        hashes = sorted(record_hashes.union(history_hashes))
+        ignored_identities = set(task.get("ignored_resource_identities") or [])
+        ignored_identities.update(
+            str(record.get("resource_identity") or "") or resource_identity(record.get("title"))
+            for record in task.get("download_records") or []
+        )
+        try:
+            for history_hash in history_hashes:
+                history = DownloadHistoryOper().get_by_hash(history_hash)
+                if history:
+                    ignored_identities.add(resource_identity(getattr(history, "torrent_name", "")))
+        except Exception as err:
+            logger.warning(f"直搜订阅读取待清理发布标识失败：{err}")
+        ignored_identities.discard("")
+        removed = 0
+        remove_error = ""
+        if hashes:
+            try:
+                state = DownloadChain().remove_torrents(
+                    hashs=hashes,
+                    delete_file=delete_files,
+                    downloader=task.get("downloader") or None,
+                )
+                if state:
+                    removed = len(hashes)
+                else:
+                    remove_error = "下载器未确认删除；项目可能已不存在或下载器当前不可用"
+            except Exception as err:
+                remove_error = str(err)
+
+        ignored_hashes = set(task.get("ignored_history_hashes") or [])
+        ignored_hashes.update(hashes)
+        scope = "下载任务和下载文件" if delete_files else "下载任务，下载文件已保留"
+        reason = f"已清理 {removed}/{len(hashes)} 个关联 Hash（{scope}），任务进度已重置"
+        if not hashes:
+            reason = "未找到仍可定位的插件下载 Hash；任务进度已重置"
+        if remove_error:
+            reason += f"；下载器提示：{remove_error}"
+        with self.__class__._data_lock:
+            tasks = self._load_tasks()
+            latest = tasks.get(task_id)
+            if not latest:
+                return {"success": False, "message": "任务不存在"}
+            latest["downloaded_episodes"] = sorted(parse_episodes(latest.get("owned_episodes")))
+            latest["downloaded_fingerprints"] = []
+            latest["download_records"] = []
+            latest["ignored_history_hashes"] = sorted(ignored_hashes)[-MAX_RESOURCE_HISTORY:]
+            latest["ignored_resource_identities"] = sorted(ignored_identities)[-MAX_RESOURCE_HISTORY:]
+            latest["last_results"] = []
+            latest["last_download_count"] = 0
+            latest["last_duplicate_count"] = 0
+            latest["last_transfer_status"] = ""
+            latest["last_transfer_message"] = ""
+            latest["last_transfer_at"] = ""
+            latest["cleanup_pending"] = {}
+            latest["status"] = "active" if latest.get("enabled") else "paused"
+            latest["last_status"] = "warning" if remove_error else "success"
+            latest["last_message"] = reason
+            latest["last_reason_summary"] = reason
+            latest["run_logs"] = [_audit_entry(
+                "清理", "已执行", reason, level="warning" if remove_error else "info"
+            ), *(latest.get("run_logs") or [])][:MAX_TASK_LOGS]
+            latest["updated_at"] = now_text()
+            tasks[task_id] = latest
+            self._save_tasks(tasks)
+        logger.info(f"直搜订阅 {task.get('name')} 清理：{reason}")
+        return {"success": True, "message": reason, "task": latest}
+
+    @staticmethod
+    def _matching_plugin_history_hashes(task: Dict[str, Any]) -> Set[str]:
+        """查找同节目且明确由本插件创建的历史 Hash，兼容任务删除后重建。"""
+        hashes: Set[str] = set()
+        try:
+            histories = DownloadHistoryOper().list_by_page(page=1, count=5000) or []
+        except Exception as err:
+            logger.warning(f"直搜订阅读取待清理历史失败：{err}")
+            return hashes
+        for history in histories:
+            note = getattr(history, "note", None)
+            source = str(note.get("source") or "") if isinstance(note, dict) else ""
+            if not source.startswith("DirectSearchSubscribe|"):
+                continue
+            if not _history_matches_task(task, history):
+                continue
+            download_hash = str(getattr(history, "download_hash", "") or "").strip().casefold()
+            if download_hash:
+                hashes.add(download_hash)
+        return hashes
 
     @classmethod
     def _claim_task(cls, task_id: str) -> bool:
@@ -866,6 +1155,19 @@ class directsearchsubscribe(_PluginBase):
             tasks[task_id] = task
             self._save_tasks(tasks)
 
+    def _save_run_logs(self, task_id: str, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        with self.__class__._data_lock:
+            tasks = self._load_tasks()
+            task = tasks.get(task_id)
+            if not task:
+                return
+            task["run_logs"] = [*reversed(entries), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
+            task["updated_at"] = now_text()
+            tasks[task_id] = task
+            self._save_tasks(tasks)
+
     def _update_transfer_record(self, download_hash: str, status: str,
                                 message: str = "", target: str = ""):
         """按下载 Hash 更新活动任务或回收站中的整理状态。"""
@@ -887,6 +1189,7 @@ class directsearchsubscribe(_PluginBase):
                         # 调度器可能在事件完成后再次扫描；不能把 completed 降级回 queued。
                         if record.get("transfer_status") == "completed" and status == "queued":
                             return
+                        previous_status = str(record.get("transfer_status") or "")
                         record["transfer_status"] = status
                         record["transfer_message"] = message
                         record["transfer_updated_at"] = now_text()
@@ -896,6 +1199,17 @@ class directsearchsubscribe(_PluginBase):
                         task["last_transfer_status"] = status
                         task["last_transfer_message"] = message
                         task["last_transfer_at"] = now_text()
+                        if previous_status != status:
+                            action = {
+                                "waiting": "等待", "queued": "入队", "completed": "完成",
+                                "failed": "失败",
+                            }.get(status, status or "更新")
+                            task["run_logs"] = [_audit_entry(
+                                "整理", action, message or f"整理状态更新为 {status}",
+                                level="error" if status == "failed" else "info",
+                                title=record.get("title"), site=record.get("site"),
+                                episodes=record.get("episodes"),
+                            ), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
                         task["updated_at"] = now_text()
                         tasks[task_id] = task
                         changed = True
@@ -1001,7 +1315,14 @@ class directsearchsubscribe(_PluginBase):
         strict_task = dict(task)
         strict_task["strict_title_match"] = True
         task_season = parse_int(task.get("season"), minimum=1)
+        ignored_hashes = {
+            str(item or "").strip().casefold()
+            for item in task.get("ignored_history_hashes") or []
+        }
         for history in histories:
+            history_hash = str(getattr(history, "download_hash", "") or "").strip().casefold()
+            if history_hash and history_hash in ignored_hashes:
+                continue
             torrent_title = str(getattr(history, "torrent_name", "") or "").strip()
             identity = resource_identity(torrent_title)
             if identity:
@@ -1030,6 +1351,12 @@ class directsearchsubscribe(_PluginBase):
                 continue
             episodes.update(torrent_meta.episode_list or [])
             episodes.update(stored_meta.episode_list or [])
+            episodes.update(parse_episodes(getattr(history, "episodes", None)))
+            episodes.update(extract_episode_numbers(torrent_title))
+            episodes.update(extract_episode_numbers(
+                f"{getattr(history, 'seasons', '') or ''} "
+                f"{getattr(history, 'episodes', '') or ''}"
+            ))
         return identities, episodes, matched_movie
 
     def _repair_download_tags(self):
@@ -1108,11 +1435,24 @@ def _direct_transfer_task(download_hash: Optional[str], fileitem: Any = None) ->
     stored_tasks = [*plugin._load_tasks().values(), *plugin._load_trash().values()]
     if normalized_hash:
         for task in stored_tasks:
+            if normalized_hash in {
+                    str(item or "").strip().casefold()
+                    for item in task.get("ignored_history_hashes") or []
+            }:
+                continue
             if any(
                     str(record.get("hash") or "").strip().casefold() == normalized_hash
                     for record in task.get("download_records") or []
             ):
                 return task
+        if any(
+                normalized_hash in {
+                    str(item or "").strip().casefold()
+                    for item in task.get("ignored_history_hashes") or []
+                }
+                for task in stored_tasks
+        ):
+            return None
 
     history = _download_history_for_transfer(download_hash, fileitem)
     note = getattr(history, "note", None) if history else None
@@ -1123,6 +1463,11 @@ def _direct_transfer_task(download_hash: Optional[str], fileitem: Any = None) ->
     task_id = source[len(prefix):].strip()
     for task in stored_tasks:
         if str(task.get("id") or "") == task_id:
+            if normalized_hash and normalized_hash in {
+                    str(item or "").strip().casefold()
+                    for item in task.get("ignored_history_hashes") or []
+            }:
+                return None
             return task
     return _task_from_download_history(history, task_id)
 
@@ -1248,6 +1593,111 @@ def _patched_transfer_history_media(self: TransferHistoryOper, mtype: Optional[s
     return original(self, mtype=mtype, tmdbid=tmdbid)
 
 
+def _audit_entry(stage: str, action: str, reason: str, level: str = "info",
+                 run_id: str = "", result: Optional[Dict[str, Any]] = None,
+                 title: Any = "", site: Any = "", episodes: Any = "",
+                 seeders: Any = None) -> Dict[str, Any]:
+    """构造不包含下载地址、Cookie 或 Passkey 的任务审计日志。"""
+    result = result or {}
+    return {
+        "time": now_text(),
+        "run_id": str(run_id or ""),
+        "stage": str(stage or ""),
+        "action": str(action or ""),
+        "level": str(level or "info"),
+        "reason": _safe_log_text(reason),
+        "title": str(title or result.get("title") or ""),
+        "site": str(site or result.get("site") or ""),
+        "episodes": str(episodes or result.get("episodes") or ""),
+        "seeders": parse_int(
+            seeders if seeders is not None else result.get("seeders"), 0, minimum=0
+        ) or 0,
+    }
+
+
+def _safe_log_text(value: Any) -> str:
+    """隐藏日志中可能由异常文本带出的下载链接查询参数。"""
+    text = str(value or "")
+    return re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[参数已隐藏]", text)
+
+
+def _audit(entries: List[Dict[str, Any]], run_id: str, stage: str, action: str,
+           reason: str, level: str = "info", result: Optional[Dict[str, Any]] = None,
+           **fields):
+    """追加单轮详细日志；限制单轮条数，避免大结果集挤爆插件数据。"""
+    max_run_entries = 300
+    if len(entries) >= max_run_entries:
+        if len(entries) == max_run_entries:
+            entries.append(_audit_entry(
+                "日志", "截断", f"本轮详细日志超过 {max_run_entries} 条，后续明细已省略",
+                level="warning", run_id=run_id,
+            ))
+        return
+    entries.append(_audit_entry(
+        stage, action, reason, level=level, run_id=run_id, result=result, **fields
+    ))
+
+
+def _reason_summary(results: List[Dict[str, Any]], downloads: List[Dict[str, Any]],
+                    duplicate_count: int, search_errors: List[str]) -> str:
+    if downloads:
+        pack_count = sum(1 for item in downloads if item.get("download_scope") == "full_pack")
+        return f"已加入 {len(downloads)} 个下载" + (f"，其中整包 {pack_count} 个" if pack_count else "")
+    reasons: Dict[str, int] = {}
+    for result in results:
+        reason = str(result.get("download_error") or result.get("skip_reason") or "").strip()
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+    if reasons:
+        reason, count = sorted(reasons.items(), key=lambda item: item[1], reverse=True)[0]
+        return f"未新增下载：{reason}" + (f"（{count} 个候选）" if count > 1 else "")
+    if duplicate_count:
+        return f"未新增下载：{duplicate_count} 个资源被历史或任务记录去重"
+    if search_errors:
+        return f"未新增下载：搜索发生 {len(search_errors)} 个异常且没有可用候选"
+    return "未新增下载：没有通过标题、集数、关键词和做种条件的候选"
+
+
+def _cleanup_pending_active(pending: Dict[str, Any]) -> bool:
+    try:
+        expires_at = datetime.strptime(str(pending.get("expires_at") or ""), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return False
+    return datetime.now() <= expires_at
+
+
+def _history_matches_task(task: Dict[str, Any], history: Any) -> bool:
+    torrent_title = str(getattr(history, "torrent_name", "") or "").strip()
+    if not torrent_title:
+        return False
+    description = " ".join(filter(None, (
+        str(getattr(history, "torrent_description", "") or ""),
+        str(getattr(history, "title", "") or ""),
+    )))
+    strict_task = dict(task)
+    strict_task["strict_title_match"] = True
+    if not title_matches(strict_task, torrent_title, description):
+        return False
+    history_type = str(getattr(history, "type", "") or "")
+    if history_type and history_type != task.get("type"):
+        return False
+    if task.get("type") == MediaType.MOVIE.value:
+        task_year = str(task.get("year") or "").strip()
+        history_year = str(getattr(history, "year", "") or "").strip()
+        return not task_year or not history_year or task_year == history_year
+    task_season = parse_int(task.get("season"), minimum=1)
+    torrent_meta = MetaInfo(title=torrent_title, subtitle=description)
+    stored_meta = MetaInfo(
+        title=f"{getattr(history, 'seasons', '') or ''}{getattr(history, 'episodes', '') or ''}"
+    )
+    parsed_season = torrent_meta.begin_season or stored_meta.begin_season
+    if task_season and parsed_season and task_season != parsed_season:
+        return False
+    task_year = str(task.get("year") or "").strip()
+    history_year = str(getattr(history, "year", "") or torrent_meta.year or "").strip()
+    return not task_year or not history_year or task_year == history_year
+
+
 def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "name": config.get("title"), "type": config.get("type"), "year": config.get("year"),
@@ -1259,6 +1709,7 @@ def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "search_pages": config.get("search_pages"), "downloader": config.get("downloader"),
         "priority_mode": config.get("priority_mode"), "min_seeders": config.get("min_seeders"),
         "dedupe_history": config.get("dedupe_history"),
+        "prefer_full_pack": config.get("prefer_full_pack"),
         "save_path": config.get("save_path"), "media_category": config.get("media_category"),
         "enabled": config.get("task_enabled"), "auto_download": config.get("auto_download"),
         "strict_title_match": config.get("strict_title_match"),
@@ -1267,39 +1718,46 @@ def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _prepare_candidate(task: Dict[str, Any], context: Context, missing: Set[int],
-                       downloaded: Set[int]) -> Optional[Tuple[Context, Dict[str, Any]]]:
+                       downloaded: Set[int]) \
+        -> Tuple[Optional[Tuple[Context, Dict[str, Any]]], str]:
     torrent = context.torrent_info
     if not torrent or not torrent.title:
-        return None
+        return None, "资源缺少标题"
     if not title_matches(task, torrent.title, torrent.description or ""):
-        return None
-    if not words_match(task, torrent.title, torrent.description or ""):
-        return None
+        return None, "标题未命中节目名称、别名或搜索词"
+    filter_reason = word_filter_reason(task, torrent.title, torrent.description or "")
+    if filter_reason:
+        return None, filter_reason
     media_type = MediaType(task.get("type") or MediaType.TV.value)
     meta = MetaInfo(title=torrent.title, subtitle=torrent.description)
     meta.type = media_type
     task_year = str(task.get("year") or "").strip()
     parsed_year = str(getattr(meta, "year", None) or "").strip()
     if task_year and parsed_year and task_year != parsed_year:
-        return None
+        return None, f"年份不符：任务 {task_year}，资源 {parsed_year}"
     if media_type == MediaType.TV:
         task_season = parse_int(task.get("season"), minimum=1)
         parsed_season = meta.begin_season
         if task_season and parsed_season and task_season != parsed_season:
-            return None
+            return None, f"季号不符：任务 S{task_season:02d}，资源 S{parsed_season:02d}"
         if task_season and not parsed_season:
             meta.begin_season = task_season
         elif not meta.begin_season:
             meta.begin_season = 1
     episodes = set(meta.episode_list or [])
+    episodes.update(extract_episode_numbers(f"{torrent.title} {torrent.description or ''}"))
     target = target_episodes(task)
     if media_type == MediaType.TV and episodes:
         needed = missing if target else episodes.difference(downloaded)
         if not episodes.intersection(needed):
-            return None
+            return None, (
+                f"资源集数 {episodes_text(episodes)} 未覆盖当前缺集 "
+                f"{episodes_text(needed) or '-'}"
+            )
     seeders = int(torrent.seeders or 0)
-    if seeders < (parse_int(task.get("min_seeders"), 0, minimum=0) or 0):
-        return None
+    min_seeders = parse_int(task.get("min_seeders"), 0, minimum=0) or 0
+    if seeders < min_seeders:
+        return None, f"做种数 {seeders} 低于最低要求 {min_seeders}"
     fingerprint = resource_fingerprint(torrent.site, torrent.enclosure, torrent.page_url,
                                        torrent.title, torrent.size)
     identity = resource_identity(torrent.title)
@@ -1312,7 +1770,17 @@ def _prepare_candidate(task: Dict[str, Any], context: Context, missing: Set[int]
     context.media_info_is_target = True
     score = candidate_score(episodes, missing, seeders,
                             torrent.downloadvolumefactor, int(torrent.size or 0))
-    return context, {
+    if media_type == MediaType.MOVIE:
+        accepted_reason = f"电影候选通过；做种 {seeders}"
+    elif episodes:
+        overlap = episodes.intersection(missing) if target else episodes.difference(downloaded)
+        pack = "整包" if len(episodes) > 1 else "单集"
+        accepted_reason = (
+            f"{pack} {episodes_text(episodes)} 覆盖缺集 {episodes_text(overlap)}；做种 {seeders}"
+        )
+    else:
+        accepted_reason = f"未解析出具体集数；做种 {seeders}"
+    return (context, {
         "fingerprint": fingerprint, "resource_identity": identity, "site_id": torrent.site,
         "site": torrent.site_name or str(torrent.site or ""), "title": torrent.title,
         "size": int(torrent.size or 0), "seeders": seeders,
@@ -1323,7 +1791,7 @@ def _prepare_candidate(task: Dict[str, Any], context: Context, missing: Set[int]
         "downloadable": bool(episodes) or media_type == MediaType.MOVIE
                         or parse_bool(task.get("accept_unknown_episode"), False),
         "downloaded": False, "score": score,
-    }
+    }), accepted_reason
 
 
 def _candidate_priority_key(task: Dict[str, Any], result: Dict[str, Any],
@@ -1336,6 +1804,7 @@ def _candidate_priority_key(task: Dict[str, Any], result: Dict[str, Any],
         free_factor=0 if result.get("free") else 1,
         size=int(result.get("size") or 0),
         pubdate=result.get("pubdate"),
+        prefer_full_pack=parse_bool(task.get("prefer_full_pack"), True),
     )
 
 
@@ -1440,12 +1909,35 @@ def _task_card(task: Dict[str, Any]) -> Dict[str, Any]:
     }[normalize_priority_mode(task.get("priority_mode"))]
     priority_text += f" · 最低做种 {parse_int(task.get('min_seeders'), 0, minimum=0) or 0}"
     priority_text += " · 下载历史去重" if parse_bool(task.get("dedupe_history"), True) else ""
+    priority_text += " · 整包优先" if parse_bool(task.get("prefer_full_pack"), True) else ""
     transfer_status = {
         "waiting": "等待下载完成", "queued": "已加入整理队列", "completed": "整理完成",
         "failed": "整理失败",
     }.get(str(task.get("last_transfer_status") or ""), "尚无整理记录")
     if task.get("last_transfer_message"):
         transfer_status += f" · {task.get('last_transfer_message')}"
+    cleanup_pending = task.get("cleanup_pending") or {}
+    if _cleanup_pending_active(cleanup_pending):
+        cleanup_scope = "下载任务及下载文件" if cleanup_pending.get("delete_files") \
+            else "下载任务（保留文件）"
+        cleanup_actions = [
+            _alert("warning", f"待确认：将清理{cleanup_scope}，重置插件进度后立即重新检查；媒体库成品不会删除。"),
+            {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-2"}, "content": [
+                _action("确认清理并重处理", "mdi-delete-sweep", "error",
+                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/confirm"),
+                _action("取消清理", "mdi-close", "secondary",
+                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/cancel"),
+            ]},
+        ]
+    else:
+        cleanup_actions = [
+            {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-2"}, "content": [
+                _action("准备清理（保留文件）", "mdi-broom", "secondary",
+                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/prepare"),
+                _action("准备清理下载文件", "mdi-delete-sweep", "error",
+                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/prepare-files"),
+            ]},
+        ]
     return {
         "component": "VCard", "props": {"variant": "outlined", "class": "mb-3"},
         "content": [
@@ -1462,6 +1954,7 @@ def _task_card(task: Dict[str, Any]) -> Dict[str, Any]:
                 _line("站点", ", ".join(str(item) for item in task.get("sites") or []) or "系统活动站点"),
                 _line("择优", priority_text),
                 _line("最近结果", str(task.get("last_message") or "尚未运行")),
+                _line("本轮原因", str(task.get("last_reason_summary") or "尚无详细原因")),
                 _line("下载后整理", transfer_status),
                 _line("最近检查", str(task.get("last_run_at") or "-")),
                 {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-3"}, "content": [
@@ -1470,6 +1963,7 @@ def _task_card(task: Dict[str, Any]) -> Dict[str, Any]:
                     _action(auto_text, "mdi-download", "warning", f"plugin/{PLUGIN_ID}/tasks/{task['id']}/auto"),
                     _action("移入回收站", "mdi-delete-outline", "error", f"plugin/{PLUGIN_ID}/tasks/{task['id']}/delete"),
                 ]},
+                *cleanup_actions,
             ]},
         ],
     }
@@ -1484,15 +1978,41 @@ def _recent_results(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
             )
             rows.append({"节目": task.get("name"), "站点": result.get("site"), "标题": result.get("title"),
                          "集数": result.get("episodes") or "未知", "做种": result.get("seeders") or 0,
-                         "促销": "免费" if result.get("free") else "-", "状态": state})
+                         "促销": "免费" if result.get("free") else "-", "状态": state,
+                         "原因": result.get("download_error") or result.get("skip_reason")
+                                 or result.get("selection_reason") or result.get("reason") or "-"})
     headers = [{"title": key, "key": key}
-               for key in ["节目", "站点", "标题", "集数", "做种", "促销", "状态"]]
+               for key in ["节目", "站点", "标题", "集数", "做种", "促销", "状态", "原因"]]
     return {
         "component": "VCard", "props": {"variant": "outlined", "class": "mb-4"},
         "content": [{"component": "VCardTitle", "text": "最近候选"},
                     {"component": "VDataTable", "props": {"headers": headers, "items": rows[:50],
                                                                "items-per-page": 10, "density": "compact",
                                                                "no-data-text": "暂无候选结果"}}],
+    }
+
+
+def _run_log_table(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = []
+    for task in tasks:
+        for entry in task.get("run_logs") or []:
+            rows.append({
+                "时间": entry.get("time"), "节目": task.get("name"),
+                "阶段": entry.get("stage"), "动作": entry.get("action"),
+                "站点": entry.get("site") or "-", "资源": entry.get("title") or "-",
+                "集数": entry.get("episodes") or "-", "做种": entry.get("seeders") or 0,
+                "原因": entry.get("reason") or "-",
+            })
+    rows.sort(key=lambda item: str(item.get("时间") or ""), reverse=True)
+    headers = [{"title": key, "key": key}
+               for key in ["时间", "节目", "阶段", "动作", "站点", "资源", "集数", "做种", "原因"]]
+    return {
+        "component": "VCard", "props": {"variant": "outlined", "class": "mb-4"},
+        "content": [{"component": "VCardTitle", "text": "详细运行日志与原因"},
+                    {"component": "VDataTable", "props": {
+                        "headers": headers, "items": rows[:100], "items-per-page": 15,
+                        "density": "compact", "no-data-text": "暂无运行日志",
+                    }}],
     }
 
 

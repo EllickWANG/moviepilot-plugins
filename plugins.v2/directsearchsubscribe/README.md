@@ -1,6 +1,6 @@
 # 直搜订阅
 
-`directsearchsubscribe` 2.2 是一个完全由插件维护的站点直搜任务管理器。它适合没有可靠 TMDB、豆瓣或 Bangumi 条目的节目，也适合只想按人工关键词和集数直接检查站点的场景。
+`directsearchsubscribe` 2.3 是一个完全由插件维护的站点直搜任务管理器。它适合没有可靠 TMDB、豆瓣或 Bangumi 条目的节目，也适合只想按人工关键词和集数直接检查站点的场景。
 
 ## 设计边界
 
@@ -29,11 +29,22 @@
 - 填写年份时，只会排除能够从资源标题识别出且年份不同的候选；标题没有年份时不会误杀。
 - 自动下载默认关闭。建议先运行一次，在插件详情页检查候选，再打开自动下载。
 - 默认按做种数优先；每个任务也可改为综合、免费、发布时间、小体积或大体积优先，并可设置最低做种数。
+- “优先整包下载”默认开启。明确识别为 `E01-E08` 一类的整包只要覆盖任一缺集，就优先于覆盖数相同的单集资源，并下载整包全部文件；例如只缺第 2 集时仍会下载 1-8 整包。
 - 下载历史去重默认开启：同时检查活动任务、回收站和 MoviePilot 下载历史；相同发布标题只下载一次，并从匹配的历史记录恢复已有集数。
 - 未知集数下载默认关闭。开启后每个任务也只允许选择一个未知集数资源，避免同一季连续下载多个整包。
 - 电影任务每轮最多成功添加一个资源，不会因为“单次最多下载”大于 1 而重复选择多个版本。
 - 有限目标全部下载成功后任务会标记为已完成；不填总集数和指定集数时进入持续追更模式。
 - 删除任务会先进入插件回收站，可以在详情页恢复。
+
+候选的标题、季、集数、包含/排除词、最低做种数、去重、选集、下载器返回值和整理结果都会写入插件自己的详细日志。日志不保存种子下载地址、Cookie 或 Passkey，详情页显示最近 100 条，每个任务最多保留 500 条。
+
+## 清理并重新处理
+
+- 任务卡提供“准备清理（保留文件）”和“准备清理下载文件”两个入口，第一次点击只进入五分钟确认期，第二次确认后才执行。
+- 清理范围只包含与当前节目匹配、且明确由本插件创建的下载 Hash；不会删除其他来源的下载，也不会删除媒体库成品。
+- “保留文件”只从下载器移除任务；“清理下载文件”同时要求下载器删除对应下载数据。
+- 清理后插件下载记录与进度恢复为人工填写的“已有集数”，旧 Hash 会从本任务的历史恢复中临时排除，并立即重新搜索、下载和整理。
+- MoviePilot 的下载历史仍保留作为审计记录；同一 Hash 成功重新加入后会自动恢复正常历史去重。
 
 资源成功加入下载器后，插件同时记录站点指纹和跨站点发布标识；下载器明确返回“任务已存在”时只登记为重复跳过，不再计作新增下载。下载任务会同时保留 MoviePilot 系统标签和“直搜订阅”标签，因此可在 MoviePilot 下载管理中正常显示；升级加载时也会为仍在下载器中的旧任务补齐系统标签。每次运行最多添加的任务数由“单次最多下载”控制。
 
@@ -59,7 +70,7 @@
 
 ## 页面与接口
 
-插件详情页显示任务状态、缺失集数、最近检查结果、候选资源和回收站，并提供立即检查、暂停/恢复、自动下载开关和删除操作。
+插件详情页显示任务状态、缺失集数、本轮原因、候选资源、详细日志和回收站，并提供立即检查、暂停/恢复、自动下载开关、两步清理重处理和删除操作。
 
 插件 API 均使用 MoviePilot 的 Bearer 鉴权：
 
@@ -70,9 +81,14 @@
 - `POST /plugin/directsearchsubscribe/tasks/{task_id}/toggle`
 - `POST /plugin/directsearchsubscribe/tasks/{task_id}/auto`
 - `POST /plugin/directsearchsubscribe/tasks/{task_id}/reset`
+- `POST /plugin/directsearchsubscribe/tasks/{task_id}/cleanup/prepare`
+- `POST /plugin/directsearchsubscribe/tasks/{task_id}/cleanup/prepare-files`
+- `POST /plugin/directsearchsubscribe/tasks/{task_id}/cleanup/confirm`
+- `POST /plugin/directsearchsubscribe/tasks/{task_id}/cleanup/cancel`
 - `POST|DELETE /plugin/directsearchsubscribe/tasks/{task_id}/delete`
 - `POST /plugin/directsearchsubscribe/trash/{task_id}/restore`
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/results`
+- `GET /plugin/directsearchsubscribe/tasks/{task_id}/logs`
 - `POST /plugin/directsearchsubscribe/transfers/retry-failed`
 
 ## 使用前提

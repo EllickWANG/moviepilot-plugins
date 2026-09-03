@@ -10,9 +10,10 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-TASK_SCHEMA_VERSION = 4
+TASK_SCHEMA_VERSION = 5
 MAX_RESULTS = 50
 MAX_RESOURCE_HISTORY = 500
+MAX_TASK_LOGS = 500
 PRIORITY_MODES = {"seeders", "balanced", "free", "latest", "smallest", "largest"}
 
 
@@ -118,6 +119,29 @@ def parse_episodes(value: Any) -> Set[int]:
     return {episode for episode in episodes if episode > 0}
 
 
+def extract_episode_numbers(value: Any) -> Set[int]:
+    """从发布标题或历史文本中提取 E01、E01-E08、S01E01-S01E08 等集数。"""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    episodes: Set[int] = set()
+    range_patterns = (
+        r"(?:S\d{1,3}\s*)?E(?:P)?\s*(\d{1,4})\s*[-~至到]\s*(?:S\d{1,3}\s*)?E?(?:P)?\s*(\d{1,4})",
+        r"第?\s*(\d{1,4})\s*[-~至到]\s*第?\s*(\d{1,4})\s*[集话話]",
+    )
+    for pattern in range_patterns:
+        for matched in re.finditer(pattern, text, re.IGNORECASE):
+            start, end = int(matched.group(1)), int(matched.group(2))
+            start, end = min(start, end), max(start, end)
+            if start > 0 and end - start <= 10000:
+                episodes.update(range(start, end + 1))
+    for matched in re.finditer(
+            r"(?:S\d{1,3}\s*)?E(?:P)?\s*(\d{1,4})(?!\d)", text, re.IGNORECASE
+    ):
+        episode = int(matched.group(1))
+        if episode > 0:
+            episodes.add(episode)
+    return episodes
+
+
 def episode_expression_is_valid(value: Any) -> bool:
     """校验集数表达式，避免悄悄忽略错误片段。"""
     if value in (None, "", []):
@@ -201,6 +225,20 @@ def words_match(task: Dict[str, Any], title: str, description: str = "") -> bool
         and not any(word in text for word in excludes)
 
 
+def word_filter_reason(task: Dict[str, Any], title: str, description: str = "") -> Optional[str]:
+    """返回必须包含/排除词不匹配的可读原因。"""
+    text = f"{title} {description}".casefold()
+    includes = parse_words(task.get("include"))
+    excludes = parse_words(task.get("exclude"))
+    missing = [word for word in includes if word.casefold() not in text]
+    if missing:
+        return f"缺少必须包含词：{', '.join(missing)}"
+    blocked = [word for word in excludes if word.casefold() in text]
+    if blocked:
+        return f"命中排除词：{', '.join(blocked)}"
+    return None
+
+
 def target_episodes(task: Dict[str, Any]) -> Set[int]:
     """计算任务的有限目标集；空集合表示持续追更模式。"""
     explicit = parse_episodes(task.get("episodes"))
@@ -258,10 +296,12 @@ def _pubdate_rank(value: Any) -> int:
 
 def candidate_sort_key(priority_mode: Any, episodes: Set[int], missing: Set[int],
                        seeders: int, free_factor: Optional[float], size: int,
-                       pubdate: Any = None) -> Tuple[int, ...]:
-    """生成候选排序键；缺集覆盖和可识别集数始终优先，再应用用户规则。"""
+                       pubdate: Any = None,
+                       prefer_full_pack: bool = True) -> Tuple[int, ...]:
+    """生成候选排序键；缺集覆盖后优先明确整包，再应用用户规则。"""
     covered = len(episodes.intersection(missing)) if missing else len(episodes)
     known = 1 if episodes else 0
+    full_pack = 1 if prefer_full_pack and len(episodes) > 1 else 0
     seeds = max(int(seeders or 0), 0)
     free = 1 if free_factor == 0 else 0
     bytes_size = max(int(size or 0), 0)
@@ -275,7 +315,7 @@ def candidate_sort_key(priority_mode: Any, episodes: Set[int], missing: Set[int]
         "smallest": (-bytes_size, seeds, free, latest),
         "largest": (bytes_size, seeds, free, latest),
     }
-    return covered, known, *priorities[mode]
+    return covered, full_pack, known, *priorities[mode]
 
 
 def is_duplicate_download_message(value: Any) -> bool:
@@ -333,12 +373,23 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
         "strict_title_match": parse_bool(source.get("strict_title_match"), True),
         "accept_unknown_episode": parse_bool(source.get("accept_unknown_episode"), False),
         "dedupe_history": parse_bool(source.get("dedupe_history"), True),
+        "prefer_full_pack": parse_bool(source.get("prefer_full_pack"), True),
         "priority_mode": normalize_priority_mode(source.get("priority_mode")),
         "min_seeders": parse_int(source.get("min_seeders"), 0, minimum=0, maximum=1000000) or 0,
         "owned_episodes": episodes_text(owned),
         "downloaded_episodes": sorted(downloaded),
         "downloaded_fingerprints": list(dict.fromkeys(source.get("downloaded_fingerprints") or []))[-MAX_RESOURCE_HISTORY:],
         "download_records": list(source.get("download_records") or [])[-MAX_RESOURCE_HISTORY:],
+        "ignored_history_hashes": list(dict.fromkeys(
+            str(item or "").strip().casefold()
+            for item in source.get("ignored_history_hashes") or []
+            if str(item or "").strip()
+        ))[-MAX_RESOURCE_HISTORY:],
+        "ignored_resource_identities": list(dict.fromkeys(
+            str(item or "").strip()
+            for item in source.get("ignored_resource_identities") or []
+            if str(item or "").strip()
+        ))[-MAX_RESOURCE_HISTORY:],
         "last_results": list(source.get("last_results") or [])[:MAX_RESULTS],
         "status": str(source.get("status") or "active"),
         "last_run_at": str(source.get("last_run_at") or ""),
@@ -350,6 +401,9 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
         "last_transfer_status": str(source.get("last_transfer_status") or ""),
         "last_transfer_message": str(source.get("last_transfer_message") or ""),
         "last_transfer_at": str(source.get("last_transfer_at") or ""),
+        "last_reason_summary": str(source.get("last_reason_summary") or ""),
+        "run_logs": list(source.get("run_logs") or [])[:MAX_TASK_LOGS],
+        "cleanup_pending": dict(source.get("cleanup_pending") or {}),
         "created_at": created_at,
         "updated_at": now_text(),
     }
