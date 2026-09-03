@@ -65,7 +65,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.3.1"
+    plugin_version = "2.3.2"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -115,6 +115,7 @@ class directsearchsubscribe(_PluginBase):
         # 2.0.0 创建的任务只有插件标签，MoviePilot 下载管理会将其过滤掉。
         # 标签追加是幂等操作，每次加载时顺便修复仍保留在下载器中的历史任务。
         self._repair_download_tags()
+        self._reconcile_transfer_records()
 
         # 2.2 之前已经完成下载的任务可能因缺少外部媒体 ID 留下“未识别”失败历史。
         # 只自动补偿从未登记过整理状态的旧记录，明确失败的新记录留给用户手工重试。
@@ -671,6 +672,7 @@ class directsearchsubscribe(_PluginBase):
         return {"success": True, "message": "任务已在后台开始", "task_id": task_id}
 
     def _execute_task(self, task_id: str, manual: bool, stop_event: threading.Event):
+        self._reconcile_transfer_records(task_id=task_id)
         task = self._load_tasks().get(task_id)
         if not task:
             return
@@ -1010,6 +1012,7 @@ class directsearchsubscribe(_PluginBase):
                 last_results=[item[1] for item in candidates],
             )
         self._update_runtime(task_id, last_results=[item[1] for item in candidates])
+        self._reconcile_transfer_records(task_id=task_id)
         return downloads, duplicate_count
 
     def _cleanup_task(self, task: Dict[str, Any], delete_files: bool) -> Dict[str, Any]:
@@ -1219,6 +1222,60 @@ class directsearchsubscribe(_PluginBase):
                 if changed:
                     saver(tasks)
                     return
+
+    def _reconcile_transfer_records(self, task_id: Optional[str] = None):
+        """按 Hash 对账整理历史，补偿整理事件早于插件记录落库的竞态。"""
+        stored_tasks = [*self._load_tasks().values(), *self._load_trash().values()]
+        for task in stored_tasks:
+            if task_id and str(task.get("id") or "") != str(task_id):
+                continue
+            for record in task.get("download_records") or []:
+                if str(record.get("transfer_status") or "") == "completed":
+                    continue
+                download_hash = str(record.get("hash") or "").strip()
+                if not download_hash:
+                    continue
+                try:
+                    histories = TransferHistoryOper().list_by_hash(download_hash) or []
+                except Exception as err:
+                    logger.warning(f"直搜订阅整理状态对账失败：{download_hash[:12]} - {err}")
+                    continue
+                try:
+                    record_threshold = datetime.strptime(
+                        str(record.get("time") or ""), "%Y-%m-%d %H:%M:%S"
+                    ) - timedelta(minutes=2)
+                    histories = [history for history in histories if not getattr(history, "date", None)
+                                 or datetime.strptime(str(history.date), "%Y-%m-%d %H:%M:%S")
+                                 >= record_threshold]
+                except (TypeError, ValueError):
+                    pass
+                latest_by_source: Dict[str, Any] = {}
+                for history in histories:
+                    source = str(getattr(history, "src", "") or getattr(history, "id", ""))
+                    current = latest_by_source.get(source)
+                    rank = (str(getattr(history, "date", "") or ""), int(getattr(history, "id", 0) or 0))
+                    current_rank = (
+                        str(getattr(current, "date", "") or ""),
+                        int(getattr(current, "id", 0) or 0),
+                    ) if current else ("", 0)
+                    if not current or rank >= current_rank:
+                        latest_by_source[source] = history
+                latest_histories = list(latest_by_source.values())
+                successes = [history for history in latest_histories
+                             if bool(getattr(history, "status", False))]
+                failures = [history for history in latest_histories
+                            if not bool(getattr(history, "status", False))]
+                if failures:
+                    message = str(getattr(failures[-1], "errmsg", "") or "整理历史中存在失败文件")
+                    if successes:
+                        message = f"已完成 {len(successes)} 个文件，失败 {len(failures)} 个：{message}"
+                    self._update_transfer_record(download_hash, "failed", message)
+                elif successes:
+                    target = str(getattr(successes[-1], "dest", "") or "")
+                    message = f"已整理 {len(successes)} 个文件"
+                    if target:
+                        message += f"，最近目标 {target}"
+                    self._update_transfer_record(download_hash, "completed", message, target)
 
     def _start_failed_transfer_retry(self, legacy_only: bool) -> bool:
         """后台重试本插件下载产生的失败整理记录。"""

@@ -172,7 +172,7 @@ class ArchitectureBoundaryTest(unittest.TestCase):
     def test_manifest_versions_match_plugin(self):
         for filename in ("package.v2.json", "package.json"):
             package = json.loads((ROOT / filename).read_text(encoding="utf-8"))
-            self.assertEqual(package["directsearchsubscribe"]["version"], "2.3.1")
+            self.assertEqual(package["directsearchsubscribe"]["version"], "2.3.2")
 
     def test_downloads_keep_moviepilot_system_tag(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
@@ -207,6 +207,8 @@ class ArchitectureBoundaryTest(unittest.TestCase):
         self.assertIn('/tasks/{task_id}/cleanup/confirm', source)
         self.assertIn('delete_file=delete_files', source)
         self.assertIn('ignored_history_hashes', source)
+        self.assertIn('_reconcile_transfer_records', source)
+        self.assertIn('latest_by_source', source)
 
 
 if __name__ == "__main__":
