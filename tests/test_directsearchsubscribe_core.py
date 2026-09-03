@@ -77,6 +77,19 @@ class TaskSafetyTest(unittest.TestCase):
             task, "Re Zero S04E01 1080P HEVC 预告"
         ))
 
+    def test_title_match_allows_year_before_season_episode(self):
+        task = CORE.normalize_task({
+            "name": "Re Zero kara Hajimeru Isekai Seikatsu S04",
+        })
+        self.assertTrue(CORE.title_matches(
+            task,
+            "Re Zero Kara Hajimeru Isekai Seikatsu 2026 S04E01-S04E08 1080p",
+        ))
+        self.assertFalse(CORE.title_matches(
+            task,
+            "Another Isekai Seikatsu 2026 S04E01-S04E08 1080p",
+        ))
+
     def test_fingerprint_ignores_rotating_download_url_when_page_is_stable(self):
         first = CORE.resource_fingerprint(1, "https://tracker/download?t=old", "https://tracker/details/8", "Title", 10)
         second = CORE.resource_fingerprint(1, "https://tracker/download?t=new", "https://tracker/details/8", "Title", 10)
@@ -159,7 +172,7 @@ class ArchitectureBoundaryTest(unittest.TestCase):
     def test_manifest_versions_match_plugin(self):
         for filename in ("package.v2.json", "package.json"):
             package = json.loads((ROOT / filename).read_text(encoding="utf-8"))
-            self.assertEqual(package["directsearchsubscribe"]["version"], "2.3.0")
+            self.assertEqual(package["directsearchsubscribe"]["version"], "2.3.1")
 
     def test_downloads_keep_moviepilot_system_tag(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")

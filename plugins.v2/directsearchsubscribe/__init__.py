@@ -65,7 +65,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.3.0"
+    plugin_version = "2.3.1"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1

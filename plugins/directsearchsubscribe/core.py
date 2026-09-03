@@ -212,8 +212,38 @@ def title_matches(task: Dict[str, Any], title: str, description: str = "") -> bo
     """判断站点结果是否命中人工标题或别名。"""
     if not parse_bool(task.get("strict_title_match"), True):
         return True
-    haystack = normalize_text(f"{title} {description}")
-    return any(normalize_text(candidate) in haystack for candidate in task_title_candidates(task))
+    raw_haystack = f"{title} {description}"
+    haystack = normalize_text(raw_haystack)
+    haystack_tokens = _title_tokens(raw_haystack)
+    for candidate in task_title_candidates(task):
+        if normalize_text(candidate) in haystack:
+            return True
+        candidate_tokens = _title_tokens(candidate)
+        if len(candidate_tokens) >= 2 and _tokens_in_order(candidate_tokens, haystack_tokens):
+            return True
+    return False
+
+
+def _title_tokens(value: Any) -> List[str]:
+    """保留发布标题词序，允许年份、季号和技术参数插入节目名称中间。"""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.findall(r"[^\W_]+", text, re.UNICODE)
+
+
+def _tokens_in_order(needles: List[str], haystack: List[str]) -> bool:
+    """按顺序匹配词；任务中的 S04 允许命中发布标题的 S04E01。"""
+    index = 0
+    for needle in needles:
+        matched = False
+        while index < len(haystack):
+            token = haystack[index]
+            index += 1
+            if token == needle or re.fullmatch(r"s\d{1,3}", needle) and token.startswith(needle + "e"):
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
 
 
 def words_match(task: Dict[str, Any], title: str, description: str = "") -> bool:
