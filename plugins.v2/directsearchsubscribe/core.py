@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-TASK_SCHEMA_VERSION = 5
+TASK_SCHEMA_VERSION = 6
 MAX_RESULTS = 50
 MAX_RESOURCE_HISTORY = 500
 MAX_TASK_LOGS = 500
@@ -377,7 +377,10 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
     normalized_id = str((existing or {}).get("id") or task_id or uuid.uuid4().hex[:12])
     episodes = episodes_text(parse_episodes(source.get("episodes")))
     owned = parse_episodes(source.get("owned_episodes"))
+    repair_missing = parse_episodes(source.get("repair_missing_episodes"))
+    repair_missing.difference_update(owned)
     downloaded = parse_episodes(source.get("downloaded_episodes"))
+    downloaded.difference_update(repair_missing)
     downloaded.update(owned)
     task = {
         "schema_version": TASK_SCHEMA_VERSION,
@@ -408,6 +411,7 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
         "min_seeders": parse_int(source.get("min_seeders"), 0, minimum=0, maximum=1000000) or 0,
         "owned_episodes": episodes_text(owned),
         "downloaded_episodes": sorted(downloaded),
+        "repair_missing_episodes": sorted(repair_missing),
         "downloaded_fingerprints": list(dict.fromkeys(source.get("downloaded_fingerprints") or []))[-MAX_RESOURCE_HISTORY:],
         "download_records": list(source.get("download_records") or [])[-MAX_RESOURCE_HISTORY:],
         "ignored_history_hashes": list(dict.fromkeys(
@@ -431,6 +435,9 @@ def normalize_task(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] =
         "last_transfer_status": str(source.get("last_transfer_status") or ""),
         "last_transfer_message": str(source.get("last_transfer_message") or ""),
         "last_transfer_at": str(source.get("last_transfer_at") or ""),
+        "last_repair_at": str(source.get("last_repair_at") or ""),
+        "last_repair_status": str(source.get("last_repair_status") or ""),
+        "last_repair_message": str(source.get("last_repair_message") or ""),
         "last_reason_summary": str(source.get("last_reason_summary") or ""),
         "run_logs": list(source.get("run_logs") or [])[:MAX_TASK_LOGS],
         "cleanup_pending": dict(source.get("cleanup_pending") or {}),

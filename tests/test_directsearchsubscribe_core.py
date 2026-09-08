@@ -60,10 +60,20 @@ class TaskSafetyTest(unittest.TestCase):
         self.assertTrue(task["prefer_full_pack"])
         self.assertEqual(task["priority_mode"], "seeders")
         self.assertEqual(task["min_seeders"], 0)
-        self.assertEqual(task["schema_version"], 5)
+        self.assertEqual(task["schema_version"], 6)
         self.assertEqual(task["run_logs"], [])
         self.assertEqual(task["ignored_history_hashes"], [])
         self.assertEqual(task["ignored_resource_identities"], [])
+        self.assertEqual(task["repair_missing_episodes"], [])
+
+    def test_confirmed_lost_episodes_stay_missing_during_normalization(self):
+        task = CORE.normalize_task({
+            "name": "测试剧",
+            "downloaded_episodes": [1, 2, 3],
+            "repair_missing_episodes": [2],
+        })
+        self.assertEqual(task["downloaded_episodes"], [1, 3])
+        self.assertEqual(task["repair_missing_episodes"], [2])
 
     def test_alias_title_and_word_filters(self):
         task = CORE.normalize_task({
@@ -237,6 +247,19 @@ class ArchitectureBoundaryTest(unittest.TestCase):
         self.assertIn('d-none d-md-block overflow-x-auto', source)
         self.assertIn('d-flex d-md-none flex-column', source)
         self.assertIn('候选和运行原因默认收起', source)
+
+    def test_scheduled_missing_repair_is_exposed_and_keeps_download_safety(self):
+        source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('directsearchsubscribe_repair', source)
+        self.assertIn('/repair/run', source)
+        self.assertIn('/repair/status', source)
+        self.assertIn('_inspect_task_files', source)
+        self.assertIn('_repair_media_indexes', source)
+        self.assertIn('refresh_library_by_items', source)
+        self.assertIn('成品丢失，下载缓存仍在', source)
+        self.assertIn('repair_missing_episodes', source)
+        self.assertIn('history_episodes.difference_update(repair_missing)', source)
+        self.assertIn('该资源未补回丢失文件，继续保留缺集', source)
 
 
 if __name__ == "__main__":

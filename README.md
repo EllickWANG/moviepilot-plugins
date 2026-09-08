@@ -35,6 +35,8 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 
 `directsearchsubscribe` 完全在插件内维护人工节目任务、目标集数、下载进度和候选结果，并按独立 cron 定时直搜站点。它不会创建系统订阅，也不使用 TMDB、豆瓣或 Bangumi 完成搜索。
 
+下载完成后会定时核对媒体服务器索引、媒体库成品和下载缓存：漏索引时刷新媒体库，成品丢失时优先从缓存重新整理，缓存也不存在时恢复为缺集并重新直搜。
+
 主要能力：
 
 - 自定义电影或电视剧任务、季、总集数、指定集数和已有集数。

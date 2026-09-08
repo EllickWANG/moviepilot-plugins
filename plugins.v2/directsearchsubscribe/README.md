@@ -1,6 +1,6 @@
 # 直搜订阅
 
-`directsearchsubscribe` 2.4 是一个完全由插件维护的站点直搜任务管理器。它适合没有可靠 TMDB、豆瓣或 Bangumi 条目的节目，也适合只想按人工关键词和集数直接检查站点的场景。
+`directsearchsubscribe` 2.5 是一个完全由插件维护的站点直搜任务管理器。它适合没有可靠 TMDB、豆瓣或 Bangumi 条目的节目，也适合只想按人工关键词和集数直接检查站点的场景。
 
 ## 设计边界
 
@@ -68,6 +68,16 @@
 
 即每 30 分钟检查一次。多个任务串行执行，并按“任务间隔”暂停，减少对站点的瞬时请求。
 
+## 丢失补偿
+
+插件默认每 6 小时对已整理的电视剧文件做一次三级对账，并保留 30 分钟整理宽限期：
+
+1. 成品文件存在、媒体服务器未索引对应集时，只刷新对应媒体库，不重复下载。
+2. 成品文件丢失、下载缓存仍存在时，直接从缓存重新整理。
+3. 成品和下载缓存都丢失时，从已获取进度中移除对应集，临时解除旧 Hash、发布标识和指纹去重，然后立即重新直搜；是否自动加入下载器仍服从任务自己的“自动下载”开关。
+
+补偿周期、宽限时间和总开关可以在配置页修改。详情页提供“立即对账补偿”，并显示最近一次核对结果；所有动作都会写入任务详细记录。
+
 ## 页面与接口
 
 配置页按“节目范围 → 搜索匹配 → 下载整理 → 创建确认”组织；常用字段直接展示，高级规则折叠收纳。插件详情页先显示运行概览，再以可折叠任务卡展示状态、缺失集数、本轮原因和操作；候选、详细日志和回收站默认收起，手机端使用信息卡片代替宽表格。
@@ -92,6 +102,8 @@
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/results`
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/logs`
 - `POST /plugin/directsearchsubscribe/transfers/retry-failed`
+- `GET /plugin/directsearchsubscribe/repair/status`
+- `POST /plugin/directsearchsubscribe/repair/run`
 
 ## 使用前提
 

@@ -15,7 +15,9 @@ from fastapi import Body
 
 from app import schemas
 from app.chain.download import DownloadChain
+from app.chain.mediaserver import MediaServerChain
 from app.chain.search import SearchChain
+from app.chain.storage import StorageChain
 from app.chain.transfer import JobManager, TransferChain
 from app.core.config import global_vars, settings
 from app.core.context import Context, MediaInfo
@@ -26,7 +28,7 @@ from app.db.site_oper import SiteOper
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaType, NotificationType
+from app.schemas.types import EventType, MediaType, ModuleType, NotificationType
 
 from .core import (
     MAX_RESOURCE_HISTORY,
@@ -47,6 +49,7 @@ from .core import (
     resource_identity,
     target_episodes,
     task_search_keywords,
+    task_title_candidates,
     title_matches,
     validate_task,
     word_filter_reason,
@@ -56,6 +59,7 @@ from .core import (
 PLUGIN_ID = "directsearchsubscribe"
 TASKS_KEY = "tasks_v2"
 TRASH_KEY = "tasks_v2_trash"
+REPAIR_STATE_KEY = "repair_state_v1"
 LEGACY_TASKS_KEY = "direct_subscribes"
 MAX_TRASH = 100
 SEARCH_TIMEOUT = 300
@@ -67,7 +71,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.4.0"
+    plugin_version = "2.5.0"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -78,6 +82,9 @@ class directsearchsubscribe(_PluginBase):
     _notify = True
     _max_downloads = 3
     _task_gap = 2
+    _repair_enabled = True
+    _repair_cron = "15 */6 * * *"
+    _repair_grace_minutes = 30
     _config: Dict[str, Any] = {}
     _data_lock = threading.RLock()
     _running_lock = threading.Lock()
@@ -87,6 +94,7 @@ class directsearchsubscribe(_PluginBase):
     _stop_event: threading.Event
     _transfer_patch_lock = threading.RLock()
     _transfer_retry_lock = threading.Lock()
+    _repair_lock = threading.Lock()
     _transfer_context = threading.local()
     _transfer_patched = False
     _transfer_originals: Dict[str, Any] = {}
@@ -103,11 +111,19 @@ class directsearchsubscribe(_PluginBase):
         self._notify = parse_bool(config.get("notify"), True)
         self._max_downloads = parse_int(config.get("max_downloads"), 3, 1, 20) or 3
         self._task_gap = parse_int(config.get("task_gap"), 2, 0, 60) or 0
+        self._repair_enabled = parse_bool(config.get("repair_enabled"), True)
+        self._repair_cron = str(config.get("repair_cron") or "15 */6 * * *").strip()
+        self._repair_grace_minutes = parse_int(
+            config.get("repair_grace_minutes"), 30, 5, 1440
+        ) or 30
         self.__class__._enabled = self._enabled
         self.__class__._cron = self._cron
         self.__class__._notify = self._notify
         self.__class__._max_downloads = self._max_downloads
         self.__class__._task_gap = self._task_gap
+        self.__class__._repair_enabled = self._repair_enabled
+        self.__class__._repair_cron = self._repair_cron
+        self.__class__._repair_grace_minutes = self._repair_grace_minutes
         self._config = config
 
         # 下载完成后仍使用 MoviePilot 的转移链，但只为本插件下载注入手工媒体信息，
@@ -141,20 +157,32 @@ class directsearchsubscribe(_PluginBase):
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册插件自己的周期任务，不复用系统订阅调度器。"""
-        if not self._enabled or not self._cron:
+        if not self._enabled:
             return []
-        try:
-            trigger = CronTrigger.from_crontab(self._cron)
-        except Exception as err:
-            logger.error(f"直搜订阅 cron 无效：{self._cron} - {err}")
-            return []
-        return [{
-            "id": "directsearchsubscribe_scan",
-            "name": "直搜订阅定时检查",
-            "trigger": trigger,
-            "func": self.run_scheduled,
-            "kwargs": {},
-        }]
+        services = []
+        if self._cron:
+            try:
+                services.append({
+                    "id": "directsearchsubscribe_scan",
+                    "name": "直搜订阅定时检查",
+                    "trigger": CronTrigger.from_crontab(self._cron),
+                    "func": self.run_scheduled,
+                    "kwargs": {},
+                })
+            except Exception as err:
+                logger.error(f"直搜订阅 cron 无效：{self._cron} - {err}")
+        if self._repair_enabled and self._repair_cron:
+            try:
+                services.append({
+                    "id": "directsearchsubscribe_repair",
+                    "name": "直搜订阅丢失补偿",
+                    "trigger": CronTrigger.from_crontab(self._repair_cron),
+                    "func": self.run_repair_scheduled,
+                    "kwargs": {},
+                })
+            except Exception as err:
+                logger.error(f"直搜订阅补偿 cron 无效：{self._repair_cron} - {err}")
+        return services
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -178,6 +206,8 @@ class directsearchsubscribe(_PluginBase):
             _api("/tasks/{task_id}/results", self.api_task_results, ["GET"], "查询最近候选"),
             _api("/tasks/{task_id}/logs", self.api_task_logs, ["GET"], "查询任务详细日志"),
             _api("/transfers/retry-failed", self.api_retry_failed_transfers, ["POST"], "重试失败整理"),
+            _api("/repair/status", self.api_repair_status, ["GET"], "查询丢失补偿状态"),
+            _api("/repair/run", self.api_run_repair, ["POST"], "立即执行丢失补偿"),
         ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -207,6 +237,26 @@ class directsearchsubscribe(_PluginBase):
                                 "task_gap", "任务间隔", 0, 60, "任务之间等待的秒数",
                             )),
                         ]),
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        _row([
+                            _col(12, 4, _switch(
+                                "repair_enabled", "启用丢失补偿",
+                                "核对整理文件和媒体服务器索引；丢失时自动补回",
+                            )),
+                            _col(12, 4, _field(
+                                "repair_cron", "补偿检查周期", "15 */6 * * *",
+                                "默认每 6 小时检查一次，避开常规直搜整点",
+                            )),
+                            _col(12, 4, _number(
+                                "repair_grace_minutes", "整理宽限时间", 5, 1440,
+                                "刚整理的文件在此时间内不判定为丢失",
+                            )),
+                        ]),
+                        _alert(
+                            "info",
+                            "补偿会先重扫媒体服务器；成品缺失但下载缓存仍在时重新整理，"
+                            "缓存也丢失时才恢复为缺集并重新直搜。",
+                        ),
                     ]),
                     _form_section(
                         "1. 节目与追更范围",
@@ -341,6 +391,9 @@ class directsearchsubscribe(_PluginBase):
             "cron": "*/30 * * * *",
             "max_downloads": 3,
             "task_gap": 2,
+            "repair_enabled": True,
+            "repair_cron": "15 */6 * * *",
+            "repair_grace_minutes": 30,
             "save_task_now": False,
             "run_after_save": False,
             "title": "",
@@ -382,9 +435,12 @@ class directsearchsubscribe(_PluginBase):
         attention = sum(
             1 for task in tasks
             if task.get("status") == "error" or task.get("last_transfer_status") == "failed"
+            or task.get("last_repair_status") == "warning"
         )
+        repair_state = self.get_data(REPAIR_STATE_KEY) or {}
         contents = [
             _hero(self, len(tasks), attention),
+            _repair_overview(self, repair_state),
             _overview_metrics(len(tasks), active, auto, completed),
             _task_collection(tasks),
             _activity_collection(tasks),
@@ -518,6 +574,7 @@ class directsearchsubscribe(_PluginBase):
             if not task:
                 return schemas.Response(success=False, message="任务不存在")
             task["downloaded_episodes"] = sorted(parse_episodes(task.get("owned_episodes")))
+            task["repair_missing_episodes"] = []
             task["downloaded_fingerprints"] = []
             task["download_records"] = []
             task["status"] = "active" if task.get("enabled") else "paused"
@@ -643,6 +700,347 @@ class directsearchsubscribe(_PluginBase):
             return schemas.Response(success=True, message="失败整理重试已在运行")
         return schemas.Response(success=True, message="已开始在后台重试本插件的失败整理")
 
+    def api_run_repair(self) -> schemas.Response:
+        if not self._start_repair_thread():
+            return schemas.Response(success=True, message="丢失补偿正在运行")
+        return schemas.Response(success=True, message="已开始在后台核对并补偿丢失内容")
+
+    def api_repair_status(self) -> schemas.Response:
+        state = dict(self.get_data(REPAIR_STATE_KEY) or {})
+        state["running"] = self.__class__._repair_lock.locked()
+        return schemas.Response(success=True, data=state)
+
+    def _start_repair_thread(self) -> bool:
+        """启动一次后台补偿，避免接口请求被媒体库扫描阻塞。"""
+        if not self.__class__._repair_lock.acquire(blocking=False):
+            return False
+
+        def runner():
+            try:
+                self._run_repair()
+            except Exception as err:
+                logger.error(f"直搜订阅丢失补偿异常：{err}", exc_info=True)
+            finally:
+                self.__class__._repair_lock.release()
+
+        threading.Thread(
+            target=runner, name="direct-search-repair", daemon=True
+        ).start()
+        return True
+
+    def run_repair_scheduled(self):
+        """定时核对整理文件和媒体服务器索引，并按最小动作补偿。"""
+        if not self._enabled or not self._repair_enabled \
+                or global_vars.is_system_stopped or self._stop_event.is_set():
+            return
+        if not self.__class__._repair_lock.acquire(blocking=False):
+            logger.info("直搜订阅丢失补偿仍在运行，本轮跳过")
+            return
+        try:
+            self._run_repair()
+        finally:
+            self.__class__._repair_lock.release()
+
+    def _run_repair(self):
+        """执行文件、缓存和媒体服务器三级对账。"""
+        self._reconcile_transfer_records()
+        storage = StorageChain()
+        tasks = self._load_tasks()
+        checked_tasks = 0
+        checked_files = 0
+        refresh_entries: Dict[str, List[Dict[str, Any]]] = {}
+        reopened_task_ids: List[str] = []
+        requeued = 0
+        lost_rows = []
+        skipped_running = 0
+        errors = []
+
+        for task_id, task in tasks.items():
+            if self._stop_event.is_set() or global_vars.is_system_stopped:
+                break
+            if not task.get("enabled") or task.get("type") != MediaType.TV.value:
+                continue
+            if not self._claim_task(task_id):
+                skipped_running += 1
+                continue
+            try:
+                try:
+                    report = self._inspect_task_files(task, storage)
+                    checked_tasks += 1
+                    checked_files += report["files_checked"]
+                    if report["present"]:
+                        refresh_entries[task_id] = report["present"]
+                    if report["lost"]:
+                        self._mark_lost_episodes(task_id, report["lost"])
+                        reopened_task_ids.append(task_id)
+                        lost_rows.append({
+                            "task_id": task_id,
+                            "name": task.get("name"),
+                            "episodes": sorted(report["lost"]),
+                        })
+                    for repair in report["retransfer"]:
+                        if self._resubmit_missing_transfer(task_id, repair):
+                            requeued += 1
+                except Exception as err:
+                    message = f"{task.get('name') or task_id}：{err}"
+                    errors.append(message)
+                    logger.warning(f"直搜订阅任务补偿检查失败：{message}", exc_info=True)
+            finally:
+                self._release_task(task_id)
+
+        media_report = self._repair_media_indexes(refresh_entries)
+        state = {
+            "last_run_at": now_text(),
+            "tasks_checked": checked_tasks,
+            "files_checked": checked_files,
+            "lost": lost_rows,
+            "requeued_transfers": requeued,
+            "media_index_gaps": media_report["gaps"],
+            "media_refreshes": media_report["refreshes"],
+            "skipped_running": skipped_running,
+            "errors": errors,
+        }
+        state["message"] = _repair_state_message(state)
+        self.save_data(REPAIR_STATE_KEY, state)
+        logger.info(f"直搜订阅丢失补偿完成：{state['message']}")
+
+        # 真正缺失的文件解除去重后立即重新直搜；自动下载开关仍照常生效。
+        for index, task_id in enumerate(dict.fromkeys(reopened_task_ids)):
+            if self._stop_event.is_set() or global_vars.is_system_stopped:
+                break
+            latest = self._load_tasks().get(task_id)
+            if not latest or not latest.get("enabled") or not self._claim_task(task_id):
+                continue
+            try:
+                self._execute_task(task_id, manual=False, stop_event=self._stop_event)
+            finally:
+                self._release_task(task_id)
+            if index < len(reopened_task_ids) - 1 and self._task_gap:
+                self._stop_event.wait(self._task_gap)
+
+    def _inspect_task_files(self, task: Dict[str, Any], storage: StorageChain) -> Dict[str, Any]:
+        """按整理历史检查成品与下载缓存，不凭插件进度字段猜测文件状态。"""
+        downloaded = parse_episodes(task.get("downloaded_episodes"))
+        owned = parse_episodes(task.get("owned_episodes"))
+        episode_entries: Dict[int, List[Dict[str, Any]]] = {}
+        files_checked = 0
+        for record in task.get("download_records") or []:
+            record_episodes = parse_episodes(record.get("episodes"))
+            if not record_episodes or not record_episodes.intersection(downloaded - owned):
+                continue
+            if not _repair_record_is_mature(record, self._repair_grace_minutes):
+                continue
+            download_hash = str(record.get("hash") or "").strip()
+            if not download_hash:
+                continue
+            histories = _latest_record_transfer_histories(record, download_hash)
+            successes = [history for history in histories if bool(getattr(history, "status", False))]
+            if not successes:
+                continue
+            for history in successes:
+                history_episodes = _transfer_history_episodes(history)
+                if not history_episodes and len(record_episodes) == 1:
+                    history_episodes = set(record_episodes)
+                history_episodes.intersection_update(record_episodes)
+                if not history_episodes:
+                    continue
+                dest_item = _transfer_history_fileitem(history, "dest")
+                if not dest_item or not dest_item.path:
+                    continue
+                files_checked += 1
+                dest_exists = bool(storage.get_item(dest_item))
+                src_item = _transfer_history_fileitem(history, "src")
+                src_exists = bool(src_item and src_item.path and storage.get_item(src_item))
+                for episode in history_episodes.intersection(downloaded - owned):
+                    episode_entries.setdefault(episode, []).append({
+                        "record": record,
+                        "history": history,
+                        "dest_item": dest_item,
+                        "dest_exists": dest_exists,
+                        "src_item": src_item,
+                        "src_exists": src_exists,
+                    })
+
+        present = []
+        retransfer = []
+        lost: Set[int] = set()
+        seen_sources = set()
+        for episode, entries in episode_entries.items():
+            existing = next((entry for entry in entries if entry["dest_exists"]), None)
+            if existing:
+                present.append({
+                    "episode": episode,
+                    "item": _refresh_item_from_transfer(existing["history"]),
+                    "path": existing["dest_item"].path,
+                })
+                continue
+            cached = next((entry for entry in entries if entry["src_exists"]), None)
+            if cached:
+                source_key = (
+                    str(cached["record"].get("hash") or "").casefold(),
+                    str(cached["src_item"].storage or ""),
+                    str(cached["src_item"].path or ""),
+                )
+                if source_key not in seen_sources:
+                    seen_sources.add(source_key)
+                    retransfer.append({"episode": episode, **cached})
+                continue
+            lost.add(episode)
+        return {
+            "files_checked": files_checked,
+            "present": [entry for entry in present if entry.get("item")],
+            "retransfer": retransfer,
+            "lost": lost,
+        }
+
+    def _resubmit_missing_transfer(self, task_id: str, repair: Dict[str, Any]) -> bool:
+        """成品丢失但缓存仍在时，直接重走整理，不浪费 PT 下载。"""
+        record = repair["record"]
+        history = repair["history"]
+        src_item = repair["src_item"]
+        episode = int(repair["episode"])
+        try:
+            state, message = TransferChain().do_transfer(
+                fileitem=src_item,
+                downloader=getattr(history, "downloader", None),
+                download_hash=str(record.get("hash") or ""),
+                force=True,
+                scrape=False,
+                background=True,
+            )
+        except Exception as err:
+            state, message = False, str(err)
+        reason = (
+            f"第 {episode} 集成品丢失，下载缓存仍在，已重新提交整理"
+            if state else f"第 {episode} 集重新整理提交失败：{message or '未知错误'}"
+        )
+        self._append_repair_log(task_id, reason, success=bool(state))
+        return bool(state)
+
+    def _mark_lost_episodes(self, task_id: str, lost: Set[int]):
+        """成品和缓存都不存在时解除旧历史去重，让缺集重新进入直搜。"""
+        if not lost:
+            return
+        with self.__class__._data_lock:
+            tasks = self._load_tasks()
+            task = tasks.get(task_id)
+            if not task:
+                return
+            downloaded = parse_episodes(task.get("downloaded_episodes"))
+            downloaded.difference_update(lost)
+            pending = parse_episodes(task.get("repair_missing_episodes"))
+            pending.update(lost)
+            ignored_hashes = set(task.get("ignored_history_hashes") or [])
+            ignored_identities = set(task.get("ignored_resource_identities") or [])
+            affected_fingerprints = set()
+            records = list(task.get("download_records") or [])
+            for record in records:
+                if not parse_episodes(record.get("episodes")).intersection(lost):
+                    continue
+                download_hash = str(record.get("hash") or "").strip().casefold()
+                identity = str(record.get("resource_identity") or "") \
+                    or resource_identity(record.get("title"))
+                fingerprint = str(record.get("fingerprint") or "")
+                if download_hash:
+                    ignored_hashes.add(download_hash)
+                if identity:
+                    ignored_identities.add(identity)
+                if fingerprint:
+                    affected_fingerprints.add(fingerprint)
+                record["repair_status"] = "lost"
+                record["repair_message"] = f"成品和下载缓存均不存在：{episodes_text(lost)}"
+                record["repair_updated_at"] = now_text()
+            task["downloaded_episodes"] = sorted(downloaded)
+            task["repair_missing_episodes"] = sorted(pending)
+            task["downloaded_fingerprints"] = [
+                value for value in task.get("downloaded_fingerprints") or []
+                if value not in affected_fingerprints
+            ]
+            task["ignored_history_hashes"] = sorted(ignored_hashes)[-MAX_RESOURCE_HISTORY:]
+            task["ignored_resource_identities"] = sorted(ignored_identities)[-MAX_RESOURCE_HISTORY:]
+            task["download_records"] = records[-MAX_RESOURCE_HISTORY:]
+            task["status"] = "active" if task.get("enabled") else "paused"
+            reason = f"检测到成品和下载缓存均丢失：{episodes_text(lost)}，已恢复为缺集"
+            task["last_repair_at"] = now_text()
+            task["last_repair_status"] = "warning"
+            task["last_repair_message"] = reason
+            task["last_message"] = reason
+            task["last_reason_summary"] = reason
+            task["run_logs"] = [_audit_entry(
+                "补偿", "恢复缺集", reason, level="warning", episodes=episodes_text(lost)
+            ), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
+            task["updated_at"] = now_text()
+            tasks[task_id] = task
+            self._save_tasks(tasks)
+
+    def _append_repair_log(self, task_id: str, message: str, success: bool = True):
+        with self.__class__._data_lock:
+            tasks = self._load_tasks()
+            task = tasks.get(task_id)
+            if not task:
+                return
+            task["last_repair_at"] = now_text()
+            task["last_repair_status"] = "success" if success else "warning"
+            task["last_repair_message"] = message
+            task["run_logs"] = [_audit_entry(
+                "补偿", "已处理" if success else "失败", message,
+                level="info" if success else "warning",
+            ), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
+            task["updated_at"] = now_text()
+            tasks[task_id] = task
+            self._save_tasks(tasks)
+
+    def _repair_media_indexes(self, entries_by_task: Dict[str, List[Dict[str, Any]]]) \
+            -> Dict[str, Any]:
+        """只在媒体服务器缺集或无法定位节目时触发对应媒体库刷新。"""
+        if not entries_by_task:
+            return {"gaps": [], "refreshes": 0}
+        tasks = self._load_tasks()
+        media_chain = MediaServerChain()
+        gaps = []
+        refreshes = 0
+        for module in media_chain.modulemanager.get_running_type_modules(ModuleType.MediaServer):
+            if not hasattr(module, "get_instances"):
+                continue
+            for server_name, server in (module.get_instances() or {}).items():
+                refresh_items = []
+                server_gaps = []
+                for task_id, entries in entries_by_task.items():
+                    task = tasks.get(task_id)
+                    if not task:
+                        continue
+                    physical = {int(entry["episode"]) for entry in entries}
+                    indexed = _server_indexed_episodes(module, server_name, task, entries)
+                    missing = physical if indexed is None else physical.difference(indexed)
+                    if not missing:
+                        continue
+                    server_gaps.append({
+                        "task_id": task_id,
+                        "name": task.get("name"),
+                        "server": server_name,
+                        "episodes": sorted(missing),
+                        "index_unknown": indexed is None,
+                    })
+                    refresh_items.extend(
+                        entry["item"] for entry in entries if int(entry["episode"]) in missing
+                    )
+                refresh_items = _dedupe_refresh_items(refresh_items)
+                if not refresh_items or not hasattr(server, "refresh_library_by_items"):
+                    gaps.extend(server_gaps)
+                    continue
+                success = _refresh_media_server(server, refresh_items)
+                if success:
+                    refreshes += 1
+                for gap in server_gaps:
+                    gaps.append(gap)
+                    episode_text = episodes_text(gap["episodes"])
+                    reason = (
+                        f"媒体服务器 {server_name} 缺少索引 {episode_text}，已触发媒体库刷新"
+                        if success else f"媒体服务器 {server_name} 缺少索引 {episode_text}，刷新未成功"
+                    )
+                    self._append_repair_log(gap["task_id"], reason, success=success)
+        return {"gaps": gaps, "refreshes": refreshes}
+
     def create_task(self, payload: Dict[str, Any], update_same: bool = False) -> Dict[str, Any]:
         task = normalize_task(payload)
         error = validate_task(task, payload)
@@ -734,6 +1132,10 @@ class directsearchsubscribe(_PluginBase):
             history_identities, history_episodes, history_has_movie = self._history_snapshot(task)
             known_identities.update(history_identities)
             downloaded = parse_episodes(task.get("downloaded_episodes"))
+            repair_missing = parse_episodes(task.get("repair_missing_episodes"))
+            # 已确认物理丢失的集数不能再被旧下载历史误恢复为“已获取”。
+            history_episodes.difference_update(repair_missing)
+            downloaded.difference_update(repair_missing)
             recovered = history_episodes.difference(downloaded)
             _audit(audit, run_id, "历史", "检查", (
                 f"命中 {len(history_identities)} 个历史发布标识；"
@@ -858,7 +1260,12 @@ class directsearchsubscribe(_PluginBase):
                     prepared[1]["reason"] = reason
                     fingerprint = prepared[1]["fingerprint"]
                     identity = prepared[1]["resource_identity"] or fingerprint
-                    if fingerprint in downloaded_fingerprints or identity in known_identities:
+                    candidate_episodes = set(prepared[1].get("episode_numbers") or [])
+                    repair_overlap = candidate_episodes.intersection(
+                        parse_episodes(task.get("repair_missing_episodes"))
+                    )
+                    if (fingerprint in downloaded_fingerprints or identity in known_identities) \
+                            and not repair_overlap:
                         duplicate_count += 1
                         _audit(audit, run_id, "去重", "跳过",
                                "发布标题已存在于插件记录或 MoviePilot 下载历史", result=prepared[1])
@@ -929,12 +1336,15 @@ class directsearchsubscribe(_PluginBase):
                 break
             fingerprint = result["fingerprint"]
             identity = result.get("resource_identity") or fingerprint
-            if fingerprint in fingerprints or identity in known_identities:
+            candidate_episodes = set(result.get("episode_numbers") or [])
+            repair_overlap = candidate_episodes.intersection(
+                parse_episodes(current.get("repair_missing_episodes"))
+            )
+            if (fingerprint in fingerprints or identity in known_identities) and not repair_overlap:
                 duplicate_count += 1
                 result["skip_reason"] = "运行期间再次命中插件记录或下载历史"
                 _audit(audit, run_id, "去重", "跳过", result["skip_reason"], result=result)
                 continue
-            candidate_episodes = set(result.get("episode_numbers") or [])
             selected: Optional[Set[int]] = None
             progress_episodes: Set[int] = set()
             if task.get("type") == MediaType.TV.value:
@@ -993,11 +1403,16 @@ class directsearchsubscribe(_PluginBase):
                 continue
             if is_duplicate_download_message(error):
                 result["duplicate"] = True
+                repair_missing = parse_episodes(current.get("repair_missing_episodes"))
+                repair_overlap = progress_episodes.intersection(repair_missing)
                 result["skip_reason"] = error or "下载任务已存在"
                 duplicate_count += 1
                 fingerprints.add(fingerprint)
                 known_identities.add(identity)
-                downloaded.update(progress_episodes)
+                if repair_overlap:
+                    result["skip_reason"] += "；该资源未补回丢失文件，继续保留缺集"
+                else:
+                    downloaded.update(progress_episodes)
                 if not candidate_episodes and task.get("type") == MediaType.TV.value:
                     unknown_downloaded = True
                 _audit(audit, run_id, "下载", "重复",
@@ -1015,6 +1430,8 @@ class directsearchsubscribe(_PluginBase):
                        level="error", result=result)
                 continue
             downloaded.update(progress_episodes)
+            repair_missing = parse_episodes(current.get("repair_missing_episodes"))
+            repair_missing.difference_update(progress_episodes)
             fingerprints.add(fingerprint)
             known_identities.add(identity)
             normalized_hash = str(download_hash).strip().casefold()
@@ -1047,6 +1464,7 @@ class directsearchsubscribe(_PluginBase):
                 download_records=records[-MAX_RESOURCE_HISTORY:],
                 ignored_history_hashes=sorted(ignored_hashes)[-MAX_RESOURCE_HISTORY:],
                 ignored_resource_identities=sorted(ignored_identities)[-MAX_RESOURCE_HISTORY:],
+                repair_missing_episodes=sorted(repair_missing),
                 last_transfer_status="waiting",
                 last_transfer_message="等待下载完成",
                 last_results=[item[1] for item in candidates],
@@ -1108,6 +1526,7 @@ class directsearchsubscribe(_PluginBase):
             if not latest:
                 return {"success": False, "message": "任务不存在"}
             latest["downloaded_episodes"] = sorted(parse_episodes(latest.get("owned_episodes")))
+            latest["repair_missing_episodes"] = []
             latest["downloaded_fingerprints"] = []
             latest["download_records"] = []
             latest["ignored_history_hashes"] = sorted(ignored_hashes)[-MAX_RESOURCE_HISTORY:]
@@ -1937,6 +2356,211 @@ def _candidate_priority_key(task: Dict[str, Any], result: Dict[str, Any],
     )
 
 
+def _repair_record_is_mature(record: Dict[str, Any], grace_minutes: int) -> bool:
+    """整理完成后保留宽限期，避免扫描到仍在复制的目标文件。"""
+    raw = record.get("transfer_updated_at") or record.get("time")
+    try:
+        updated_at = datetime.strptime(str(raw or ""), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return False
+    return datetime.now() - updated_at >= timedelta(minutes=max(5, grace_minutes))
+
+
+def _latest_record_transfer_histories(record: Dict[str, Any], download_hash: str) -> List[Any]:
+    """读取单次插件下载之后的最新整理历史，排除同 Hash 的旧任务记录。"""
+    try:
+        histories = TransferHistoryOper().list_by_hash(download_hash) or []
+    except Exception as err:
+        logger.warning(f"直搜订阅补偿读取整理历史失败：{download_hash[:12]} - {err}")
+        return []
+    try:
+        threshold = datetime.strptime(
+            str(record.get("time") or ""), "%Y-%m-%d %H:%M:%S"
+        ) - timedelta(minutes=2)
+        histories = [
+            history for history in histories
+            if not getattr(history, "date", None)
+            or datetime.strptime(str(history.date), "%Y-%m-%d %H:%M:%S") >= threshold
+        ]
+    except (TypeError, ValueError):
+        pass
+    latest_by_source: Dict[str, Any] = {}
+    for history in histories:
+        source = str(getattr(history, "src", "") or getattr(history, "id", ""))
+        current = latest_by_source.get(source)
+        rank = (str(getattr(history, "date", "") or ""), int(getattr(history, "id", 0) or 0))
+        current_rank = (
+            str(getattr(current, "date", "") or ""),
+            int(getattr(current, "id", 0) or 0),
+        ) if current else ("", 0)
+        if not current or rank >= current_rank:
+            latest_by_source[source] = history
+    return list(latest_by_source.values())
+
+
+def _transfer_history_episodes(history: Any) -> Set[int]:
+    """从整理历史字段和源/目标文件名恢复集数。"""
+    return extract_episode_numbers(" ".join(filter(None, (
+        str(getattr(history, "seasons", "") or ""),
+        str(getattr(history, "episodes", "") or ""),
+        str(getattr(history, "src", "") or ""),
+        str(getattr(history, "dest", "") or ""),
+    ))))
+
+
+def _transfer_history_fileitem(history: Any, side: str) -> Optional[schemas.FileItem]:
+    """兼容历史中的序列化 FileItem 和早期只有路径的记录。"""
+    raw = getattr(history, f"{side}_fileitem", None)
+    if isinstance(raw, schemas.FileItem):
+        return raw
+    if isinstance(raw, dict):
+        try:
+            return schemas.FileItem(**raw)
+        except Exception:
+            pass
+    path = str(getattr(history, side, "") or "").strip()
+    if not path:
+        return None
+    return schemas.FileItem(
+        storage=str(getattr(history, f"{side}_storage", "") or "local"),
+        type="file",
+        path=path,
+        name=Path(path).name,
+    )
+
+
+def _refresh_item_from_transfer(history: Any) -> Optional[schemas.RefreshMediaItem]:
+    path = str(getattr(history, "dest", "") or "").strip()
+    if not path:
+        return None
+    try:
+        media_type = MediaType(getattr(history, "type", None))
+    except (TypeError, ValueError):
+        media_type = MediaType.TV
+    return schemas.RefreshMediaItem(
+        title=getattr(history, "title", None),
+        year=getattr(history, "year", None),
+        type=media_type,
+        category=getattr(history, "category", None),
+        target_path=Path(path),
+    )
+
+
+def _repair_title_candidates(task: Dict[str, Any], entries: List[Dict[str, Any]]) -> List[str]:
+    """生成媒体服务器标题候选，兼容人工任务名中包含季号和年份。"""
+    values = list(task_title_candidates(task))
+    for entry in entries:
+        path = Path(str(entry.get("path") or ""))
+        if len(path.parents) >= 2:
+            values.append(path.parent.parent.name)
+    result = []
+    seen = set()
+
+    def add(value: Any):
+        text = str(value or "").strip(" .-_()（）[]")
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            result.append(text)
+
+    for value in values:
+        text = str(value or "").strip()
+        add(text)
+        without_year = re.sub(r"\s*[\(（\[]\d{4}[\)）\]]\s*$", "", text).strip()
+        add(without_year)
+        without_season = re.sub(
+            r"\s*第\s*(?:\d+|[零〇一二三四五六七八九十百两]+)\s*季\s*$",
+            "", without_year, flags=re.IGNORECASE,
+        ).strip()
+        without_season = re.sub(
+            r"\s+(?:season\s*|S)0*\d{1,3}\s*$", "", without_season,
+            flags=re.IGNORECASE,
+        ).strip()
+        add(without_season)
+    return result
+
+
+def _server_indexed_episodes(module: Any, server_name: str, task: Dict[str, Any],
+                             entries: List[Dict[str, Any]]) -> Optional[Set[int]]:
+    """查询单个媒体服务器中的已索引集数；无法定位节目时返回 None。"""
+    season = parse_int(task.get("season"), minimum=1)
+    if season is None or not hasattr(module, "media_exists"):
+        return None
+    for title in _repair_title_candidates(task, entries):
+        media = _manual_media_info(task)
+        media.title = title
+        # 人工任务年份经常是季度年份，而媒体服务器保存的是整部剧首播年份。
+        media.year = None
+        try:
+            exists = module.media_exists(mediainfo=media, server=server_name)
+        except Exception as err:
+            logger.warning(f"直搜订阅查询媒体服务器 {server_name} 失败：{title} - {err}")
+            continue
+        if not exists:
+            continue
+        seasons = getattr(exists, "seasons", None) or {}
+        indexed = seasons.get(season)
+        if indexed is None:
+            indexed = seasons.get(str(season))
+        return parse_episodes(indexed or [])
+    return None
+
+
+def _dedupe_refresh_items(items: List[schemas.RefreshMediaItem]) -> List[schemas.RefreshMediaItem]:
+    result = []
+    seen = set()
+    for item in items:
+        path = str(getattr(item, "target_path", "") or "")
+        if path and path not in seen:
+            seen.add(path)
+            result.append(item)
+    return result
+
+
+def _refresh_media_server(server: Any, items: List[schemas.RefreshMediaItem]) -> bool:
+    """触发最小范围刷新；服务端不支持路径刷新时回退全库扫描。"""
+    try:
+        try:
+            result = server.refresh_library_by_items(items, scan_mode=3)
+        except TypeError:
+            result = server.refresh_library_by_items(items)
+    except Exception as err:
+        logger.warning(f"直搜订阅触发媒体服务器刷新失败：{err}")
+        return False
+    if result is not False and result is not None:
+        return True
+    api = getattr(server, "_api", None)
+    if result is False and api and hasattr(api, "task_running"):
+        try:
+            if api.task_running():
+                return True
+        except Exception:
+            pass
+    if hasattr(server, "refresh_root_library"):
+        try:
+            fallback = server.refresh_root_library()
+            return fallback is not False and fallback is not None
+        except Exception as err:
+            logger.warning(f"直搜订阅触发媒体服务器全库刷新失败：{err}")
+    return False
+
+
+def _repair_state_message(state: Dict[str, Any]) -> str:
+    lost_count = sum(len(row.get("episodes") or []) for row in state.get("lost") or [])
+    index_count = sum(len(row.get("episodes") or []) for row in state.get("media_index_gaps") or [])
+    message = (
+        f"核对 {state.get('tasks_checked') or 0} 个任务、{state.get('files_checked') or 0} 个文件；"
+        f"媒体索引缺 {index_count} 集，触发刷新 {state.get('media_refreshes') or 0} 个服务器；"
+        f"重新整理 {state.get('requeued_transfers') or 0} 个文件；"
+        f"恢复直搜 {lost_count} 集"
+    )
+    if state.get("errors"):
+        message += f"；异常 {len(state['errors'])} 个"
+    if state.get("skipped_running"):
+        message += f"；跳过运行中任务 {state['skipped_running']} 个"
+    return message
+
+
 def _manual_media_info(task: Dict[str, Any]) -> MediaInfo:
     """构造完整的手工媒体上下文，显式阻止下载链再次调用媒体识别。"""
     media = MediaInfo()
@@ -2123,8 +2747,12 @@ def _hero(plugin: directsearchsubscribe, total: int, attention: int) -> Dict[str
                               "text": "手工节目任务 · PT 站直搜 · 下载完成后自动整理"},
                          ]},
                      ]},
-                     _action("重试失败整理", "mdi-folder-refresh", "secondary",
-                             f"plugin/{PLUGIN_ID}/transfers/retry-failed"),
+                     {"component": "div", "props": {"class": "d-flex flex-wrap ga-2"}, "content": [
+                         _action("立即对账补偿", "mdi-database-sync", "primary",
+                                 f"plugin/{PLUGIN_ID}/repair/run"),
+                         _action("重试失败整理", "mdi-folder-refresh", "secondary",
+                                 f"plugin/{PLUGIN_ID}/transfers/retry-failed"),
+                     ]},
                  ]},
                 {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 mt-4"},
                  "content": [
@@ -2138,6 +2766,7 @@ def _hero(plugin: directsearchsubscribe, total: int, attention: int) -> Dict[str
                  ]},
                 {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-3"},
                  "text": f"共 {total} 个任务 · 检查周期 {plugin._cron}"
+                         + (f" · 补偿周期 {plugin._repair_cron}" if plugin._repair_enabled else " · 补偿已停用")
                          + (f" · {attention} 个任务需要处理" if attention else " · 当前无异常")},
             ],
         }],
@@ -2153,6 +2782,25 @@ def _overview_metrics(total: int, active: int, auto: int, completed: int) -> Dic
             _stat_card("正在追更", active, "启用且未完成", "mdi-radar", "success"),
             _stat_card("自动下载", auto, "其余任务仅预览", "mdi-download-circle-outline", "warning"),
             _stat_card("已经完成", completed, "有限目标已齐", "mdi-check-decagram-outline", "info"),
+        ],
+    }
+
+
+def _repair_overview(plugin: directsearchsubscribe, state: Dict[str, Any]) -> Dict[str, Any]:
+    if not plugin._repair_enabled:
+        return _alert("warning", "丢失补偿已停用；不会定时核对媒体索引、成品文件和下载缓存。")
+    message = str(state.get("message") or "尚未执行补偿对账；系统会按设定周期自动检查。")
+    checked_at = str(state.get("last_run_at") or "-")
+    return {
+        "component": "VAlert",
+        "props": {
+            "type": "info", "variant": "tonal", "rounded": "xl", "class": "mb-4",
+            "title": "丢失补偿",
+        },
+        "content": [
+            {"component": "div", "props": {"class": "text-body-2"}, "text": message},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
+             "text": f"上次检查 {checked_at} · 宽限 {plugin._repair_grace_minutes} 分钟"},
         ],
     }
 
@@ -2309,6 +2957,7 @@ def _task_panel(task: Dict[str, Any]) -> Dict[str, Any]:
                         _line("下载位置", str(task.get("save_path") or "站点或系统默认")),
                         _line("媒体分类", str(task.get("media_category") or "使用媒体库默认规则")),
                         _line("整理状态", transfer_status),
+                        _line("丢失补偿", str(task.get("last_repair_message") or "尚未发现异常")),
                     ])),
                 ]},
                 _detail_card("最近一次运行", "mdi-history", [
