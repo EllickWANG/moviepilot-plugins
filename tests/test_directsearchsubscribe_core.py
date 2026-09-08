@@ -226,6 +226,18 @@ class ArchitectureBoundaryTest(unittest.TestCase):
         self.assertIn('_reconcile_transfer_records', source)
         self.assertIn('latest_by_source', source)
 
+    def test_page_uses_progressive_and_responsive_layout(self):
+        source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
+        # 配置项、任务详情和诊断数据不再同时平铺在一个长页面中。
+        self.assertIn('"component": "VExpansionPanels"', source)
+        self.assertIn('"component": "VProgressLinear"', source)
+        self.assertIn('"4. 创建或更新任务"', source)
+        self.assertIn('本次保存时创建或更新上面的任务', source)
+        # 宽表只在桌面端显示，手机端使用信息卡片。
+        self.assertIn('d-none d-md-block overflow-x-auto', source)
+        self.assertIn('d-flex d-md-none flex-column', source)
+        self.assertIn('候选和运行原因默认收起', source)
+
 
 if __name__ == "__main__":
     unittest.main()
