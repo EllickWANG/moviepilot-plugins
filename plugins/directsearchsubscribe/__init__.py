@@ -79,7 +79,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.5.2"
+    plugin_version = "2.5.3"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -213,6 +213,7 @@ class directsearchsubscribe(_PluginBase):
             _api("/trash/{task_id}/restore", self.api_restore_task, ["POST"], "恢复直搜任务"),
             _api("/trash/{task_id}/purge", self.api_purge_task, ["POST", "DELETE"], "彻底删除回收站任务"),
             _api("/trash/purge", self.api_purge_trash, ["POST", "DELETE"], "清空回收站"),
+            _api("/legacy/purge", self.api_purge_legacy, ["POST", "DELETE"], "清除旧版插件映射"),
             _api("/tasks/{task_id}/results", self.api_task_results, ["GET"], "查询最近候选"),
             _api("/tasks/{task_id}/logs", self.api_task_logs, ["GET"], "查询任务详细日志"),
             _api("/transfers/retry-failed", self.api_retry_failed_transfers, ["POST"], "重试失败整理"),
@@ -456,11 +457,7 @@ class directsearchsubscribe(_PluginBase):
             _activity_collection(tasks),
         ]
         if legacy:
-            contents.insert(1, _alert(
-                "warning",
-                f"检测到旧版插件映射 {len(legacy)} 条。2.0 不读取、不执行也不删除这些旧数据；"
-                "如系统订阅列表仍有旧任务，请人工确认后在系统订阅页删除。",
-            ))
+            contents.insert(1, _legacy_notice(legacy))
         if trash:
             contents.append(_trash_collection(trash[:20]))
         return contents
@@ -715,6 +712,15 @@ class directsearchsubscribe(_PluginBase):
                 self._save_trash({})
         return schemas.Response(success=True, message=f"已清空回收站，彻底删除 {count} 个任务",
                                 data={"count": count})
+
+    def api_purge_legacy(self) -> schemas.Response:
+        """清除 1.x 遗留的订阅映射。只删插件自己的数据，不触碰系统订阅。"""
+        with self.__class__._data_lock:
+            legacy = self.get_data(LEGACY_TASKS_KEY) or {}
+            count = len(legacy)
+            if count:
+                self.del_data(LEGACY_TASKS_KEY)
+        return schemas.Response(success=True, message=f"已清除 {count} 条旧版映射", data={"count": count})
 
     def api_task_results(self, task_id: str) -> schemas.Response:
         task = self._load_tasks().get(task_id)
@@ -3178,6 +3184,27 @@ def _run_log_table(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ["时间", "节目 / 阶段", "资源 / 站点", "集数", "做种", "原因"],
         desktop_rows, mobile_items,
     )
+
+
+def _legacy_notice(legacy: Any) -> Dict[str, Any]:
+    """提示 1.x 遗留映射，并提供只清插件数据的清除入口。"""
+    items = legacy.values() if isinstance(legacy, dict) else (legacy or [])
+    titles = [str(item.get("title") or item.get("keyword") or "") for item in items if isinstance(item, dict)]
+    titles = [title for title in titles if title]
+    summary = f"检测到旧版插件映射 {len(legacy)} 条"
+    if titles:
+        summary += "：" + "、".join(titles[:5]) + ("…" if len(titles) > 5 else "")
+    return {
+        "component": "VAlert",
+        "props": {"type": "warning", "variant": "tonal", "density": "comfortable", "rounded": "lg",
+                  "class": "mb-3"},
+        "content": [
+            {"component": "div", "text": summary + "。2.0 不读取也不执行这些旧数据；"
+                                        "若系统订阅页已没有对应订阅，可直接清除映射，不会影响系统订阅。"},
+            _button_row([_action("清除旧版映射", "mdi-broom", "warning",
+                                 f"plugin/{PLUGIN_ID}/legacy/purge")]),
+        ],
+    }
 
 
 def _trash_collection(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:

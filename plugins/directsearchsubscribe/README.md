@@ -10,7 +10,7 @@
 - 任务、目标集数、已下载进度、候选结果和回收站都保存在插件数据中，只在插件页面显示。
 - 成功添加下载后仍会写入 MoviePilot 正常的下载历史；下载完成后复用 MoviePilot 的目录匹配、转移和重命名能力，但媒体与剧集信息直接来自插件任务。
 
-插件不会迁移或删除 1.x 曾创建的系统订阅。升级后如果插件页面出现旧数据提示，请先在系统订阅页核对，再人工删除旧订阅。
+插件不会迁移或删除 1.x 曾创建的系统订阅。升级后如果插件页面出现旧数据提示，请先在系统订阅页核对并人工删除旧订阅，然后点击提示里的“清除旧版映射”移除插件内的残留记录。
 
 ## 创建任务
 
@@ -101,6 +101,7 @@
 - `POST /plugin/directsearchsubscribe/trash/{task_id}/restore`
 - `POST|DELETE /plugin/directsearchsubscribe/trash/{task_id}/purge`
 - `POST|DELETE /plugin/directsearchsubscribe/trash/purge`
+- `POST|DELETE /plugin/directsearchsubscribe/legacy/purge`
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/results`
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/logs`
 - `POST /plugin/directsearchsubscribe/transfers/retry-failed`
