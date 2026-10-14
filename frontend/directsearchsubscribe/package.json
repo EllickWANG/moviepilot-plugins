@@ -1,0 +1,25 @@
+{
+  "name": "directsearchsubscribe-ui",
+  "private": true,
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/prune-dist.mjs",
+    "watch": "vite build --watch"
+  },
+  "dependencies": {
+    "vue": "^3.5.13",
+    "vuetify": "3.7.3"
+  },
+  "devDependencies": {
+    "@originjs/vite-plugin-federation": "^1.4.1",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^5.4.11"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

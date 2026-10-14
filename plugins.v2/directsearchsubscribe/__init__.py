@@ -79,7 +79,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.5.3"
+    plugin_version = "3.0.0"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -148,14 +148,6 @@ class directsearchsubscribe(_PluginBase):
         if self._enabled:
             self._start_failed_transfer_retry(legacy_only=True)
 
-        if parse_bool(config.get("save_task_now"), False):
-            result = self.create_task(_task_payload_from_config(config), update_same=True)
-            config["save_task_now"] = False
-            self.update_config(config)
-            self._config = config
-            if result.get("success") and parse_bool(config.get("run_after_save"), False):
-                self._start_task_thread(str(result["task"]["id"]))
-
     def get_state(self) -> bool:
         return self._enabled
 
@@ -194,6 +186,8 @@ class directsearchsubscribe(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
+            _api("/overview", self.api_overview, ["GET"], "页面概览数据"),
+            _api("/options", self.api_options, ["GET"], "任务表单选项"),
             _api("/tasks", self.api_list_tasks, ["GET"], "查询直搜任务"),
             _api("/tasks", self.api_create_task, ["POST"], "创建直搜任务"),
             _api("/tasks/{task_id}", self.api_update_task, ["PUT"], "更新直搜任务"),
@@ -201,14 +195,7 @@ class directsearchsubscribe(_PluginBase):
             _api("/tasks/{task_id}/toggle", self.api_toggle_task, ["POST"], "暂停或恢复直搜任务"),
             _api("/tasks/{task_id}/auto", self.api_toggle_auto_download, ["POST"], "切换自动下载"),
             _api("/tasks/{task_id}/reset", self.api_reset_task, ["POST"], "重置直搜任务进度"),
-            _api("/tasks/{task_id}/cleanup/prepare", self.api_prepare_cleanup,
-                 ["POST"], "准备清理下载任务并重新处理"),
-            _api("/tasks/{task_id}/cleanup/prepare-files", self.api_prepare_cleanup_files,
-                 ["POST"], "准备清理下载任务和下载文件并重新处理"),
-            _api("/tasks/{task_id}/cleanup/confirm", self.api_confirm_cleanup,
-                 ["POST"], "确认清理并重新处理"),
-            _api("/tasks/{task_id}/cleanup/cancel", self.api_cancel_cleanup,
-                 ["POST"], "取消清理"),
+            _api("/tasks/{task_id}/cleanup", self.api_cleanup_task, ["POST"], "清理下载任务并重新处理"),
             _api("/tasks/{task_id}/delete", self.api_delete_task, ["POST", "DELETE"], "移入回收站"),
             _api("/trash/{task_id}/restore", self.api_restore_task, ["POST"], "恢复直搜任务"),
             _api("/trash/{task_id}/purge", self.api_purge_task, ["POST", "DELETE"], "彻底删除回收站任务"),
@@ -221,246 +208,18 @@ class directsearchsubscribe(_PluginBase):
             _api("/repair/run", self.api_run_repair, ["POST"], "立即执行丢失补偿"),
         ]
 
+    @staticmethod
+    def get_render_mode() -> Tuple[str, Optional[str]]:
+        """页面与配置都由联邦 Vue 组件绘制，产物位于插件目录 dist/assets。"""
+        return "vue", "dist/assets"
+
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
-        site_options = _active_site_options()
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    _form_hero(self),
-                    _form_section(
-                        "自动运行",
-                        "控制插件何时检查以及每轮最多添加多少下载；通常保持默认值即可。",
-                        "mdi-tune-variant",
-                        [
-                        _row([
-                            _col(12, 6, _switch("enabled", "启用定时检查", "关闭后保留任务，但不再自动执行")),
-                            _col(12, 6, _switch("notify", "下载结果通知", "有新下载时发送插件通知")),
-                        ]),
-                        _row([
-                            _col(12, 4, _field(
-                                "cron", "检查周期", "*/30 * * * *", "Cron 表达式，默认每 30 分钟",
-                            )),
-                            _col(12, 4, _number(
-                                "max_downloads", "每轮最多新增", 1, 20, "每个任务单轮的下载上限",
-                            )),
-                            _col(12, 4, _number(
-                                "task_gap", "任务间隔", 0, 60, "任务之间等待的秒数",
-                            )),
-                        ]),
-                        {"component": "VDivider", "props": {"class": "my-3"}},
-                        _row([
-                            _col(12, 4, _switch(
-                                "repair_enabled", "启用丢失补偿",
-                                "核对整理文件和媒体服务器索引；丢失时自动补回",
-                            )),
-                            _col(12, 4, _field(
-                                "repair_cron", "补偿检查周期", "15 */6 * * *",
-                                "默认每 6 小时检查一次，避开常规直搜整点",
-                            )),
-                            _col(12, 4, _number(
-                                "repair_grace_minutes", "整理宽限时间", 5, 1440,
-                                "刚整理的文件在此时间内不判定为丢失",
-                            )),
-                        ]),
-                        _alert(
-                            "info",
-                            "补偿会先重扫媒体服务器；成品缺失但下载缓存仍在时重新整理，"
-                            "缓存也丢失时才恢复为缺集并重新直搜。",
-                        ),
-                    ]),
-                    _form_section(
-                        "1. 节目与追更范围",
-                        "先定义要找什么，以及哪些集数还需要下载。",
-                        "mdi-television-play",
-                        [
-                        _row([
-                            _col(12, 8, _field("title", "节目名称", "从零开始的异世界生活")),
-                            _col(12, 4, _select("type", "类型", [
-                                {"title": "电视剧", "value": "电视剧"},
-                                {"title": "电影", "value": "电影"},
-                            ])),
-                        ]),
-                        _row([
-                            _col(12, 3, _field("year", "年份（可选）", "2026")),
-                            _col(12, 3, _number("season", "季（电影留空）", 1, 999)),
-                            _col(12, 3, _number("start_episode", "起始集", 1, 99999)),
-                            _col(12, 3, _number(
-                                "total_episode", "结束集", 1, 99999, "留空表示持续追更",
-                            )),
-                        ]),
-                        _row([
-                            _col(12, 6, _field(
-                                "episodes", "只追这些集（可选）", "1-12,14", "填写后优先于起始集和结束集",
-                            )),
-                            _col(12, 6, _field(
-                                "owned_episodes", "已经拥有的集数", "1-3", "这些集数不会重复下载",
-                            )),
-                        ]),
-                        _alert(
-                            "info",
-                            "集数支持 1-12,14 这样的写法。同名、同类型、同季任务会更新原任务并保留下载进度。",
-                        ),
-                    ]),
-                    {
-                        "component": "VExpansionPanels",
-                        "props": {"variant": "accordion", "class": "mb-4"},
-                        "content": [
-                            _form_expansion(
-                                "2. 搜索与标题匹配",
-                                "搜索词、别名、站点与过滤条件",
-                                "mdi-magnify-scan",
-                                [
-                                    _row([
-                                        _col(12, 6, _textarea(
-                                            "keywords", "站点搜索词（每行一个）",
-                                            "Re Zero S04\n从零开始的异世界生活 第四季",
-                                            "实际发送给 PT 站的关键词；留空时使用节目名称",
-                                        )),
-                                        _col(12, 6, _textarea(
-                                            "aliases", "标题别名（每行一个）",
-                                            "Re:Zero\nリゼロ", "只用于校验候选标题，不会额外发起搜索",
-                                        )),
-                                    ]),
-                                    _row([
-                                        _col(12, 6, _field(
-                                            "include", "必须包含", "2160p,HEVC", "逗号分隔，全部命中才保留",
-                                        )),
-                                        _col(12, 6, _field(
-                                            "exclude", "排除关键词", "试看,预告", "逗号分隔，命中任意一个就跳过",
-                                        )),
-                                    ]),
-                                    _row([
-                                        _col(12, 8, _select(
-                                            "sites", "检查站点", site_options,
-                                            "留空时使用系统允许搜索的活动站点", multiple=True,
-                                        )),
-                                        _col(12, 4, _number(
-                                            "search_pages", "每个关键词搜索页数", 1, 5,
-                                        )),
-                                    ]),
-                                    _switch(
-                                        "strict_title_match", "严格标题匹配",
-                                        "要求候选标题命中节目名称、标题别名或搜索词，建议保持开启",
-                                    ),
-                                ],
-                            ),
-                            _form_expansion(
-                                "3. 下载与整理策略",
-                                "候选排序、自动下载、保存位置与安全开关",
-                                "mdi-download-box-outline",
-                                [
-                                    _row([
-                                        _col(12, 4, _select("priority_mode", "候选优先规则", [
-                                            {"title": "做种数优先", "value": "seeders"},
-                                            {"title": "综合优先", "value": "balanced"},
-                                            {"title": "免费优先", "value": "free"},
-                                            {"title": "发布时间优先", "value": "latest"},
-                                            {"title": "小体积优先", "value": "smallest"},
-                                            {"title": "大体积优先", "value": "largest"},
-                                        ])),
-                                        _col(12, 4, _number(
-                                            "min_seeders", "最低做种数", 0, 1000000,
-                                        )),
-                                        _col(12, 4, _switch(
-                                            "dedupe_history", "下载历史去重",
-                                            "检查插件记录和 MoviePilot 下载历史",
-                                        )),
-                                    ]),
-                                    _row([
-                                        _col(12, 4, _field(
-                                            "downloader", "指定下载器（可选）", "留空使用站点或系统默认",
-                                        )),
-                                        _col(12, 4, _field(
-                                            "save_path", "下载保存路径（可选）", "/media/downloads",
-                                        )),
-                                        _col(12, 4, _field(
-                                            "media_category", "媒体库二级分类（可选）", "日番",
-                                        )),
-                                    ]),
-                                    _row([
-                                        _col(12, 6, _switch(
-                                            "prefer_full_pack", "优先整包下载",
-                                            "整包覆盖缺集时，优先选择整包并记录其全部集数",
-                                        )),
-                                        _col(12, 6, _switch(
-                                            "accept_unknown_episode", "允许未知集数自动下载",
-                                            "高风险：标题无法解析集数时，每轮仍可选择一个候选",
-                                            color="warning",
-                                        )),
-                                    ]),
-                                ],
-                            ),
-                        ],
-                    },
-                    _save_task_section(),
-                ],
-            }
-        ], {
-            "enabled": True,
-            "notify": True,
-            "cron": "*/30 * * * *",
-            "max_downloads": 3,
-            "task_gap": 2,
-            "repair_enabled": True,
-            "repair_cron": "15 */6 * * *",
-            "repair_grace_minutes": 30,
-            "save_task_now": False,
-            "run_after_save": False,
-            "title": "",
-            "type": "电视剧",
-            "year": "",
-            "season": "",
-            "start_episode": 1,
-            "total_episode": "",
-            "episodes": "",
-            "owned_episodes": "",
-            "keywords": "",
-            "aliases": "",
-            "include": "",
-            "exclude": "",
-            "sites": [],
-            "search_pages": 1,
-            "priority_mode": "seeders",
-            "min_seeders": 0,
-            "dedupe_history": True,
-            "downloader": "",
-            "save_path": "",
-            "media_category": "",
-            "task_enabled": True,
-            "auto_download": False,
-            "strict_title_match": True,
-            "accept_unknown_episode": False,
-            "prefer_full_pack": True,
-        }
+        """Vue 模式下只返回全局设置的当前值，表单由联邦组件 Config 绘制。"""
+        return None, self._settings_snapshot()
 
     def get_page(self) -> Optional[List[dict]]:
-        tasks = list(self._load_tasks().values())
-        tasks.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        trash = list(self._load_trash().values())
-        trash.sort(key=lambda item: str(item.get("deleted_at") or ""), reverse=True)
-        legacy = self.get_data(LEGACY_TASKS_KEY) or {}
-        active = sum(1 for task in tasks if task.get("enabled") and task.get("status") != "completed")
-        auto = sum(1 for task in tasks if task.get("auto_download"))
-        completed = sum(1 for task in tasks if task.get("status") == "completed")
-        attention = sum(
-            1 for task in tasks
-            if task.get("status") == "error" or task.get("last_transfer_status") == "failed"
-            or task.get("last_repair_status") == "warning"
-        )
-        repair_state = self.get_data(REPAIR_STATE_KEY) or {}
-        contents = [
-            _hero(self, len(tasks), attention),
-            _repair_overview(self, repair_state),
-            _overview_metrics(len(tasks), active, auto, completed),
-            _task_collection(tasks),
-            _activity_collection(tasks),
-        ]
-        if legacy:
-            contents.insert(1, _legacy_notice(legacy))
-        if trash:
-            contents.append(_trash_collection(trash[:20]))
-        return contents
+        """Vue 模式下详情页由联邦组件 Page 通过 /overview 接口自行取数。"""
+        return None
 
     def stop_service(self):
         """通知正在运行的任务尽快停止。"""
@@ -539,6 +298,48 @@ class directsearchsubscribe(_PluginBase):
             target = ""
         self._update_transfer_record(download_hash, status, message, target)
 
+    def _settings_snapshot(self) -> Dict[str, Any]:
+        return {
+            "enabled": self._enabled, "notify": self._notify, "cron": self._cron,
+            "max_downloads": self._max_downloads, "task_gap": self._task_gap,
+            "repair_enabled": self._repair_enabled, "repair_cron": self._repair_cron,
+            "repair_grace_minutes": self._repair_grace_minutes,
+        }
+
+    def api_overview(self) -> schemas.Response:
+        """一次返回详情页需要的全部数据，减少前端往返。"""
+        tasks = sorted(self._load_tasks().values(),
+                       key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        trash = sorted(self._load_trash().values(),
+                       key=lambda item: str(item.get("deleted_at") or ""), reverse=True)
+        legacy = self.get_data(LEGACY_TASKS_KEY) or {}
+        legacy_items = list(legacy.items()) if isinstance(legacy, dict) else list(enumerate(legacy or []))
+        repair = dict(self.get_data(REPAIR_STATE_KEY) or {})
+        repair["running"] = self.__class__._repair_lock.locked()
+        with self.__class__._running_lock:
+            running_ids = sorted(self.__class__._running_ids)
+        return schemas.Response(success=True, data={
+            "plugin_version": self.plugin_version,
+            "settings": self._settings_snapshot(),
+            "tasks": [_task_view(task) for task in tasks],
+            "running_task_ids": running_ids,
+            "trash": [_trash_view(task) for task in trash],
+            "legacy": [
+                {
+                    "key": str(key),
+                    "title": str(item.get("title") or item.get("keyword") or key)
+                    if isinstance(item, dict) else str(key),
+                }
+                for key, item in legacy_items
+            ],
+            "repair": repair,
+            "transfer_retry_running": self.__class__._transfer_retry_lock.locked(),
+        })
+
+    def api_options(self) -> schemas.Response:
+        """任务编辑表单需要的选项。"""
+        return schemas.Response(success=True, data={"sites": _active_site_options()})
+
     def api_list_tasks(self) -> schemas.Response:
         return schemas.Response(success=True, data=list(self._load_tasks().values()))
 
@@ -595,65 +396,18 @@ class directsearchsubscribe(_PluginBase):
             self._save_tasks(tasks)
         return schemas.Response(success=True, message="任务进度已重置", data=task)
 
-    def api_prepare_cleanup(self, task_id: str) -> schemas.Response:
-        return self._prepare_cleanup(task_id, delete_files=False)
 
-    def api_prepare_cleanup_files(self, task_id: str) -> schemas.Response:
-        return self._prepare_cleanup(task_id, delete_files=True)
-
-    def _prepare_cleanup(self, task_id: str, delete_files: bool) -> schemas.Response:
-        """进入五分钟的两步清理确认期，第一次调用不会删除任何内容。"""
-        with self.__class__._data_lock:
-            tasks = self._load_tasks()
-            task = tasks.get(task_id)
-            if not task:
-                return schemas.Response(success=False, message="任务不存在")
-            pending = {
-                "delete_files": delete_files,
-                "prepared_at": now_text(),
-                "expires_at": (datetime.now() + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            task["cleanup_pending"] = pending
-            scope = "下载任务及下载文件" if delete_files else "下载任务（保留下载文件）"
-            task["run_logs"] = [_audit_entry(
-                "清理", "等待确认", f"已准备清理{scope}；五分钟内再次确认才会执行", level="warning"
-            ), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
-            task["updated_at"] = now_text()
-            tasks[task_id] = task
-            self._save_tasks(tasks)
-        return schemas.Response(
-            success=True,
-            message=f"已准备清理{scope}，请在五分钟内点击“确认清理并重处理”",
-            data=task,
-        )
-
-    def api_cancel_cleanup(self, task_id: str) -> schemas.Response:
-        with self.__class__._data_lock:
-            tasks = self._load_tasks()
-            task = tasks.get(task_id)
-            if not task:
-                return schemas.Response(success=False, message="任务不存在")
-            task["cleanup_pending"] = {}
-            task["run_logs"] = [_audit_entry(
-                "清理", "已取消", "用户取消了待确认的清理操作"
-            ), *(task.get("run_logs") or [])][:MAX_TASK_LOGS]
-            task["updated_at"] = now_text()
-            tasks[task_id] = task
-            self._save_tasks(tasks)
-        return schemas.Response(success=True, message="已取消清理", data=task)
-
-    def api_confirm_cleanup(self, task_id: str) -> schemas.Response:
+    def api_cleanup_task(self, task_id: str,
+                         payload: Optional[Dict[str, Any]] = Body(default=None)) -> schemas.Response:
+        """清理本插件为该任务创建的下载并重新检查；前端负责二次确认。"""
         task = self._load_tasks().get(task_id)
         if not task:
             return schemas.Response(success=False, message="任务不存在")
-        pending = task.get("cleanup_pending") or {}
-        if not _cleanup_pending_active(pending):
-            self._update_runtime(task_id, cleanup_pending={})
-            return schemas.Response(success=False, message="清理确认已失效，请重新准备清理")
+        delete_files = parse_bool((payload or {}).get("delete_files"), False)
         if not self._claim_task(task_id):
             return schemas.Response(success=False, message="任务正在运行，请稍后再清理")
         try:
-            result = self._cleanup_task(task, delete_files=parse_bool(pending.get("delete_files"), False))
+            result = self._cleanup_task(task, delete_files=delete_files)
         finally:
             self._release_task(task_id)
         if not result.get("success"):
@@ -2235,14 +1989,6 @@ def _reason_summary(results: List[Dict[str, Any]], downloads: List[Dict[str, Any
     return "未新增下载：没有通过标题、集数、关键词和做种条件的候选"
 
 
-def _cleanup_pending_active(pending: Dict[str, Any]) -> bool:
-    try:
-        expires_at = datetime.strptime(str(pending.get("expires_at") or ""), "%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError):
-        return False
-    return datetime.now() <= expires_at
-
-
 def _history_matches_task(task: Dict[str, Any], history: Any) -> bool:
     torrent_title = str(getattr(history, "torrent_name", "") or "").strip()
     if not torrent_title:
@@ -2273,25 +2019,6 @@ def _history_matches_task(task: Dict[str, Any], history: Any) -> bool:
     task_year = str(task.get("year") or "").strip()
     history_year = str(getattr(history, "year", "") or torrent_meta.year or "").strip()
     return not task_year or not history_year or task_year == history_year
-
-
-def _task_payload_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "name": config.get("title"), "type": config.get("type"), "year": config.get("year"),
-        "season": config.get("season"), "start_episode": config.get("start_episode"),
-        "total_episode": config.get("total_episode"), "episodes": config.get("episodes"),
-        "owned_episodes": config.get("owned_episodes"),
-        "keywords": config.get("keywords") or config.get("keyword"), "aliases": config.get("aliases"),
-        "include": config.get("include"), "exclude": config.get("exclude"), "sites": config.get("sites"),
-        "search_pages": config.get("search_pages"), "downloader": config.get("downloader"),
-        "priority_mode": config.get("priority_mode"), "min_seeders": config.get("min_seeders"),
-        "dedupe_history": config.get("dedupe_history"),
-        "prefer_full_pack": config.get("prefer_full_pack"),
-        "save_path": config.get("save_path"), "media_category": config.get("media_category"),
-        "enabled": config.get("task_enabled"), "auto_download": config.get("auto_download"),
-        "strict_title_match": config.get("strict_title_match"),
-        "accept_unknown_episode": config.get("accept_unknown_episode"),
-    }
 
 
 def _search_site_titles(search_chain: SearchChain, keyword: str, page: int,
@@ -2652,6 +2379,43 @@ def _response(result: Dict[str, Any]) -> schemas.Response:
                             data=result.get("task") or result)
 
 
+def _task_view(task: Dict[str, Any]) -> Dict[str, Any]:
+    """组装前端任务视图：去掉大体积字段，补充进度与状态摘要。"""
+    target = target_episodes(task)
+    downloaded = parse_episodes(task.get("downloaded_episodes"))
+    missing = missing_episodes(task)
+    view = {
+        key: value for key, value in task.items()
+        if key not in ("run_logs", "last_results", "downloaded_fingerprints",
+                       "ignored_history_hashes", "ignored_resource_identities", "cleanup_pending")
+    }
+    view["download_records"] = list(reversed(list(task.get("download_records") or [])[-20:]))
+    view["target_count"] = len(target)
+    view["downloaded_count"] = len(downloaded)
+    view["missing_count"] = len(missing)
+    view["target_text"] = episodes_text(target)
+    view["downloaded_text"] = episodes_text(downloaded)
+    view["missing_text"] = episodes_text(missing)
+    view["progress"] = int(round(len(target & downloaded) * 100 / len(target))) if target else None
+    view["tracking_mode"] = "fixed" if target else "ongoing"
+    view["transfer_status_text"] = {
+        "waiting": "等待下载完成", "queued": "已加入整理队列", "completed": "整理完成",
+        "failed": "整理失败",
+    }.get(str(task.get("last_transfer_status") or ""), "")
+    view["results_count"] = len(task.get("last_results") or [])
+    view["logs_count"] = len(task.get("run_logs") or [])
+    return view
+
+
+def _trash_view(task: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": task.get("id"), "name": task.get("name"), "type": task.get("type"),
+        "year": task.get("year"), "season": task.get("season"),
+        "deleted_at": task.get("deleted_at"),
+        "downloaded_text": episodes_text(parse_episodes(task.get("downloaded_episodes"))),
+    }
+
+
 def _download_labels() -> str:
     """组合 MoviePilot 系统标签和插件标签，并保持顺序去重。"""
     labels = []
@@ -2677,843 +2441,3 @@ def _active_site_options() -> List[Dict[str, Any]]:
         return []
 
 
-def _form_hero(plugin: directsearchsubscribe) -> Dict[str, Any]:
-    return {
-        "component": "VCard",
-        "props": {"variant": "tonal", "color": "primary", "rounded": "xl", "class": "mb-4"},
-        "content": [{
-            "component": "VCardText",
-            "props": {"class": "pa-4 pa-sm-5"},
-            "content": [
-                {"component": "div", "props": {"class": "d-flex align-center ga-3"}, "content": [
-                    _avatar("mdi-magnify-scan", "primary", 52),
-                    {"component": "div", "props": {"style": "min-width:0"}, "content": [
-                        {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
-                         "text": "创建直搜任务"},
-                        {"component": "div", "props": {"class": "text-body-2 text-medium-emphasis mt-1"},
-                         "text": f"v{plugin.plugin_version} · 人工定义节目，直接搜索 PT 站，不依赖外部媒体信息源"},
-                    ]},
-                ]},
-                {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 mt-4"},
-                 "content": [
-                     _chip("1  定义节目", "primary", "mdi-television-play"),
-                     _icon("mdi-chevron-right", "text-medium-emphasis"),
-                     _chip("2  预览候选", "info", "mdi-eye-outline"),
-                     _icon("mdi-chevron-right", "text-medium-emphasis"),
-                     _chip("3  开启自动下载", "warning", "mdi-download"),
-                 ]},
-            ],
-        }],
-    }
-
-
-def _form_section(title: str, subtitle: str, icon: str,
-                  content: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
-        "component": "VCard",
-        "props": {"variant": "flat", "rounded": "xl", "border": True, "class": "mb-4"},
-        "content": [{
-            "component": "VCardText",
-            "props": {"class": "pa-4 pa-sm-5"},
-            "content": [
-                _section_heading(title, subtitle, icon),
-                {"component": "div", "props": {"class": "mt-4"}, "content": content,
-                 },
-            ],
-        }],
-    }
-
-
-def _form_expansion(title: str, subtitle: str, icon: str,
-                    content: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
-        "component": "VExpansionPanel",
-        "content": [
-            {"component": "VExpansionPanelTitle", "content": [
-                {"component": "div", "props": {"class": "d-flex align-center ga-3 w-100 pr-3"}, "content": [
-                    _avatar(icon, "primary", 36),
-                    {"component": "div", "props": {"style": "min-width:0"}, "content": [
-                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"},
-                         "text": title},
-                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-                         "text": subtitle},
-                    ]},
-                ]},
-            ]},
-            {"component": "VExpansionPanelText", "content": content},
-        ],
-    }
-
-
-def _save_task_section() -> Dict[str, Any]:
-    return {
-        "component": "VCard",
-        "props": {"variant": "tonal", "color": "primary", "rounded": "xl", "class": "mb-4"},
-        "content": [{
-            "component": "VCardText",
-            "props": {"class": "pa-4 pa-sm-5"},
-            "content": [
-                _section_heading(
-                    "4. 创建或更新任务",
-                    "最后确认任务状态，然后使用插件配置页自带的保存按钮提交。",
-                    "mdi-content-save-check-outline",
-                ),
-                _row([
-                    _col(12, 4, _switch("task_enabled", "创建后立即启用", "关闭时保存为暂停任务")),
-                    _col(12, 4, _switch(
-                        "auto_download", "允许自动下载", "初次使用建议关闭，先在详情页检查候选",
-                        color="warning",
-                    )),
-                    _col(12, 4, _switch(
-                        "run_after_save", "保存后立即检查", "创建或更新成功后立即搜索一次",
-                    )),
-                ]),
-                {"component": "VDivider", "props": {"class": "my-3"}},
-                _switch(
-                    "save_task_now", "本次保存时创建或更新上面的任务",
-                    "请先开启此项，再点击页面右下角的保存按钮；执行完成后此项会自动关闭",
-                ),
-                _alert("info", "若只是修改插件的自动运行设置，请不要开启“本次保存时创建或更新任务”。"),
-            ],
-        }],
-    }
-
-
-def _hero(plugin: directsearchsubscribe, total: int, attention: int) -> Dict[str, Any]:
-    enabled = plugin._enabled
-    return {
-        "component": "VCard",
-        "props": {"variant": "tonal", "color": "primary", "rounded": "xl", "class": "mb-4"},
-        "content": [{
-            "component": "VCardText",
-            "props": {"class": "pa-4 pa-sm-5"},
-            "content": [
-                {"component": "div",
-                 "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-3"},
-                 "content": [
-                     {"component": "div", "props": {"class": "d-flex align-center ga-3",
-                                                       "style": "min-width:0"}, "content": [
-                         _avatar("mdi-magnify-scan", "primary", 52),
-                         {"component": "div", "props": {"style": "min-width:0"}, "content": [
-                             {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2"},
-                              "content": [
-                                  {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
-                                   "text": "直搜订阅"},
-                                  _chip("运行中" if enabled else "已停用", "success" if enabled else "error",
-                                        "mdi-power" if enabled else "mdi-power-off"),
-                                  _chip(f"v{plugin.plugin_version}", "secondary", "mdi-tag-outline"),
-                              ]},
-                             {"component": "div",
-                              "props": {"class": "text-body-2 text-medium-emphasis mt-1"},
-                              "text": "手工节目任务 · PT 站直搜 · 下载完成后自动整理"},
-                         ]},
-                     ]},
-                     {"component": "div", "props": {"class": "d-flex flex-wrap ga-2"}, "content": [
-                         _action("立即对账补偿", "mdi-database-sync", "primary",
-                                 f"plugin/{PLUGIN_ID}/repair/run"),
-                         _action("重试失败整理", "mdi-folder-refresh", "secondary",
-                                 f"plugin/{PLUGIN_ID}/transfers/retry-failed"),
-                     ]},
-                 ]},
-                {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 mt-4"},
-                 "content": [
-                     _chip("节目任务", "primary", "mdi-playlist-check"),
-                     _icon("mdi-chevron-right", "text-medium-emphasis"),
-                     _chip("搜索 PT 站", "info", "mdi-database-search"),
-                     _icon("mdi-chevron-right", "text-medium-emphasis"),
-                     _chip("发送下载器", "warning", "mdi-download"),
-                     _icon("mdi-chevron-right", "text-medium-emphasis"),
-                     _chip("媒体库整理", "success", "mdi-folder-move"),
-                 ]},
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-3"},
-                 "text": f"共 {total} 个任务 · 检查周期 {plugin._cron}"
-                         + (f" · 补偿周期 {plugin._repair_cron}" if plugin._repair_enabled else " · 补偿已停用")
-                         + (f" · {attention} 个任务需要处理" if attention else " · 当前无异常")},
-            ],
-        }],
-    }
-
-
-def _overview_metrics(total: int, active: int, auto: int, completed: int) -> Dict[str, Any]:
-    return {
-        "component": "VRow",
-        "props": {"class": "mb-1"},
-        "content": [
-            _stat_card("全部任务", total, "插件内维护", "mdi-playlist-check", "primary"),
-            _stat_card("正在追更", active, "启用且未完成", "mdi-radar", "success"),
-            _stat_card("自动下载", auto, "其余任务仅预览", "mdi-download-circle-outline", "warning"),
-            _stat_card("已经完成", completed, "有限目标已齐", "mdi-check-decagram-outline", "info"),
-        ],
-    }
-
-
-def _repair_overview(plugin: directsearchsubscribe, state: Dict[str, Any]) -> Dict[str, Any]:
-    if not plugin._repair_enabled:
-        return _alert("warning", "丢失补偿已停用；不会定时核对媒体索引、成品文件和下载缓存。")
-    message = str(state.get("message") or "尚未执行补偿对账；系统会按设定周期自动检查。")
-    checked_at = str(state.get("last_run_at") or "-")
-    return {
-        "component": "VAlert",
-        "props": {
-            "type": "info", "variant": "tonal", "rounded": "xl", "class": "mb-4",
-            "title": "丢失补偿",
-        },
-        "content": [
-            {"component": "div", "props": {"class": "text-body-2"}, "text": message},
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
-             "text": f"上次检查 {checked_at} · 宽限 {plugin._repair_grace_minutes} 分钟"},
-        ],
-    }
-
-
-def _stat_card(title: str, value: Any, subtitle: str, icon: str, color: str) -> Dict[str, Any]:
-    return {
-        "component": "VCol", "props": {"cols": 6, "sm": 6, "lg": 3},
-        "content": [{
-            "component": "VCard",
-            "props": {"variant": "flat", "rounded": "xl", "border": True, "class": "h-100"},
-            "content": [{"component": "VCardText", "props": {"class": "pa-3 pa-sm-4"}, "content": [
-                {"component": "div", "props": {"class": "d-flex align-center ga-3"}, "content": [
-                    _avatar(icon, color, 44),
-                    {"component": "div", "props": {"style": "min-width:0"}, "content": [
-                        {"component": "div", "props": {"class": "text-h5 font-weight-bold lh-1"},
-                         "text": str(value)},
-                        {"component": "div", "props": {"class": "text-caption font-weight-medium mt-1"},
-                         "text": title},
-                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-                         "text": subtitle},
-                    ]},
-                ]},
-            ]}],
-        }],
-    }
-
-
-def _task_collection(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not tasks:
-        content = [_empty_state(
-            "mdi-playlist-plus", "还没有直搜任务", "打开插件配置，填写节目和搜索词后创建第一个任务。",
-        )]
-    else:
-        content = [{
-            "component": "VExpansionPanels",
-            "props": {"variant": "accordion"},
-            "content": [_task_panel(task) for task in tasks],
-        }]
-    return _page_card(
-        "任务",
-        "按最近更新时间排序；展开任务可查看规则、运行结果和操作。",
-        "mdi-format-list-bulleted",
-        content,
-        count=len(tasks),
-    )
-
-
-def _task_panel(task: Dict[str, Any]) -> Dict[str, Any]:
-    target = target_episodes(task)
-    downloaded = parse_episodes(task.get("downloaded_episodes"))
-    missing = target.difference(downloaded)
-    acquired = len(target) - len(missing)
-    status = _task_status_label(task.get("status"))
-    status_color = _status_color(task.get("status"))
-    toggle_text = "暂停任务" if task.get("enabled") else "恢复任务"
-    toggle_icon = "mdi-pause" if task.get("enabled") else "mdi-play"
-    auto_text = "关闭自动下载" if task.get("auto_download") else "开启自动下载"
-    media_bits = [str(task.get("type") or "节目")]
-    if task.get("year"):
-        media_bits.append(str(task.get("year")))
-    if task.get("type") != "电影" and task.get("season"):
-        media_bits.append(f"S{int(task['season']):02d}")
-    progress_summary = (f"已获取 {acquired}/{len(target)} · 缺 {episodes_text(missing) or '-'}"
-                        if target else f"持续追更 · 已记录 {episodes_text(downloaded) or '-'}")
-    priority_text = {
-        "seeders": "做种数优先", "balanced": "综合优先", "free": "免费优先",
-        "latest": "发布时间优先", "smallest": "小体积优先", "largest": "大体积优先",
-    }[normalize_priority_mode(task.get("priority_mode"))]
-    priority_text += f" · 最低做种 {parse_int(task.get('min_seeders'), 0, minimum=0) or 0}"
-    priority_text += " · 历史去重" if parse_bool(task.get("dedupe_history"), True) else ""
-    priority_text += " · 整包优先" if parse_bool(task.get("prefer_full_pack"), True) else ""
-    filters = []
-    if task.get("include"):
-        filters.append("包含 " + ", ".join(str(item) for item in task.get("include") or []))
-    if task.get("exclude"):
-        filters.append("排除 " + ", ".join(str(item) for item in task.get("exclude") or []))
-    if not filters:
-        filters.append("未设置额外关键词过滤")
-    transfer_status = _transfer_status(task)
-    last_message = str(task.get("last_message") or "尚未运行，点击“立即检查”预览候选。")
-    message_type = "error" if task.get("status") == "error" else (
-        "success" if (task.get("last_download_count") or task.get("status") == "completed") else "info"
-    )
-    cleanup_pending = task.get("cleanup_pending") or {}
-    if _cleanup_pending_active(cleanup_pending):
-        cleanup_scope = "下载任务及下载文件" if cleanup_pending.get("delete_files") \
-            else "下载任务（保留文件）"
-        maintenance = [
-            _alert("warning", f"等待确认：将清理{cleanup_scope}，重置进度后立即重新检查；媒体库成品不会删除。"),
-            _button_row([
-                _action("确认清理并重处理", "mdi-delete-sweep", "error",
-                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/confirm"),
-                _action("取消", "mdi-close", "secondary",
-                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/cancel"),
-            ]),
-        ]
-    else:
-        maintenance = [
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-2"},
-             "text": "清理仅作用于这个插件明确创建的下载 Hash，不会删除媒体库成品。"},
-            _button_row([
-                _action("清理任务，保留文件", "mdi-broom", "secondary",
-                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/prepare"),
-                _action("清理任务和下载文件", "mdi-delete-sweep", "error",
-                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/cleanup/prepare-files"),
-                _action("移入回收站", "mdi-delete-outline", "error",
-                        f"plugin/{PLUGIN_ID}/tasks/{task['id']}/delete"),
-            ]),
-        ]
-    return {
-        "component": "VExpansionPanel",
-        "content": [
-            {"component": "VExpansionPanelTitle", "content": [
-                {"component": "div",
-                 "props": {"class": "d-flex flex-wrap align-center ga-3 w-100 pr-3"},
-                 "content": [
-                     _avatar(_task_icon(task), status_color, 38),
-                     {"component": "div", "props": {"class": "flex-grow-1", "style": "min-width:180px"},
-                      "content": [
-                          {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium",
-                                                            "style": "word-break:break-word"},
-                           "text": str(task.get("name") or "未命名")},
-                          {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-                           "text": " · ".join(media_bits) + " · " + progress_summary},
-                      ]},
-                     {"component": "div", "props": {"class": "d-flex flex-wrap ga-2"}, "content": [
-                         _chip(status, status_color),
-                         _chip("自动下载" if task.get("auto_download") else "仅预览",
-                               "warning" if task.get("auto_download") else "info"),
-                     ]},
-                 ]},
-            ]},
-            {"component": "VExpansionPanelText", "content": [
-                _task_progress(target, missing, downloaded, status_color),
-                _alert(message_type, last_message),
-                _button_row([
-                    _action("立即检查", "mdi-magnify", "primary",
-                            f"plugin/{PLUGIN_ID}/tasks/{task['id']}/run"),
-                    _action(toggle_text, toggle_icon, "secondary",
-                            f"plugin/{PLUGIN_ID}/tasks/{task['id']}/toggle"),
-                    _action(auto_text, "mdi-download", "warning",
-                            f"plugin/{PLUGIN_ID}/tasks/{task['id']}/auto"),
-                ]),
-                {"component": "VRow", "props": {"class": "mt-2"}, "content": [
-                    _col(12, 6, _detail_card("搜索规则", "mdi-database-search", [
-                        _line("搜索词", " / ".join(task_search_keywords(task)) or "节目名称"),
-                        _line("站点", ", ".join(str(item) for item in task.get("sites") or [])
-                              or "系统活动站点"),
-                        _line("过滤", "；".join(filters)),
-                        _line("标题匹配", "严格匹配" if task.get("strict_title_match") else "宽松匹配"),
-                    ])),
-                    _col(12, 6, _detail_card("下载与整理", "mdi-folder-move", [
-                        _line("候选择优", priority_text),
-                        _line("下载位置", str(task.get("save_path") or "站点或系统默认")),
-                        _line("媒体分类", str(task.get("media_category") or "使用媒体库默认规则")),
-                        _line("整理状态", transfer_status),
-                        _line("丢失补偿", str(task.get("last_repair_message") or "尚未发现异常")),
-                    ])),
-                ]},
-                _detail_card("最近一次运行", "mdi-history", [
-                    _line("检查时间", str(task.get("last_run_at") or "-")),
-                    _line("候选 / 下载 / 重复", f"{task.get('last_match_count') or 0} / "
-                          f"{task.get('last_download_count') or 0} / {task.get('last_duplicate_count') or 0}"),
-                    _line("结果说明", str(task.get("last_reason_summary") or "暂无详细原因")),
-                ]),
-                {"component": "VDivider", "props": {"class": "my-4"}},
-                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-2"},
-                 "text": "维护与清理"},
-                *maintenance,
-            ]},
-        ],
-    }
-
-
-def _task_progress(target: Set[int], missing: Set[int], downloaded: Set[int],
-                   color: str) -> Dict[str, Any]:
-    if not target:
-        return {
-            "component": "VSheet",
-            "props": {"rounded": "lg", "class": "pa-3 mb-3", "color": "info"},
-            "content": [
-                {"component": "div", "props": {"class": "d-flex align-center ga-2"}, "content": [
-                    _icon("mdi-infinity", "text-info"),
-                    {"component": "div", "props": {"class": "text-body-2 font-weight-medium"},
-                     "text": "持续追更模式"},
-                ]},
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                 "text": f"已记录集数：{episodes_text(downloaded) or '暂无'}"},
-            ],
-        }
-    acquired = len(target) - len(missing)
-    percentage = round(acquired * 100 / len(target))
-    return {
-        "component": "VSheet",
-        "props": {"rounded": "lg", "class": "pa-3 mb-3", "border": True},
-        "content": [
-            {"component": "div", "props": {"class": "d-flex justify-space-between ga-3 mb-2"},
-             "content": [
-                 {"component": "span", "props": {"class": "text-body-2 font-weight-medium"},
-                  "text": f"已获取 {acquired}/{len(target)}"},
-                 {"component": "span", "props": {"class": "text-caption text-medium-emphasis"},
-                  "text": f"缺少 {episodes_text(missing) or '无'}"},
-             ]},
-            {"component": "VProgressLinear", "props": {
-                "model-value": percentage, "color": color, "height": 8, "rounded": True,
-            }},
-        ],
-    }
-
-
-def _activity_collection(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    candidates = _candidate_rows(tasks)
-    run_logs = _run_log_rows(tasks)
-    return _page_card(
-        "最近活动",
-        "候选和运行原因默认收起，需要排查时再展开；手机端会自动切换为卡片。",
-        "mdi-pulse",
-        [{
-            "component": "VExpansionPanels",
-            "props": {"variant": "accordion"},
-            "content": [
-                _activity_panel(
-                    "最近候选", f"{len(candidates)} 条", "mdi-format-list-checks",
-                    _recent_results(candidates),
-                ),
-                _activity_panel(
-                    "详细运行日志", f"{len(run_logs)} 条", "mdi-text-box-search-outline",
-                    _run_log_table(run_logs),
-                ),
-            ],
-        }],
-    )
-
-
-def _candidate_rows(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = []
-    for task in tasks:
-        for result in (task.get("last_results") or [])[:10]:
-            state = "已下载" if result.get("downloaded") else (
-                "重复跳过" if result.get("duplicate") or result.get("skip_reason") else "候选"
-            )
-            rows.append({
-                "节目": task.get("name") or "-", "站点": result.get("site") or "-",
-                "标题": result.get("title") or "-", "集数": result.get("episodes") or "未知",
-                "做种": result.get("seeders") or 0, "促销": "免费" if result.get("free") else "-",
-                "状态": state, "原因": result.get("download_error") or result.get("skip_reason")
-                or result.get("selection_reason") or result.get("reason") or "-",
-            })
-    return rows[:50]
-
-
-def _run_log_rows(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = []
-    for task in tasks:
-        for entry in task.get("run_logs") or []:
-            rows.append({
-                "时间": entry.get("time") or "-", "节目": task.get("name") or "-",
-                "阶段": entry.get("stage") or "-", "动作": entry.get("action") or "-",
-                "站点": entry.get("site") or "-", "资源": entry.get("title") or "-",
-                "集数": entry.get("episodes") or "-", "做种": entry.get("seeders") or 0,
-                "原因": entry.get("reason") or "-",
-            })
-    rows.sort(key=lambda item: str(item.get("时间") or ""), reverse=True)
-    return rows[:100]
-
-
-def _recent_results(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not rows:
-        return _empty_state("mdi-magnify-close", "暂无候选", "运行一次任务后，候选资源会显示在这里。")
-    desktop_rows = []
-    mobile_items = []
-    for row in rows:
-        state_color = {"已下载": "success", "重复跳过": "secondary"}.get(row["状态"], "info")
-        desktop_rows.append({"component": "tr", "content": [
-            _td(row["节目"], "text-no-wrap"),
-            {"component": "td", "content": [
-                {"component": "div", "props": {"class": "text-body-2",
-                                                  "style": "min-width:260px;word-break:break-word"},
-                 "text": str(row["标题"])},
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                 "text": str(row["站点"])},
-            ]},
-            _td(row["集数"], "text-no-wrap"), _td(row["做种"], "text-no-wrap"),
-            _chip_td(row["促销"], "success" if row["促销"] == "免费" else "secondary"),
-            _chip_td(row["状态"], state_color), _td(row["原因"]),
-        ]})
-        mobile_items.append(_mobile_record(
-            row["标题"], f"{row['节目']} · {row['站点']}",
-            [_chip(str(row["集数"]), "primary", "mdi-television-classic"),
-             _chip(f"做种 {row['做种']}", "info", "mdi-account-multiple"),
-             _chip(str(row["状态"]), state_color)],
-            [_line("促销", str(row["促销"])), _line("原因", str(row["原因"]))],
-        ))
-    return _responsive_table(
-        ["节目", "资源 / 站点", "集数", "做种", "促销", "状态", "原因"],
-        desktop_rows, mobile_items,
-    )
-
-
-def _run_log_table(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not rows:
-        return _empty_state("mdi-text-box-search-outline", "暂无运行日志", "任务运行后的筛选与下载原因会显示在这里。")
-    desktop_rows = []
-    mobile_items = []
-    for row in rows:
-        desktop_rows.append({"component": "tr", "content": [
-            _td(row["时间"], "text-no-wrap"),
-            _td(f"{row['节目']}\n{row['阶段']} · {row['动作']}"),
-            _td(f"{row['资源']}\n{row['站点']}"),
-            _td(row["集数"], "text-no-wrap"), _td(row["做种"], "text-no-wrap"), _td(row["原因"]),
-        ]})
-        mobile_items.append(_mobile_record(
-            f"{row['阶段']} · {row['动作']}", f"{row['时间']} · {row['节目']}",
-            [_chip(str(row["站点"]), "secondary", "mdi-database"),
-             _chip(str(row["集数"]), "primary", "mdi-television-classic"),
-             _chip(f"做种 {row['做种']}", "info", "mdi-account-multiple")],
-            [_line("资源", str(row["资源"])), _line("原因", str(row["原因"]))],
-        ))
-    return _responsive_table(
-        ["时间", "节目 / 阶段", "资源 / 站点", "集数", "做种", "原因"],
-        desktop_rows, mobile_items,
-    )
-
-
-def _legacy_notice(legacy: Any) -> Dict[str, Any]:
-    """提示 1.x 遗留映射，并提供只清插件数据的清除入口。"""
-    items = legacy.values() if isinstance(legacy, dict) else (legacy or [])
-    titles = [str(item.get("title") or item.get("keyword") or "") for item in items if isinstance(item, dict)]
-    titles = [title for title in titles if title]
-    summary = f"检测到旧版插件映射 {len(legacy)} 条"
-    if titles:
-        summary += "：" + "、".join(titles[:5]) + ("…" if len(titles) > 5 else "")
-    return {
-        "component": "VAlert",
-        "props": {"type": "warning", "variant": "tonal", "density": "comfortable", "rounded": "lg",
-                  "class": "mb-3"},
-        "content": [
-            {"component": "div", "text": summary + "。2.0 不读取也不执行这些旧数据；"
-                                        "若系统订阅页已没有对应订阅，可直接清除映射，不会影响系统订阅。"},
-            _button_row([_action("清除旧版映射", "mdi-broom", "warning",
-                                 f"plugin/{PLUGIN_ID}/legacy/purge")]),
-        ],
-    }
-
-
-def _trash_collection(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    panels = []
-    for task in tasks:
-        panels.append({
-            "component": "VExpansionPanel",
-            "content": [
-                {"component": "VExpansionPanelTitle", "content": [
-                    {"component": "div", "props": {"class": "d-flex align-center ga-3 w-100 pr-3"},
-                     "content": [
-                         _avatar("mdi-delete-clock-outline", "secondary", 36),
-                         {"component": "div", "props": {"class": "flex-grow-1", "style": "min-width:0"},
-                          "content": [
-                              {"component": "div", "props": {"class": "text-body-1 font-weight-medium"},
-                               "text": str(task.get("name") or task.get("id"))},
-                              {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-                               "text": f"删除于 {task.get('deleted_at') or '-'}"},
-                          ]},
-                         _chip(str(task.get("type") or "任务"), "secondary"),
-                     ]},
-                ]},
-                {"component": "VExpansionPanelText", "content": [
-                    _line("原任务 ID", str(task.get("id") or "-")),
-                    _line("已下载集数", episodes_text(parse_episodes(task.get("downloaded_episodes"))) or "-"),
-                    _button_row([
-                        _action("恢复任务", "mdi-restore", "success",
-                                f"plugin/{PLUGIN_ID}/trash/{task['id']}/restore"),
-                        _action("彻底删除", "mdi-delete-forever", "error",
-                                f"plugin/{PLUGIN_ID}/trash/{task['id']}/purge"),
-                    ]),
-                ]},
-            ],
-        })
-    return _page_card(
-        "回收站", "删除的任务可恢复或彻底删除；彻底删除后不再参与历史去重。最多显示最近 20 条。",
-        "mdi-delete-restore",
-        [
-            {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": panels},
-            _button_row([_action("清空回收站", "mdi-delete-sweep-outline", "error",
-                                 f"plugin/{PLUGIN_ID}/trash/purge")]),
-        ],
-        count=len(tasks),
-    )
-
-
-def _page_card(title: str, subtitle: str, icon: str, content: List[Dict[str, Any]],
-               count: Optional[int] = None) -> Dict[str, Any]:
-    heading = _section_heading(title, subtitle, icon)
-    if count is not None:
-        heading["content"].extend([{"component": "VSpacer"}, _chip(f"{count} 个", "primary")])
-    return {
-        "component": "VCard",
-        "props": {"variant": "flat", "rounded": "xl", "border": True, "class": "mb-4"},
-        "content": [{"component": "VCardText", "props": {"class": "pa-3 pa-sm-4"}, "content": [
-            heading,
-            {"component": "div", "props": {"class": "mt-3"}, "content": content},
-        ]}],
-    }
-
-
-def _section_heading(title: str, subtitle: str, icon: str) -> Dict[str, Any]:
-    return {
-        "component": "div", "props": {"class": "d-flex align-center ga-3"},
-        "content": [
-            _avatar(icon, "primary", 38),
-            {"component": "div", "props": {"style": "min-width:0"}, "content": [
-                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": title},
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-                 "text": subtitle},
-            ]},
-        ],
-    }
-
-
-def _activity_panel(title: str, subtitle: str, icon: str,
-                    content: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "component": "VExpansionPanel",
-        "content": [
-            {"component": "VExpansionPanelTitle", "content": [
-                {"component": "div", "props": {"class": "d-flex align-center ga-3 w-100 pr-3"},
-                 "content": [
-                     _avatar(icon, "primary", 34),
-                     {"component": "span", "props": {"class": "font-weight-medium"}, "text": title},
-                     {"component": "VSpacer"},
-                     _chip(subtitle, "secondary"),
-                 ]},
-            ]},
-            {"component": "VExpansionPanelText", "content": [content]},
-        ],
-    }
-
-
-def _detail_card(title: str, icon: str, content: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
-        "component": "VSheet",
-        "props": {"rounded": "lg", "border": True, "class": "pa-3 mb-3 h-100"},
-        "content": [
-            {"component": "div", "props": {"class": "d-flex align-center ga-2 mb-2"}, "content": [
-                _icon(icon, "text-primary"),
-                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium"},
-                 "text": title},
-            ]},
-            *content,
-        ],
-    }
-
-
-def _button_row(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-3"}, "content": actions}
-
-
-def _responsive_table(headers: List[str], desktop_rows: List[Dict[str, Any]],
-                      mobile_items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
-        "component": "div",
-        "content": [
-            {"component": "div", "props": {"class": "d-none d-md-block overflow-x-auto"}, "content": [{
-                "component": "VTable", "props": {"hover": True, "density": "comfortable"}, "content": [
-                    _table_header(headers), {"component": "tbody", "content": desktop_rows},
-                ],
-            }]},
-            {"component": "div", "props": {"class": "d-flex d-md-none flex-column ga-3"},
-             "content": mobile_items},
-        ],
-    }
-
-
-def _table_header(headers: List[str]) -> Dict[str, Any]:
-    return {"component": "thead", "content": [{"component": "tr", "content": [
-        {"component": "th", "props": {"class": "text-start text-no-wrap"}, "text": header}
-        for header in headers
-    ]}]}
-
-
-def _td(text: Any, class_name: str = "") -> Dict[str, Any]:
-    item = {"component": "td", "text": str(text if text is not None else "-")}
-    if class_name:
-        item["props"] = {"class": class_name}
-    return item
-
-
-def _chip_td(text: Any, color: str) -> Dict[str, Any]:
-    return {"component": "td", "props": {"class": "text-no-wrap"},
-            "content": [_chip(str(text), color)]}
-
-
-def _mobile_record(title: Any, subtitle: Any, chips: List[Dict[str, Any]],
-                   details: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
-        "component": "VSheet", "props": {"rounded": "lg", "border": True, "class": "pa-3"},
-        "content": [
-            {"component": "div", "props": {"class": "text-body-2 font-weight-medium",
-                                              "style": "word-break:break-word"}, "text": str(title)},
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
-             "text": str(subtitle)},
-            {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-3"}, "content": chips},
-            {"component": "div", "props": {"class": "mt-2"}, "content": details},
-        ],
-    }
-
-
-def _empty_state(icon: str, title: str, subtitle: str) -> Dict[str, Any]:
-    return {
-        "component": "div", "props": {"class": "d-flex flex-column align-center text-center py-8 ga-2"},
-        "content": [
-            _icon(icon, "text-disabled", 42),
-            {"component": "div", "props": {"class": "text-body-1 font-weight-medium"}, "text": title},
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-             "text": subtitle},
-        ],
-    }
-
-
-def _avatar(icon: str, color: str, size: int) -> Dict[str, Any]:
-    return {
-        "component": "VAvatar",
-        "props": {"variant": "tonal", "color": color, "rounded": "lg", "size": size,
-                  "class": "flex-shrink-0"},
-        "content": [_icon(icon, size=max(18, size // 2))],
-    }
-
-
-def _icon(icon: str, class_name: str = "", size: int = 18) -> Dict[str, Any]:
-    props: Dict[str, Any] = {"icon": icon, "size": size}
-    if class_name:
-        props["class"] = class_name
-    return {"component": "VIcon", "props": props}
-
-
-def _task_icon(task: Dict[str, Any]) -> str:
-    if task.get("status") == "completed":
-        return "mdi-check"
-    if task.get("status") == "running":
-        return "mdi-radar"
-    if task.get("status") == "error" or task.get("last_transfer_status") == "failed":
-        return "mdi-alert-circle-outline"
-    if not task.get("enabled"):
-        return "mdi-pause"
-    return "mdi-movie-search-outline" if task.get("type") == "电影" else "mdi-television-play"
-
-
-def _task_status_label(status: Any) -> str:
-    return {"active": "追更中", "paused": "已暂停", "running": "检查中", "completed": "已完成",
-            "error": "异常"}.get(str(status or ""), str(status or "未知"))
-
-
-def _transfer_status(task: Dict[str, Any]) -> str:
-    text = {
-        "waiting": "等待下载完成", "queued": "已加入整理队列", "completed": "整理完成",
-        "failed": "整理失败",
-    }.get(str(task.get("last_transfer_status") or ""), "尚无整理记录")
-    if task.get("last_transfer_message") and str(task.get("last_transfer_message")) != text:
-        text += f" · {task.get('last_transfer_message')}"
-    return text
-
-
-def _row(content: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {"component": "VRow", "props": {"dense": True}, "content": content}
-
-
-def _col(cols: int, md: int, child: Dict[str, Any]) -> Dict[str, Any]:
-    return {"component": "VCol", "props": {"cols": cols, "md": md}, "content": [child]}
-
-
-def _field(model: str, label: str, placeholder: str = "", hint: str = "") -> Dict[str, Any]:
-    props: Dict[str, Any] = {
-        "model": model, "label": label, "placeholder": placeholder,
-        "variant": "outlined", "density": "comfortable", "clearable": True,
-    }
-    if hint:
-        props.update({"hint": hint, "persistent-hint": True})
-    return {"component": "VTextField", "props": props}
-
-
-def _number(model: str, label: str, minimum: int, maximum: int,
-            hint: str = "") -> Dict[str, Any]:
-    props: Dict[str, Any] = {
-        "model": model, "label": label, "type": "number", "min": minimum, "max": maximum,
-        "variant": "outlined", "density": "comfortable",
-    }
-    if hint:
-        props.update({"hint": hint, "persistent-hint": True})
-    return {"component": "VTextField", "props": props}
-
-
-def _textarea(model: str, label: str, placeholder: str, hint: str = "") -> Dict[str, Any]:
-    props: Dict[str, Any] = {
-        "model": model, "label": label, "placeholder": placeholder, "rows": 3,
-        "auto-grow": True, "variant": "outlined", "density": "comfortable", "clearable": True,
-    }
-    if hint:
-        props.update({"hint": hint, "persistent-hint": True})
-    return {"component": "VTextarea", "props": props}
-
-
-def _select(model: str, label: str, items: List[Dict[str, Any]], hint: str = "",
-            multiple: bool = False) -> Dict[str, Any]:
-    props: Dict[str, Any] = {
-        "model": model, "label": label, "items": items, "variant": "outlined",
-        "density": "comfortable",
-    }
-    if multiple:
-        props.update({"multiple": True, "chips": True, "closable-chips": True, "clearable": True})
-    if hint:
-        props.update({"hint": hint, "persistent-hint": True})
-    return {"component": "VSelect", "props": props}
-
-
-def _switch(model: str, label: str, hint: str, color: str = "primary") -> Dict[str, Any]:
-    return {"component": "VSwitch", "props": {
-        "model": model, "label": label, "hint": hint, "persistent-hint": True,
-        "color": color, "density": "comfortable", "inset": True,
-    }}
-
-
-def _alert(alert_type: str, text: str) -> Dict[str, Any]:
-    return {"component": "VAlert", "props": {
-        "type": alert_type, "variant": "tonal", "density": "comfortable", "rounded": "lg",
-        "class": "mb-3",
-    }, "text": text}
-
-
-def _chip(text: str, color: str, icon: Optional[str] = None) -> Dict[str, Any]:
-    props: Dict[str, Any] = {"color": color, "size": "small", "variant": "tonal"}
-    if icon:
-        props["prepend-icon"] = icon
-    return {"component": "VChip", "props": props, "text": text}
-
-
-def _line(label: str, value: str) -> Dict[str, Any]:
-    return {"component": "div", "props": {"class": "d-flex align-start py-1 ga-2"}, "content": [
-        {"component": "div", "props": {
-            "class": "text-caption text-medium-emphasis flex-shrink-0", "style": "width:6.5em",
-        }, "text": label},
-        {"component": "div", "props": {
-            "class": "text-body-2 flex-grow-1", "style": "min-width:0;word-break:break-word",
-        }, "text": value},
-    ]}
-
-
-def _action(text: str, icon: str, color: str, api: str) -> Dict[str, Any]:
-    return {"component": "VBtn", "props": {"variant": "tonal", "color": color,
-                                                "prepend-icon": icon, "size": "small", "rounded": "lg",
-                                                "class": "text-none"}, "text": text,
-            "events": {"click": {"api": api, "method": "post"}}}
-
-
-def _status_color(status: Any) -> str:
-    return {"active": "success", "running": "primary", "completed": "info", "paused": "secondary",
-            "error": "error"}.get(str(status or ""), "secondary")

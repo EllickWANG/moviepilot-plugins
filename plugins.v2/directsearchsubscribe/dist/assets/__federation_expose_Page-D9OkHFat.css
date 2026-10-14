@@ -1,0 +1,37 @@
+
+.dss-search[data-v-4918e317] {
+  max-width: 320px;
+  flex: 1 1 240px;
+}
+.dss-task[data-v-4918e317] {
+  transition: border-color 0.2s ease;
+}
+.dss-task--running[data-v-4918e317] {
+  border-color: rgb(var(--v-theme-primary));
+}
+.dss-task--paused .dss-task__name[data-v-4918e317] {
+  opacity: 0.7;
+}
+.dss-task__body[data-v-4918e317] {
+  min-width: 240px;
+  flex-basis: 0;
+}
+.dss-task__message[data-v-4918e317] {
+  word-break: break-word;
+}
+.dss-task__actions[data-v-4918e317] {
+  margin-inline-start: auto;
+}
+.dss-progress[data-v-4918e317] {
+  max-width: 560px;
+}
+.lh-1[data-v-4918e317] {
+  line-height: 1.1;
+}
+@media (max-width: 959px) {
+.dss-task__actions[data-v-4918e317] {
+    width: 100%;
+    justify-content: flex-end;
+    margin-inline-start: 0;
+}
+}

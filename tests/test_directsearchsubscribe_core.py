@@ -179,6 +179,13 @@ class ArchitectureBoundaryTest(unittest.TestCase):
             current = ROOT / "plugins.v2" / "directsearchsubscribe" / filename
             compatible = ROOT / "plugins" / "directsearchsubscribe" / filename
             self.assertEqual(current.read_bytes(), compatible.read_bytes())
+        current_dist = ROOT / "plugins.v2" / "directsearchsubscribe" / "dist"
+        compatible_dist = ROOT / "plugins" / "directsearchsubscribe" / "dist"
+        current_files = sorted(path.relative_to(current_dist) for path in current_dist.rglob("*") if path.is_file())
+        compatible_files = sorted(path.relative_to(compatible_dist) for path in compatible_dist.rglob("*") if path.is_file())
+        self.assertEqual(current_files, compatible_files)
+        for relative in current_files:
+            self.assertEqual((current_dist / relative).read_bytes(), (compatible_dist / relative).read_bytes())
 
     def test_manifest_versions_match_plugin(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
@@ -224,29 +231,40 @@ class ArchitectureBoundaryTest(unittest.TestCase):
         self.assertIn("TransferHistoryOper().list_by_hash", source)
         self.assertIn("force=True", source)
 
-    def test_logs_full_pack_and_two_step_cleanup_are_exposed(self):
+    def test_logs_full_pack_and_cleanup_are_exposed(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('episodes=None 表示不做文件级选集', source)
         self.assertIn('"download_scope"] = "full_pack"', source)
         self.assertIn('/tasks/{task_id}/logs', source)
-        self.assertIn('/tasks/{task_id}/cleanup/prepare-files', source)
-        self.assertIn('/tasks/{task_id}/cleanup/confirm', source)
+        # 清理改为前端确认后一次执行，不再保留五分钟两步确认接口。
+        self.assertIn('"/tasks/{task_id}/cleanup"', source)
+        self.assertIn('delete_files = parse_bool((payload or {}).get("delete_files"), False)', source)
+        self.assertNotIn('cleanup/prepare', source)
         self.assertIn('delete_file=delete_files', source)
         self.assertIn('ignored_history_hashes', source)
         self.assertIn('_reconcile_transfer_records', source)
         self.assertIn('latest_by_source', source)
 
-    def test_page_uses_progressive_and_responsive_layout(self):
+    def test_ui_is_rendered_by_vue_federation(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
-        # 配置项、任务详情和诊断数据不再同时平铺在一个长页面中。
-        self.assertIn('"component": "VExpansionPanels"', source)
-        self.assertIn('"component": "VProgressLinear"', source)
-        self.assertIn('"4. 创建或更新任务"', source)
-        self.assertIn('本次保存时创建或更新上面的任务', source)
-        # 宽表只在桌面端显示，手机端使用信息卡片。
-        self.assertIn('d-none d-md-block overflow-x-auto', source)
-        self.assertIn('d-flex d-md-none flex-column', source)
-        self.assertIn('候选和运行原因默认收起', source)
+        # 页面与配置都交给联邦组件，后端只提供数据接口，不再拼 Vuetify JSON。
+        self.assertIn('return "vue", "dist/assets"', source)
+        self.assertIn('return None, self._settings_snapshot()', source)
+        self.assertIn('"/overview"', source)
+        self.assertIn('"/options"', source)
+        self.assertIn('def _task_view(', source)
+        self.assertNotIn('"component": "VExpansionPanels"', source)
+        self.assertNotIn('save_task_now', source)
+        dist = ROOT / "plugins.v2" / "directsearchsubscribe" / "dist" / "assets"
+        entry = (dist / "remoteEntry.js").read_text(encoding="utf-8")
+        self.assertIn("./Page", entry)
+        self.assertIn("./Config", entry)
+        # 宿主提供 vue/vuetify 单例，产物里不能带本地预览入口和共享副本。
+        self.assertFalse(list(dist.glob("index-*")))
+        self.assertFalse(list(dist.glob("__federation_shared_*")))
+        vite_config = (ROOT / "frontend" / "directsearchsubscribe" / "vite.config.js").read_text(encoding="utf-8")
+        self.assertIn("'./Page': './src/components/Page.vue'", vite_config)
+        self.assertIn("'./Config': './src/components/Config.vue'", vite_config)
 
     def test_scheduled_missing_repair_is_exposed_and_keeps_download_safety(self):
         source = (ROOT / "plugins.v2" / "directsearchsubscribe" / "__init__.py").read_text(encoding="utf-8")
