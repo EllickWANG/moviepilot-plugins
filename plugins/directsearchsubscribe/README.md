@@ -34,7 +34,7 @@
 - 未知集数下载默认关闭。开启后每个任务也只允许选择一个未知集数资源，避免同一季连续下载多个整包。
 - 电影任务每轮最多成功添加一个资源，不会因为“单次最多下载”大于 1 而重复选择多个版本。
 - 有限目标全部下载成功后任务会标记为已完成；不填总集数和指定集数时进入持续追更模式。
-- 删除任务会先进入插件回收站，可以在详情页恢复。
+- 删除任务会先进入插件回收站，可以在详情页恢复，也可以单条彻底删除或一键清空回收站；彻底删除后其下载记录不再参与历史去重。
 
 候选的标题、季、集数、包含/排除词、最低做种数、去重、选集、下载器返回值和整理结果都会写入插件自己的详细日志。日志不保存种子下载地址、Cookie 或 Passkey，详情页显示最近 100 条，每个任务最多保留 500 条。
 
@@ -99,6 +99,8 @@
 - `POST /plugin/directsearchsubscribe/tasks/{task_id}/cleanup/cancel`
 - `POST|DELETE /plugin/directsearchsubscribe/tasks/{task_id}/delete`
 - `POST /plugin/directsearchsubscribe/trash/{task_id}/restore`
+- `POST|DELETE /plugin/directsearchsubscribe/trash/{task_id}/purge`
+- `POST|DELETE /plugin/directsearchsubscribe/trash/purge`
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/results`
 - `GET /plugin/directsearchsubscribe/tasks/{task_id}/logs`
 - `POST /plugin/directsearchsubscribe/transfers/retry-failed`

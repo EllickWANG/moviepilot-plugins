@@ -79,7 +79,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.5.1"
+    plugin_version = "2.5.2"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -211,6 +211,8 @@ class directsearchsubscribe(_PluginBase):
                  ["POST"], "取消清理"),
             _api("/tasks/{task_id}/delete", self.api_delete_task, ["POST", "DELETE"], "移入回收站"),
             _api("/trash/{task_id}/restore", self.api_restore_task, ["POST"], "恢复直搜任务"),
+            _api("/trash/{task_id}/purge", self.api_purge_task, ["POST", "DELETE"], "彻底删除回收站任务"),
+            _api("/trash/purge", self.api_purge_trash, ["POST", "DELETE"], "清空回收站"),
             _api("/tasks/{task_id}/results", self.api_task_results, ["GET"], "查询最近候选"),
             _api("/tasks/{task_id}/logs", self.api_task_logs, ["GET"], "查询任务详细日志"),
             _api("/transfers/retry-failed", self.api_retry_failed_transfers, ["POST"], "重试失败整理"),
@@ -694,6 +696,25 @@ class directsearchsubscribe(_PluginBase):
             self._save_trash(trash)
             self._save_tasks(tasks)
         return schemas.Response(success=True, message="任务已恢复", data=task)
+
+    def api_purge_task(self, task_id: str) -> schemas.Response:
+        """彻底删除回收站中的任务；其下载记录之后不再参与历史去重。"""
+        with self.__class__._data_lock:
+            trash = self._load_trash()
+            task = trash.pop(task_id, None)
+            if not task:
+                return schemas.Response(success=False, message="回收站中没有该任务")
+            self._save_trash(trash)
+        return schemas.Response(success=True, message="任务已彻底删除", data=task)
+
+    def api_purge_trash(self) -> schemas.Response:
+        """清空回收站。"""
+        with self.__class__._data_lock:
+            count = len(self._load_trash())
+            if count:
+                self._save_trash({})
+        return schemas.Response(success=True, message=f"已清空回收站，彻底删除 {count} 个任务",
+                                data={"count": count})
 
     def api_task_results(self, task_id: str) -> schemas.Response:
         task = self._load_tasks().get(task_id)
@@ -3182,16 +3203,23 @@ def _trash_collection(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
                 {"component": "VExpansionPanelText", "content": [
                     _line("原任务 ID", str(task.get("id") or "-")),
                     _line("已下载集数", episodes_text(parse_episodes(task.get("downloaded_episodes"))) or "-"),
-                    _button_row([_action(
-                        "恢复任务", "mdi-restore", "success",
-                        f"plugin/{PLUGIN_ID}/trash/{task['id']}/restore",
-                    )]),
+                    _button_row([
+                        _action("恢复任务", "mdi-restore", "success",
+                                f"plugin/{PLUGIN_ID}/trash/{task['id']}/restore"),
+                        _action("彻底删除", "mdi-delete-forever", "error",
+                                f"plugin/{PLUGIN_ID}/trash/{task['id']}/purge"),
+                    ]),
                 ]},
             ],
         })
     return _page_card(
-        "回收站", "删除的任务可恢复，最多显示最近 20 条。", "mdi-delete-restore",
-        [{"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": panels}],
+        "回收站", "删除的任务可恢复或彻底删除；彻底删除后不再参与历史去重。最多显示最近 20 条。",
+        "mdi-delete-restore",
+        [
+            {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": panels},
+            _button_row([_action("清空回收站", "mdi-delete-sweep-outline", "error",
+                                 f"plugin/{PLUGIN_ID}/trash/purge")]),
+        ],
         count=len(tasks),
     )
 
