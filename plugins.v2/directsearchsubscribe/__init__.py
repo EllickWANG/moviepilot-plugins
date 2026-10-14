@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import re
 import threading
 from datetime import datetime, timedelta
@@ -18,7 +19,7 @@ from app.chain.download import DownloadChain
 from app.chain.mediaserver import MediaServerChain
 from app.chain.search import SearchChain
 from app.chain.storage import StorageChain
-from app.chain.transfer import JobManager, TransferChain
+from app.chain.transfer import TransferChain
 from app.core.config import global_vars, settings
 from app.core.context import Context, MediaInfo
 from app.core.event import Event as MPEvent, eventmanager
@@ -29,6 +30,13 @@ from app.db.transferhistory_oper import TransferHistoryOper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, MediaType, ModuleType, NotificationType
+
+# MoviePilot v3 把整理作业管理器移到了 application 层，app.chain.transfer 不再导出它，
+# 兼容层也没有为这个符号登记别名；v2 仍只能从旧路径取到。
+try:
+    from app.application.transfer.jobs import JobManager
+except ImportError:
+    from app.chain.transfer import JobManager
 
 from .core import (
     MAX_RESOURCE_HISTORY,
@@ -71,7 +79,7 @@ class directsearchsubscribe(_PluginBase):
     plugin_name = "直搜订阅"
     plugin_desc = "手工维护节目与集数，定时直搜站点；下载完成后按人工信息整理。"
     plugin_icon = "mdi-magnify-scan"
-    plugin_version = "2.5.0"
+    plugin_version = "2.5.1"
     plugin_author = "Ellick"
     plugin_order = 30
     auth_level = 1
@@ -473,14 +481,18 @@ class directsearchsubscribe(_PluginBase):
                 return
             cls._transfer_originals = {
                 "do_transfer": TransferChain.do_transfer,
+                # v2 与 v3 的 do_transfer 形参顺序不同，按真实签名解析位置参数下标。
+                "do_transfer_positions": _positional_indexes(TransferChain.do_transfer),
                 "handle_transfer": getattr(TransferChain, handle_name),
                 "job_media_id": JobManager.__dict__[media_id_name],
-                "history_media": TransferHistoryOper.get_by_type_tmdbid,
+                # v3 的整理历史 Oper 已没有 get_by_type_tmdbid，整理链也不再按 TMDB ID 回查标题。
+                "history_media": getattr(TransferHistoryOper, "get_by_type_tmdbid", None),
             }
             TransferChain.do_transfer = _patched_transfer_do_transfer
             setattr(TransferChain, handle_name, _patched_transfer_handle)
             setattr(JobManager, media_id_name, staticmethod(_patched_job_media_id))
-            TransferHistoryOper.get_by_type_tmdbid = _patched_transfer_history_media
+            if cls._transfer_originals["history_media"] is not None:
+                TransferHistoryOper.get_by_type_tmdbid = _patched_transfer_history_media
             cls._transfer_patched = True
             logger.info("直搜订阅已启用下载完成后的手工媒体信息整理")
 
@@ -499,7 +511,7 @@ class directsearchsubscribe(_PluginBase):
                 setattr(TransferChain, handle_name, originals["handle_transfer"])
             if getattr(JobManager, media_id_name) is _patched_job_media_id:
                 setattr(JobManager, media_id_name, originals["job_media_id"])
-            if TransferHistoryOper.get_by_type_tmdbid is _patched_transfer_history_media:
+            if getattr(TransferHistoryOper, "get_by_type_tmdbid", None) is _patched_transfer_history_media:
                 TransferHistoryOper.get_by_type_tmdbid = originals["history_media"]
             cls._transfer_originals = {}
             cls._transfer_patched = False
@@ -1988,15 +2000,35 @@ def _direct_transfer_task(download_hash: Optional[str], fileitem: Any = None) ->
     return _task_from_download_history(history, task_id)
 
 
-def _call_arg(args: List[Any], kwargs: Dict[str, Any], name: str, index: int) -> Any:
-    return args[index] if len(args) > index else kwargs.get(name)
+def _call_arg(args: List[Any], kwargs: Dict[str, Any], name: str, index: Optional[int]) -> Any:
+    if index is not None and len(args) > index:
+        return args[index]
+    return kwargs.get(name)
 
 
-def _set_call_arg(args: List[Any], kwargs: Dict[str, Any], name: str, index: int, value: Any):
-    if len(args) > index:
+def _set_call_arg(args: List[Any], kwargs: Dict[str, Any], name: str, index: Optional[int], value: Any):
+    if index is not None and len(args) > index:
         args[index] = value
     else:
         kwargs[name] = value
+
+
+def _positional_indexes(func: Any) -> Dict[str, int]:
+    """返回函数各形参的位置下标（不含 self），签名不可解析时返回空表。"""
+    try:
+        params = list(inspect.signature(func).parameters.values())
+    except (TypeError, ValueError):
+        return {}
+    indexes: Dict[str, int] = {}
+    position = 0
+    for param in params:
+        if param.kind not in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+            continue
+        if param.name in ("self", "cls"):
+            continue
+        indexes[param.name] = position
+        position += 1
+    return indexes
 
 
 def _record_episodes(task: Dict[str, Any], download_hash: Optional[str]) -> Set[int]:
@@ -2046,18 +2078,20 @@ def _prepare_manual_transfer_task(transfer_task: Any, direct_task: Dict[str, Any
 def _patched_transfer_do_transfer(self: TransferChain, *args, **kwargs):
     """在 MoviePilot 建立转移任务前为本插件下载注入手工媒体上下文。"""
     args_list = list(args)
-    fileitem = _call_arg(args_list, kwargs, "fileitem", 0)
-    download_hash = _call_arg(args_list, kwargs, "download_hash", 14)
+    originals = directsearchsubscribe._transfer_originals
+    positions = originals.get("do_transfer_positions") or {}
+    fileitem = _call_arg(args_list, kwargs, "fileitem", positions.get("fileitem", 0))
+    download_hash = _call_arg(args_list, kwargs, "download_hash", positions.get("download_hash"))
     direct_task = _direct_transfer_task(download_hash, fileitem)
-    original = directsearchsubscribe._transfer_originals["do_transfer"]
+    original = originals["do_transfer"]
     if not direct_task:
         return original(self, *args_list, **kwargs)
 
-    _set_call_arg(args_list, kwargs, "mediainfo", 2, _manual_media_info(direct_task))
-    _set_call_arg(args_list, kwargs, "scrape", 7, False)
+    _set_call_arg(args_list, kwargs, "mediainfo", positions.get("mediainfo"), _manual_media_info(direct_task))
+    _set_call_arg(args_list, kwargs, "scrape", positions.get("scrape"), False)
     season = parse_int(direct_task.get("season"), minimum=1)
     if season is not None:
-        _set_call_arg(args_list, kwargs, "season", 10, season)
+        _set_call_arg(args_list, kwargs, "season", positions.get("season"), season)
     result = original(self, *args_list, **kwargs)
     plugin = directsearchsubscribe._instance
     if plugin and download_hash:
