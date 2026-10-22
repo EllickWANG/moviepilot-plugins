@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.27"
+    plugin_version = "1.3.28"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -2149,10 +2149,11 @@ def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
     result = _test_site_rss_inner(site_id, repair=repair)
     # RSS 失败时，若系统站点管理记录站点最近连接失败（如站点维护），不判为 RSS 异常
     if result.get("state") == "error" and result.get("domain"):
-        offline_msg = _site_offline_message(_site_statistics().get(result["domain"]))
-        if offline_msg:
-            result["state"] = "offline"
-            result["message"] = f"{offline_msg}，RSS 结果不可信（{result.get('message') or '请求失败'}）"
+        site = SiteOper().get(site_id)
+        failure = _site_failure(site, _site_statistics().get(result["domain"])) if site else None
+        if failure:
+            result["state"] = failure[0]
+            result["message"] = f"{failure[1]}，RSS 结果不可信（{result.get('message') or '请求失败'}）"
     return result
 
 
@@ -2239,7 +2240,7 @@ def _check_userdata_health(site_ids: Optional[List[int]] = None) -> List[Dict[st
     statistics = _site_statistics()
     return [
         _userdata_health_result(site, latest_by_domain.get(site.domain or ""),
-                                offline_msg=_site_offline_message(statistics.get(site.domain or "")),
+                                failure=_site_failure(site, statistics.get(site.domain or "")),
                                 stale_days=sitetoolbox._userdata_stale_days)
         for site in sites
     ]
@@ -2267,17 +2268,52 @@ def _site_statistics() -> Dict[str, Any]:
         return {}
 
 
-def _site_offline_message(statistic: Any) -> Optional[str]:
+def _site_failure(site: Any, statistic: Any) -> Optional[Tuple[str, str]]:
     """
-    系统站点管理最后一次访问失败（lst_state=1）时返回说明，否则返回 None
+    系统站点管理最后一次访问失败（lst_state=1）时，用系统站点测试复测并按原因分类。
+    :return: (状态, 说明)；站点正常或复测已恢复时返回 None
     """
     if not statistic or getattr(statistic, "lst_state", None) != 1:
         return None
-    lst_mod_date = getattr(statistic, "lst_mod_date", None)
-    return f"站点连接失败（最后访问 {lst_mod_date}）" if lst_mod_date else "站点连接失败"
+    try:
+        from app.chain.site import SiteChain
+        ok, reason = SiteChain().test(site.url)
+    except Exception as err:
+        ok, reason = False, f"站点测试异常：{err}"
+    if ok:
+        return None
+    reason = str(reason or "").strip() or "未知原因"
+    # 站点维护时常跳转登录页，系统测试会误报 Cookie 失效，先识别维护提示页
+    maintenance = _site_maintenance_notice(site)
+    if maintenance:
+        return "offline", f"站点维护中（页面提示：{maintenance}）"
+    if "cookie" in reason.lower():
+        return "error", f"Cookie 已失效，请更新站点 Cookie（站点测试：{reason}）"
+    if "403" in reason:
+        return "offline", f"站点拒绝访问，可能被 Cloudflare 拦截或 Cookie 失效（站点测试：{reason}）"
+    return "offline", f"站点连接失败（站点测试：{reason}）"
 
 
-def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[str] = None,
+def _site_maintenance_notice(site: Any) -> Optional[str]:
+    """
+    抓取站点首页，识别简短的维护提示页，返回页面提示文字；不是维护页时返回 None
+    """
+    try:
+        res = RequestUtils(cookies=site.cookie, ua=site.ua or settings.USER_AGENT,
+                           timeout=site.timeout or 20,
+                           proxies=settings.PROXY if site.proxy else None).get_res(site.url, allow_redirects=True)
+    except Exception:
+        return None
+    if res is None or not res.text:
+        return None
+    text = re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", res.text))).strip()
+    # 只认短页面，避免正常页面里的公告误判
+    if len(text) > 500 or not re.search(r"维护|maintenance|升级中|暂停访问|closed", text, re.I):
+        return None
+    return text[:100]
+
+
+def _userdata_health_result(site: Any, data: Any = None, failure: Optional[Tuple[str, str]] = None,
                             stale_days: int = 2) -> Dict[str, Any]:
     issues: List[str] = []
     if not getattr(site, "is_active", True):
@@ -2288,8 +2324,8 @@ def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[s
             "site_id": getattr(site, "id", None),
             "site_name": getattr(site, "name", None) or "",
             "domain": getattr(site, "domain", None) or "",
-            "state": "offline" if offline_msg else "error",
-            "message": f"{offline_msg}，跳过用户数据判断" if offline_msg else "；".join(issues),
+            "state": failure[0] if failure else "error",
+            "message": f"{failure[1]}，跳过用户数据判断" if failure else "；".join(issues),
             "username": "",
             "user_level": "",
             "upload": 0,
@@ -2336,10 +2372,10 @@ def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[s
     elif issues:
         state = "warning"
     updated_at = _join_datetime(getattr(data, "updated_day", ""), getattr(data, "updated_time", ""))
-    if offline_msg:
-        # 站点连接失败（如维护）时，库里只有旧数据，不能当作正常，也不判为解析异常
-        state = "offline"
-        issues = [f"{offline_msg}，用户数据停留在 {updated_at or '-'}"]
+    if failure:
+        # 站点访问失败（维护、拦截、Cookie 失效）时，库里只有旧数据，不能当作正常，也不判为解析异常
+        state = failure[0]
+        issues = [f"{failure[1]}，用户数据停留在 {updated_at or '-'}"]
     else:
         updated_ts = _parse_datetime_ts(updated_at)
         if updated_ts and time.time() - updated_ts > stale_days * 86400:
