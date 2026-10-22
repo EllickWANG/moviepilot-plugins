@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.28"
+    plugin_version = "1.3.29"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -66,6 +66,8 @@ class sitetoolbox(_PluginBase):
     _userdata_stale_days = 2
     _mteam_auto_enabled = False
     _mteam_auto_cron = "0 9 * * *"
+    _rss_auto_enabled = True
+    _rss_auto_cron = "0 8 * * *"
     _latest_mteam_login_check: Dict[str, Any] = {}
 
     _patched = False
@@ -120,6 +122,8 @@ class sitetoolbox(_PluginBase):
         self._userdata_stale_days = _int_or_default(config.get("userdata_stale_days"), 2, minimum=1, maximum=365)
         self._mteam_auto_enabled = _to_bool(config.get("mteam_auto_enabled", False), False)
         self._mteam_auto_cron = str(config.get("mteam_auto_cron") or "0 9 * * *").strip()
+        self._rss_auto_enabled = _to_bool(config.get("rss_auto_enabled", True), True)
+        self._rss_auto_cron = str(config.get("rss_auto_cron") or "0 8 * * *").strip()
         self._latest_mteam_login_check = (
             config.get("latest_mteam_login_check")
             if isinstance(config.get("latest_mteam_login_check"), dict)
@@ -149,6 +153,8 @@ class sitetoolbox(_PluginBase):
         self.__class__._userdata_stale_days = self._userdata_stale_days
         self.__class__._mteam_auto_enabled = self._mteam_auto_enabled
         self.__class__._mteam_auto_cron = self._mteam_auto_cron
+        self.__class__._rss_auto_enabled = self._rss_auto_enabled
+        self.__class__._rss_auto_cron = self._rss_auto_cron
         self.__class__._latest_mteam_login_check = self._latest_mteam_login_check
         self.__class__._site_rules = _parse_site_config(self._site_conf)
         self.__class__._userdata_rules = [
@@ -214,6 +220,19 @@ class sitetoolbox(_PluginBase):
                     "name": "站点工具箱馒头登录检查",
                     "trigger": trigger,
                     "func": self.auto_check_mteam_login,
+                    "kwargs": {},
+                })
+        if self._rss_auto_enabled and self._rss_auto_cron and self._site_ids:
+            try:
+                trigger = CronTrigger.from_crontab(self._rss_auto_cron)
+            except Exception as err:
+                logger.error(f"站点工具箱 RSS 定时测试 cron 无效：{self._rss_auto_cron} - {err}")
+            else:
+                services.append({
+                    "id": "sitetoolbox_rss_test",
+                    "name": "站点工具箱 RSS 定时测试",
+                    "trigger": trigger,
+                    "func": self.auto_test_rss,
                     "kwargs": {},
                 })
         return services
@@ -482,6 +501,28 @@ class sitetoolbox(_PluginBase):
                                 }),
                             ],
                         },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "rss_auto_enabled",
+                                        "label": "定时测试 RSS",
+                                        "hint": "按周期测试已选站点的 RSS，只测试不修复，异常时发送系统消息",
+                                    },
+                                }),
+                                _col(12, 6, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "rss_auto_cron",
+                                        "label": "测试周期(cron)",
+                                        "placeholder": "0 8 * * *",
+                                        "hint": "默认每天 8 点测试",
+                                    },
+                                }),
+                            ],
+                        },
                     ]),
                     _form_section("站点适配", "补充或覆盖站点索引规则，并可启用用户数据解析修正。", [
                         {
@@ -611,6 +652,8 @@ class sitetoolbox(_PluginBase):
             "userdata_stale_days": 2,
             "mteam_auto_enabled": False,
             "mteam_auto_cron": "0 9 * * *",
+            "rss_auto_enabled": True,
+            "rss_auto_cron": "0 8 * * *",
             "latest_mteam_login_check": {},
         }
 
@@ -648,6 +691,8 @@ class sitetoolbox(_PluginBase):
             "userdata_stale_days": self._userdata_stale_days,
             "mteam_auto_enabled": self._mteam_auto_enabled,
             "mteam_auto_cron": self._mteam_auto_cron,
+            "rss_auto_enabled": self._rss_auto_enabled,
+            "rss_auto_cron": self._rss_auto_cron,
             "latest_mteam_login_check": self._latest_mteam_login_check,
         }
         payload.update(overrides)
@@ -762,6 +807,25 @@ class sitetoolbox(_PluginBase):
             )
         except Exception as err:
             self._set_job_state("missing_auto", name, "error", str(err), finished_at=_now())
+            raise
+
+    def auto_test_rss(self):
+        name = "RSS定时测试"
+        self._set_job_state("rss_test_auto", name, "running", "后台运行中", started_at=_now(), finished_at="")
+        try:
+            results = [_test_site_rss(site_id) for site_id in self._site_ids]
+            self._save_results(results)
+            ok_count = len([item for item in results if item.get("state") == "success"])
+            offline_count = len([item for item in results if item.get("state") == "offline"])
+            bad_count = len([item for item in results if item.get("state") in ("error", "warning")])
+            message = f"成功 {ok_count}/{len(results)}，异常 {bad_count}，站点连接失败 {offline_count}"
+            self._set_job_state("rss_test_auto", name, "success", message, finished_at=_now())
+            if bad_count:
+                self.systemmessage.put(f"RSS定时测试发现异常 {bad_count}/{len(results)}，请在站点工具箱查看。",
+                                       title=self.plugin_name)
+            logger.info(f"站点工具箱 RSS 定时测试完成：{message}")
+        except Exception as err:
+            self._set_job_state("rss_test_auto", name, "error", str(err), finished_at=_now())
             raise
 
     def auto_check_mteam_login(self):
