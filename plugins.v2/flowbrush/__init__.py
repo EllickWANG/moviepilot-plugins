@@ -16,8 +16,6 @@ from apscheduler.triggers.cron import CronTrigger
 from app import schemas
 from app.chain.torrents import TorrentsChain
 from app.core.config import settings
-from app.core.context import MediaInfo
-from app.core.metainfo import MetaInfo
 from app.db.site_oper import SiteOper
 from app.db.subscribe_oper import SubscribeOper
 from app.helper.downloader import DownloaderHelper
@@ -25,7 +23,7 @@ from app.log import logger
 from app.modules.qbittorrent import Qbittorrent
 from app.modules.transmission import Transmission
 from app.plugins import _PluginBase
-from app.schemas import NotificationType, TorrentInfo, MediaType, ServiceInfo
+from app.schemas import NotificationType, TorrentInfo, ServiceInfo
 from app.schemas.types import EventType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
@@ -266,7 +264,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.6"
+    plugin_version = "4.3.7"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -283,7 +281,6 @@ class FlowBrush(_PluginBase):
     # Brush任务是否启动
     _task_brush_enable = False
     # 订阅缓存信息
-    _subscribe_infos = None
     # Brush定时
     _brush_interval = 10
     # Check定时
@@ -2176,7 +2173,6 @@ class FlowBrush(_PluginBase):
                 # "site_proxy": torrent.site_proxy,
                 # "site_order": torrent.site_order,
                 "description": torrent.description,
-                "imdbid": torrent.imdbid,
                 # "enclosure": torrent.enclosure,
                 "page_url": torrent.page_url,
                 # "seeders": torrent.seeders,
@@ -3057,7 +3053,6 @@ class FlowBrush(_PluginBase):
             "size": torrent_info.get("total_size", 0),  # 假设total_size对应于size
             "pubdate": None,
             "description": None,
-            "imdbid": None,
             "page_url": None,
             "date_elapsed": None,
             "freedate": None,
@@ -3905,7 +3900,7 @@ class FlowBrush(_PluginBase):
 
     def __get_subscribe_titles(self) -> Set[str]:
         """
-        获取当前订阅的所有标题，返回一个不包含None和空白字符的集合
+        获取当前订阅的标题和搜索关键字，返回一个不包含None和空白字符的集合
         """
         brush_config = self.__get_brush_config()
         if not brush_config.except_subscribe:
@@ -3914,49 +3909,15 @@ class FlowBrush(_PluginBase):
 
         logger.info("已开启排除订阅，正在准备订阅标题匹配 ...")
 
-        if not self._subscribe_infos:
-            self._subscribe_infos = {}
-
-        subscribes = SubscribeOper().list()
-        if subscribes:
-            # 遍历订阅
-            for subscribe in subscribes:
-                # 判断当前订阅是否已经在缓存中，如果已经处理过，那么这里直接跳过
-                subscribe_key = f"{subscribe.id}_{subscribe.name}"
-                if subscribe_key in self._subscribe_infos:
-                    continue
-
-                subscribe_titles = [subscribe.name]
-                try:
-                    # 生成元数据
-                    meta = MetaInfo(subscribe.name)
-                    meta.year = subscribe.year
-                    meta.begin_season = subscribe.season or None
-                    meta.type = MediaType(subscribe.type)
-                    # 识别媒体信息
-                    mediainfo: MediaInfo = self.chain.recognize_media(meta=meta, mtype=meta.type,
-                                                                      tmdbid=subscribe.tmdbid,
-                                                                      doubanid=subscribe.doubanid,
-                                                                      cache=True)
-                    if mediainfo:
-                        logger.info(f"订阅 {subscribe.name} 已识别到媒体信息")
-                        logger.debug(f"subscribe {subscribe.name} {mediainfo.to_dict()}")
-                        subscribe_titles.extend(mediainfo.names)
-                        subscribe_titles = [title.strip() for title in subscribe_titles if title and title.strip()]
-                        self._subscribe_infos[subscribe_key] = subscribe_titles
-                    else:
-                        logger.info(f"订阅 {subscribe.name} 没有识别到媒体信息，跳过订阅标题匹配")
-                except Exception as e:
-                    logger.error(f"识别订阅 {subscribe.name} 媒体信息失败，错误详情: {e}")
-
-            # 移除不再存在的订阅
-            current_keys = {f"{subscribe.id}_{subscribe.name}" for subscribe in subscribes}
-            for key in set(self._subscribe_infos) - current_keys:
-                del self._subscribe_infos[key]
+        # 只使用订阅自带的标题和搜索关键字，不调用媒体识别
+        unique_titles = set()
+        for subscribe in SubscribeOper().list() or []:
+            for title in (subscribe.name, getattr(subscribe, "keyword", None)):
+                if title and str(title).strip():
+                    unique_titles.add(str(title).strip())
 
         logger.info("订阅标题匹配完成")
-        logger.debug(f"当前订阅的标题集合为：{self._subscribe_infos}")
-        unique_titles = {title for titles in self._subscribe_infos.values() for title in titles}
+        logger.debug(f"当前订阅的标题集合为：{unique_titles}")
         return unique_titles
 
     @staticmethod
