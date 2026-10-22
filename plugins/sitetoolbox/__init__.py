@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.24"
+    plugin_version = "1.3.25"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1042,7 +1042,8 @@ def _api_test_selected_rss(payload: Optional[dict] = Body(default=None)) -> sche
         results = [_test_site_rss(site_id) for site_id in site_ids]
         plugin._save_results(results)
         ok_count = len([item for item in results if item.get("state") == "success"])
-        return f"RSS测试完成：成功 {ok_count}/{len(results)}"
+        offline_count = len([item for item in results if item.get("state") == "offline"])
+        return f"RSS测试完成：成功 {ok_count}/{len(results)}，站点连接失败 {offline_count}"
 
     return plugin._start_background_job("rss_test", "RSS测试", worker)
 
@@ -1102,8 +1103,9 @@ def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas
     def worker() -> str:
         results = _check_userdata_health(site_ids=site_ids)
         plugin._save_userdata_results(results)
-        bad_count = len([item for item in results if item.get("state") != "success"])
-        return f"用户数据检查完成：异常 {bad_count}/{len(results)}"
+        bad_count = len([item for item in results if item.get("state") in ("error", "warning")])
+        offline_count = len([item for item in results if item.get("state") == "offline"])
+        return f"用户数据检查完成：异常 {bad_count}/{len(results)}，站点连接失败 {offline_count}"
 
     return plugin._start_background_job("userdata_check", "用户数据检查", worker)
 
@@ -2091,6 +2093,17 @@ def _cleanup_result_rows(items: List[Dict[str, Any]], state: str, message: str) 
 
 
 def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
+    result = _test_site_rss_inner(site_id, repair=repair)
+    # RSS 失败时，若系统站点管理记录站点最近连接失败（如站点维护），不判为 RSS 异常
+    if result.get("state") == "error" and result.get("domain"):
+        offline_msg = _site_offline_message(_site_statistics().get(result["domain"]))
+        if offline_msg:
+            result["state"] = "offline"
+            result["message"] = f"{offline_msg}，RSS 结果不可信（{result.get('message') or '请求失败'}）"
+    return result
+
+
+def _test_site_rss_inner(site_id: int, repair: bool = False) -> Dict[str, Any]:
     start = time.monotonic()
     site = SiteOper().get(site_id)
     if not site:
@@ -2170,10 +2183,47 @@ def _check_userdata_health(site_ids: Optional[List[int]] = None) -> List[Dict[st
         if domain:
             latest_by_domain[domain] = data
 
-    return [_userdata_health_result(site, latest_by_domain.get(site.domain or "")) for site in sites]
+    statistics = _site_statistics()
+    return [
+        _userdata_health_result(site, latest_by_domain.get(site.domain or ""),
+                                offline_msg=_site_offline_message(statistics.get(site.domain or "")))
+        for site in sites
+    ]
 
 
-def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
+def _site_statistics() -> Dict[str, Any]:
+    """
+    读取系统站点管理的连接统计，按域名索引；读取失败时返回空字典，不影响原有判断
+    """
+    try:
+        from app.db.models.sitestatistic import SiteStatistic
+        try:
+            # v3
+            from app.db.session import SessionFactory
+        except ImportError:
+            # v2
+            from app.db import SessionFactory
+        db = SessionFactory()
+        try:
+            return {item.domain: item for item in db.query(SiteStatistic).all() if item.domain}
+        finally:
+            db.close()
+    except Exception as err:
+        logger.warning(f"读取站点连接统计失败：{err}")
+        return {}
+
+
+def _site_offline_message(statistic: Any) -> Optional[str]:
+    """
+    系统站点管理最后一次访问失败（lst_state=1）时返回说明，否则返回 None
+    """
+    if not statistic or getattr(statistic, "lst_state", None) != 1:
+        return None
+    lst_mod_date = getattr(statistic, "lst_mod_date", None)
+    return f"站点连接失败（最后访问 {lst_mod_date}）" if lst_mod_date else "站点连接失败"
+
+
+def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[str] = None) -> Dict[str, Any]:
     issues: List[str] = []
     if not getattr(site, "is_active", True):
         issues.append("站点未启用")
@@ -2183,8 +2233,8 @@ def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
             "site_id": getattr(site, "id", None),
             "site_name": getattr(site, "name", None) or "",
             "domain": getattr(site, "domain", None) or "",
-            "state": "error",
-            "message": "；".join(issues),
+            "state": "offline" if offline_msg else "error",
+            "message": f"{offline_msg}，跳过用户数据判断" if offline_msg else "；".join(issues),
             "username": "",
             "user_level": "",
             "upload": 0,
@@ -2230,6 +2280,10 @@ def _userdata_health_result(site: Any, data: Any = None) -> Dict[str, Any]:
         state = "error"
     elif issues:
         state = "warning"
+    if offline_msg and state != "success":
+        # 站点连接失败时拿不到用户数据属于预期，不判为用户数据异常
+        state = "offline"
+        issues = [f"{offline_msg}，跳过用户数据判断"]
 
     return {
         "site_id": getattr(site, "id", None),
@@ -3887,6 +3941,7 @@ def _state_text(state: Optional[str]) -> str:
         "success": "正常",
         "warning": "警告",
         "error": "异常",
+        "offline": "连接失败",
     }.get(state or "", state or "-")
 
 
