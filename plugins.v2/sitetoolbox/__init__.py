@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.26"
+    plugin_version = "1.3.27"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -267,6 +267,14 @@ class sitetoolbox(_PluginBase):
                 "auth": "bear",
                 "summary": "诊断站点索引器",
                 "description": "分步报告索引器定义、同步/异步抓取和蜘蛛解析结果，定位搜索/刷流拿不到种子的问题。",
+            },
+            {
+                "path": "/probe/page/{site_id}",
+                "endpoint": _api_probe_page,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "诊断站点页面",
+                "description": "在服务器上用站点 Cookie/UA/代理抓取站点域名下的页面并返回 HTML，用于排查用户数据解析规则。",
             },
             {
                 "path": "/probe/logfile",
@@ -1422,6 +1430,34 @@ def _api_probe_indexer(site_id: int, steps: Optional[str] = None) -> schemas.Res
         report["spider_live"] = {"error": f"{type(err).__name__}: {err}"}
 
     return schemas.Response(success=True, data=report)
+
+
+def _api_probe_page(site_id: int, path: Optional[str] = None, max_length: Optional[int] = 300000) -> schemas.Response:
+    """
+    诊断站点页面：只允许访问站点自身域名，返回状态和 HTML（截断到 max_length）。
+    """
+    site = SiteOper().get(site_id)
+    if not site or not site.url:
+        return schemas.Response(success=False, message=f"站点 {site_id} 不存在或地址为空")
+    target = urljoin(site.url if site.url.endswith("/") else f"{site.url}/", (path or "").lstrip("/"))
+    if StringUtils.get_url_domain(target) != StringUtils.get_url_domain(site.url):
+        return schemas.Response(success=False, message="只允许访问站点自身域名")
+    try:
+        res = RequestUtils(cookies=site.cookie, ua=site.ua or settings.USER_AGENT,
+                           timeout=site.timeout or 20,
+                           proxies=settings.PROXY if site.proxy else None).get_res(target, allow_redirects=True)
+    except Exception as err:
+        return schemas.Response(success=False, message=f"{type(err).__name__}: {err}")
+    if res is None:
+        return schemas.Response(success=False, message="无响应")
+    text = res.text or ""
+    limit = _int_or_default(max_length, 300000, minimum=1000, maximum=2000000)
+    return schemas.Response(success=True, data={
+        "status": res.status_code,
+        "final_url": str(getattr(res, "url", "") or ""),
+        "length": len(text),
+        "html": text[:limit],
+    })
 
 
 def _api_probe_logfile(logfile: str, keyword: Optional[str] = None,
