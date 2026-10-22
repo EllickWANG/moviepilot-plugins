@@ -36,7 +36,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.25"
+    plugin_version = "1.3.26"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -63,6 +63,7 @@ class sitetoolbox(_PluginBase):
     _error_retention_days = 3
     _mteam_site_ids: List[int] = []
     _mteam_warning_days = 25
+    _userdata_stale_days = 2
     _mteam_auto_enabled = False
     _mteam_auto_cron = "0 9 * * *"
     _latest_mteam_login_check: Dict[str, Any] = {}
@@ -116,6 +117,7 @@ class sitetoolbox(_PluginBase):
         self._error_retention_days = _normalize_retention_days(config.get("error_retention_days"))
         self._mteam_site_ids = _int_list(config.get("mteam_site_ids"))
         self._mteam_warning_days = _int_or_default(config.get("mteam_warning_days"), 25, minimum=1, maximum=365)
+        self._userdata_stale_days = _int_or_default(config.get("userdata_stale_days"), 2, minimum=1, maximum=365)
         self._mteam_auto_enabled = _to_bool(config.get("mteam_auto_enabled", False), False)
         self._mteam_auto_cron = str(config.get("mteam_auto_cron") or "0 9 * * *").strip()
         self._latest_mteam_login_check = (
@@ -144,6 +146,7 @@ class sitetoolbox(_PluginBase):
         self.__class__._error_retention_days = self._error_retention_days
         self.__class__._mteam_site_ids = self._mteam_site_ids
         self.__class__._mteam_warning_days = self._mteam_warning_days
+        self.__class__._userdata_stale_days = self._userdata_stale_days
         self.__class__._mteam_auto_enabled = self._mteam_auto_enabled
         self.__class__._mteam_auto_cron = self._mteam_auto_cron
         self.__class__._latest_mteam_login_check = self._latest_mteam_login_check
@@ -484,7 +487,19 @@ class sitetoolbox(_PluginBase):
                                         "hint": "只修正账号数据字段，不参与做种数和做种体积完整性判断",
                                     },
                                 }),
-                                _col(12, 8, {
+                                _col(12, 3, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "userdata_stale_days",
+                                        "label": "用户数据过期天数",
+                                        "type": "number",
+                                        "min": 1,
+                                        "max": 365,
+                                        "hint": "超过该天数未更新的用户数据标记为警告",
+                                        "persistent-hint": True,
+                                    },
+                                }),
+                                _col(12, 5, {
                                     "component": "VAlert",
                                     "props": {
                                         "type": "info",
@@ -585,6 +600,7 @@ class sitetoolbox(_PluginBase):
             "error_retention_days": 3,
             "mteam_site_ids": [],
             "mteam_warning_days": 25,
+            "userdata_stale_days": 2,
             "mteam_auto_enabled": False,
             "mteam_auto_cron": "0 9 * * *",
             "latest_mteam_login_check": {},
@@ -621,6 +637,7 @@ class sitetoolbox(_PluginBase):
             "error_retention_days": self._error_retention_days,
             "mteam_site_ids": self._mteam_site_ids,
             "mteam_warning_days": self._mteam_warning_days,
+            "userdata_stale_days": self._userdata_stale_days,
             "mteam_auto_enabled": self._mteam_auto_enabled,
             "mteam_auto_cron": self._mteam_auto_cron,
             "latest_mteam_login_check": self._latest_mteam_login_check,
@@ -2186,7 +2203,8 @@ def _check_userdata_health(site_ids: Optional[List[int]] = None) -> List[Dict[st
     statistics = _site_statistics()
     return [
         _userdata_health_result(site, latest_by_domain.get(site.domain or ""),
-                                offline_msg=_site_offline_message(statistics.get(site.domain or "")))
+                                offline_msg=_site_offline_message(statistics.get(site.domain or "")),
+                                stale_days=sitetoolbox._userdata_stale_days)
         for site in sites
     ]
 
@@ -2223,7 +2241,8 @@ def _site_offline_message(statistic: Any) -> Optional[str]:
     return f"站点连接失败（最后访问 {lst_mod_date}）" if lst_mod_date else "站点连接失败"
 
 
-def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[str] = None) -> Dict[str, Any]:
+def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[str] = None,
+                            stale_days: int = 2) -> Dict[str, Any]:
     issues: List[str] = []
     if not getattr(site, "is_active", True):
         issues.append("站点未启用")
@@ -2280,10 +2299,17 @@ def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[s
         state = "error"
     elif issues:
         state = "warning"
-    if offline_msg and state != "success":
-        # 站点连接失败时拿不到用户数据属于预期，不判为用户数据异常
+    updated_at = _join_datetime(getattr(data, "updated_day", ""), getattr(data, "updated_time", ""))
+    if offline_msg:
+        # 站点连接失败（如维护）时，库里只有旧数据，不能当作正常，也不判为解析异常
         state = "offline"
-        issues = [f"{offline_msg}，跳过用户数据判断"]
+        issues = [f"{offline_msg}，用户数据停留在 {updated_at or '-'}"]
+    else:
+        updated_ts = _parse_datetime_ts(updated_at)
+        if updated_ts and time.time() - updated_ts > stale_days * 86400:
+            issues.append(f"用户数据已过期（{updated_at}，超过 {stale_days} 天未更新）")
+            if state == "success":
+                state = "warning"
 
     return {
         "site_id": getattr(site, "id", None),
@@ -2300,7 +2326,7 @@ def _userdata_health_result(site: Any, data: Any = None, offline_msg: Optional[s
         "seeding": seeding,
         "seeding_size": seeding_size,
         "leeching": leeching,
-        "updated_at": _join_datetime(getattr(data, "updated_day", ""), getattr(data, "updated_time", "")),
+        "updated_at": updated_at,
         "adapted": _site_has_rule(getattr(site, "domain", "")),
     }
 
