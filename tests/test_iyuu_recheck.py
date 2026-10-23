@@ -41,6 +41,7 @@ def load_plugin():
         "app.plugins.iyuuautoseedplus.qb_query": {
             "QbQueryClient": QUERY.QbQueryClient, "qb_recheck_state": QUERY.qb_recheck_state,
             "query_error_message": QUERY.query_error_message,
+            "probe_network": QUERY.probe_network,
         },
         "app.schemas": {"ServiceInfo": object, "NotificationType": Mock(), "Response": types.SimpleNamespace},
         "app.schemas.types": {"EventType": Mock()},
@@ -328,6 +329,47 @@ class RecheckTest(unittest.TestCase):
             self.assertNotEqual(QUERY.qb_recheck_state({"state": state, "progress": 1})[0], "ready")
         self.assertNotEqual(QUERY.qb_recheck_state({"state": "pausedUP", "progress": 0.5})[0], "ready")
         self.assertEqual(QUERY.qb_recheck_state({"state": "stoppedUP", "progress": 1})[0], "ready")
+
+
+class NetworkProbeTest(unittest.TestCase):
+    def test_probes_one_address_per_family_and_never_returns_proxy_credentials(self):
+        import socket
+        source = types.SimpleNamespace(_http_session=types.SimpleNamespace(trust_env=True), _REQUESTS_ARGS={})
+        ipv4, ipv6 = Mock(), Mock()
+        ipv4.__enter__ = Mock(return_value=ipv4)
+        ipv4.__exit__ = Mock(return_value=False)
+        ipv6.__enter__ = Mock(return_value=ipv6)
+        ipv6.__exit__ = Mock(return_value=False)
+        ipv6.connect.side_effect = OSError("network unreachable")
+        tls = Mock()
+        tls.__enter__ = Mock(return_value=tls)
+        tls.__exit__ = Mock(return_value=False)
+        tls.version.return_value = "TLSv1.3"
+        addresses = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.1", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.2", 443)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0)),
+        ]
+        with patch("socket.getaddrinfo", return_value=addresses), \
+                patch("socket.socket", side_effect=[ipv4, ipv6]) as sockets, \
+                patch("ssl.create_default_context") as context, \
+                patch("requests.utils.get_environ_proxies", return_value={"https": "http://secret:password@proxy"}):
+            context.return_value.wrap_socket.return_value = tls
+            result = QUERY.probe_network(source, {"host": "https://qb.example"})
+        self.assertEqual(sockets.call_count, 2)
+        self.assertTrue(result["connections"][0]["tls"])
+        self.assertIn("error", result["connections"][1])
+        self.assertTrue(result["environment_proxy"])
+        self.assertNotIn("secret", str(result))
+        context.return_value.wrap_socket.assert_called_once_with(ipv4, server_hostname="qb.example")
+
+    def test_dns_failure_returns_diagnostic_instead_of_crashing(self):
+        source = types.SimpleNamespace(_http_session=None, _REQUESTS_ARGS={})
+        with patch("socket.getaddrinfo", side_effect=OSError("DNS failure")), \
+                patch("requests.utils.get_environ_proxies", return_value={}):
+            result = QUERY.probe_network(source, {"host": "https://qb.example"})
+        self.assertIn("dns_error", result)
+        self.assertEqual(result["connections"], [])
 
 
 if __name__ == "__main__":

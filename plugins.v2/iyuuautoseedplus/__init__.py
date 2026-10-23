@@ -22,7 +22,7 @@ from app.helper.torrent import TorrentHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.plugins.iyuuautoseedplus.iyuu_helper import IyuuHelper
-from app.plugins.iyuuautoseedplus.qb_query import QbQueryClient, qb_recheck_state, query_error_message
+from app.plugins.iyuuautoseedplus.qb_query import QbQueryClient, qb_recheck_state, query_error_message, probe_network
 from app.schemas import NotificationType, ServiceInfo, Response
 from app.schemas.types import EventType
 from app.utils.http import RequestUtils
@@ -152,7 +152,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.14"
+    plugin_version = "2.15.15"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -402,7 +402,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "summary": "只读检查辅种下载器查询连接",
         }]
 
-    def diagnose_downloader(self, downloader: str) -> Response:
+    def diagnose_downloader(self, downloader: str, network: bool = False) -> Response:
         """对比宿主与辅种独立会话，仅查询一条记录，不改变种子状态。"""
         if downloader not in set(self._downloaders + [self._auto_downloader]):
             return Response(success=False, message="下载器未在辅种配置中启用")
@@ -429,13 +429,16 @@ class IYUUAutoSeedPlus(_PluginBase):
                 runtime[package] = version(package)
             except PackageNotFoundError:
                 runtime[package] = "unknown"
-        return Response(success=True, data={
+        report = {
             "version": self.plugin_version, "downloader": downloader, "core": core,
             "iyuu": self._last_queries.get(downloader),
             "pending_count": len(self._recheck_torrents.get(downloader) or []),
             "certificate_verification": getattr(qbc, "_VERIFY_WEBUI_CERTIFICATE", True),
             "runtime": runtime,
-        })
+        }
+        if network:
+            report["network"] = probe_network(qbc, getattr(service.config, "config", {}) or {})
+        return Response(success=True, data=report)
 
     def get_service(self) -> List[Dict[str, Any]]:
         """

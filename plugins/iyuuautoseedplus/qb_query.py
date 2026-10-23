@@ -122,3 +122,54 @@ def qb_recheck_state(torrent):
     if state in {"pausedDL", "stoppedDL"}:
         return "blocked", "文件未完整匹配，不能自动启动；请检查路径、文件大小或手动校验"
     return "waiting", "等待文件完整且校验结束"
+
+
+def probe_network(source, config):
+    """仅探测已配置下载器的 DNS、直连 TCP/TLS，不发送认证或操作请求。"""
+    import socket
+    import ssl
+    from urllib.parse import urlparse
+    from requests.utils import get_environ_proxies
+
+    host = config.get("host") or source.host
+    target = urlparse(host if "://" in host else f"http://{host}")
+    port = config.get("port") or target.port or (443 if target.scheme == "https" else 80)
+    session = getattr(source, "_http_session", None)
+    trust_env = getattr(session, "trust_env", True)
+    proxies = get_environ_proxies(host) if trust_env else {}
+    explicit = (getattr(source, "_REQUESTS_ARGS", None) or {}).get("proxies") or {}
+    report = {
+        "host": target.hostname, "port": port, "mode": "direct", "trust_env": trust_env,
+        "environment_proxy": any(proxies.get(key) for key in ("http", "https", "all")),
+        "explicit_proxy": any(explicit.get(key) for key in ("http", "https", "all")),
+        "connections": [],
+    }
+    started = monotonic()
+    try:
+        addresses = socket.getaddrinfo(target.hostname, port, type=socket.SOCK_STREAM)
+    except Exception as error:
+        report.update(dns_error=query_error_message(error), dns_elapsed=round(monotonic() - started, 3))
+        return report
+    report.update(dns_elapsed=round(monotonic() - started, 3),
+                  addresses=list(dict.fromkeys(item[4][0] for item in addresses))[:8])
+    seen = set()
+    for family, socktype, protocol, _, address in addresses:
+        if family in seen or family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        seen.add(family)
+        result = {"family": "IPv6" if family == socket.AF_INET6 else "IPv4", "address": address[0]}
+        started = monotonic()
+        try:
+            with socket.socket(family, socktype, protocol) as connection:
+                connection.settimeout(3)
+                connection.connect(address)
+                result.update(tcp=True, tcp_elapsed=round(monotonic() - started, 3))
+                if target.scheme == "https":
+                    # 该诊断始终验证证书，不修改应用客户端已有设置。
+                    started = monotonic()
+                    with ssl.create_default_context().wrap_socket(connection, server_hostname=target.hostname) as tls:
+                        result.update(tls=True, tls_elapsed=round(monotonic() - started, 3), protocol=tls.version())
+        except Exception as error:
+            result.update(error=query_error_message(error), elapsed=round(monotonic() - started, 3))
+        report["connections"].append(result)
+    return report
