@@ -67,7 +67,7 @@ class QbQueryClient:
             finally:
                 self._lock.release()
 
-    def query(self, ids=None, status=None, limit=None):
+    def query(self, ids=None, status=None, limit=None, tag=None):
         from qbittorrentapi import APIConnectionError
         from requests.exceptions import ConnectionError, Timeout
 
@@ -84,7 +84,7 @@ class QbQueryClient:
                         if self._client is None:
                             self._client = self._new_client()
                         rows = self._client.torrents_info(
-                            torrent_hashes=ids, status_filter=status, limit=limit,
+                            torrent_hashes=ids, status_filter=status, limit=limit, tag=tag,
                             requests_args={"timeout": (min(self.timeout, 15), self.timeout)},
                         )
                         # 非列表响应不能当成“种子已不存在”来清空队列。

@@ -189,6 +189,9 @@ class RecheckTest(unittest.TestCase):
         self.plugin._query_clients_lock = threading.RLock()
         self.plugin._query_clients = {}
         self.plugin._last_queries = {}
+        self.plugin._event = Mock()
+        self.plugin._event.is_set.return_value = False
+        self.plugin._event.wait.return_value = False
         self.server = Mock()
         self.server.start_torrents.return_value = True
         self.service = types.SimpleNamespace(name="qb", type="qbittorrent", instance=self.server)
@@ -304,7 +307,7 @@ class RecheckTest(unittest.TestCase):
             result = self.plugin.diagnose_downloader("qb")
         self.assertTrue(result.data["core"]["success"])
         self.assertTrue(result.data["iyuu"]["success"])
-        isolated.query.assert_called_once_with(ids=None, status=None, limit=1)
+        isolated.query.assert_called_once_with(ids=None, status=None, limit=1, tag=None)
         self.server.start_torrents.assert_not_called()
         self.server.add_torrent.assert_not_called()
         self.server.delete_torrents.assert_not_called()
@@ -369,6 +372,31 @@ class RecheckTest(unittest.TestCase):
             self.assertNotEqual(QUERY.qb_recheck_state({"state": state, "progress": 1})[0], "ready")
         self.assertNotEqual(QUERY.qb_recheck_state({"state": "pausedUP", "progress": 0.5})[0], "ready")
         self.assertEqual(QUERY.qb_recheck_state({"state": "stoppedUP", "progress": 1})[0], "ready")
+
+    def test_legacy_added_hash_lookup_uses_isolated_query_and_checks_exact_tag(self):
+        self.fetch.return_value = [{"hash": "a", "tags": "other, unique-tag"}], False
+        self.assertEqual(self.plugin._IYUUAutoSeedPlus__find_added_torrent(self.service, "unique-tag"), "a")
+        self.fetch.assert_called_once_with(self.service, tag="unique-tag", limit=2)
+        self.server.get_torrent_id_by_tag.assert_not_called()
+
+    def test_legacy_added_hash_lookup_waits_for_qb_metadata(self):
+        self.fetch.side_effect = [([], False), ([{"hash": "a", "tags": "unique-tag"}], False)]
+        self.assertEqual(self.plugin._IYUUAutoSeedPlus__find_added_torrent(self.service, "unique-tag"), "a")
+        self.plugin._event.wait.assert_called_once_with(3)
+
+    def test_legacy_hash_lookup_does_not_guess_after_query_failure_or_tag_collision(self):
+        for response in [([], True), ([{"hash": "a", "tags": "tag"}, {"hash": "b", "tags": "tag"}], False)]:
+            self.fetch.return_value = response
+            self.assertIsNone(self.plugin._IYUUAutoSeedPlus__find_added_torrent(self.service, "tag"))
+
+    def test_legacy_hash_lookup_is_bounded_and_can_be_cancelled(self):
+        self.fetch.return_value = [{"hash": "a", "tags": "different-tag"}], False
+        self.assertIsNone(self.plugin._IYUUAutoSeedPlus__find_added_torrent(self.service, "tag"))
+        self.assertEqual(self.fetch.call_count, 9)
+        self.plugin._event.is_set.return_value = True
+        self.fetch.reset_mock()
+        self.assertIsNone(self.plugin._IYUUAutoSeedPlus__find_added_torrent(self.service, "tag"))
+        self.fetch.assert_not_called()
 
 
 class NetworkProbeTest(unittest.TestCase):
