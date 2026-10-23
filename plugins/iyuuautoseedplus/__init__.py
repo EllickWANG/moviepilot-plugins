@@ -1,7 +1,9 @@
 import os
 import re
+from collections.abc import Sequence
 from datetime import datetime, timedelta
-from threading import Event
+from threading import Event, RLock
+from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -20,7 +22,8 @@ from app.helper.torrent import TorrentHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.plugins.iyuuautoseedplus.iyuu_helper import IyuuHelper
-from app.schemas import NotificationType, ServiceInfo
+from app.plugins.iyuuautoseedplus.qb_query import QbQueryClient, qb_recheck_state, query_error_message
+from app.schemas import NotificationType, ServiceInfo, Response
 from app.schemas.types import EventType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
@@ -149,7 +152,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.13"
+    plugin_version = "2.15.14"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -230,6 +233,14 @@ class IYUUAutoSeedPlus(_PluginBase):
         self.stop_service()
         self._event = Event()
         self._applied_downloader_timeouts = {}
+        self._query_clients = {}
+        self._query_clients_lock = RLock()
+        self._last_queries = {}
+        self._recheck_messages = {}
+        self._recheck_lock = RLock()
+        self._recheck_queue_lock = RLock()
+        if "_recheck_torrents" not in self.__dict__:
+            self._recheck_torrents = {}
 
         # 启动定时任务 & 立即运行一次
         if self.get_state() or self._onlyonce:
@@ -362,7 +373,6 @@ class IYUUAutoSeedPlus(_PluginBase):
         服务信息
         """
         if not self._auto_downloader:
-            logger.debug("尚未配置主辅分离下载器，辅种不分离")
             return None
 
         service = DownloaderHelper().get_service(name=self._auto_downloader)
@@ -384,7 +394,48 @@ class IYUUAutoSeedPlus(_PluginBase):
         pass
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return [{
+            "path": "/diagnose/downloader",
+            "endpoint": self.diagnose_downloader,
+            "methods": ["GET"],
+            "auth": "bear",
+            "summary": "只读检查辅种下载器查询连接",
+        }]
+
+    def diagnose_downloader(self, downloader: str) -> Response:
+        """对比宿主与辅种独立会话，仅查询一条记录，不改变种子状态。"""
+        if downloader not in set(self._downloaders + [self._auto_downloader]):
+            return Response(success=False, message="下载器未在辅种配置中启用")
+        service = DownloaderHelper().get_service(name=downloader)
+        qbc = getattr(getattr(service, "instance", None), "qbc", None)
+        if not service or service.type != "qbittorrent" or not qbc:
+            return Response(success=False, message="未找到已连接的 qBittorrent 下载器")
+        started = monotonic()
+        core = {}
+        try:
+            rows = qbc.torrents_info(limit=1, requests_args={"timeout": (10, 15)})
+            valid = isinstance(rows, Sequence) and not isinstance(rows, (str, bytes))
+            core = {"success": valid, "count": len(rows) if valid else 0}
+        except Exception as error:
+            core = {"success": False, "error": query_error_message(error)}
+        core["elapsed"] = round(monotonic() - started, 3)
+        self.__query_torrents(service, limit=1)
+        from importlib.metadata import PackageNotFoundError, version
+        import platform
+        import ssl
+        runtime = {"python": platform.python_version(), "openssl": ssl.OPENSSL_VERSION}
+        for package in ("qbittorrent-api", "requests", "urllib3"):
+            try:
+                runtime[package] = version(package)
+            except PackageNotFoundError:
+                runtime[package] = "unknown"
+        return Response(success=True, data={
+            "version": self.plugin_version, "downloader": downloader, "core": core,
+            "iyuu": self._last_queries.get(downloader),
+            "pending_count": len(self._recheck_torrents.get(downloader) or []),
+            "certificate_verification": getattr(qbc, "_VERIFY_WEBUI_CERTIFICATE", True),
+            "runtime": runtime,
+        })
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -984,10 +1035,12 @@ class IYUUAutoSeedPlus(_PluginBase):
                     logger.info(f"辅种服务停止")
                     return
                 downloader = service.name
-                downloader_obj = service.instance
                 logger.info(f"开始扫描下载器 {downloader} ...")
                 # 获取下载器中已完成的种子
-                torrents = downloader_obj.get_completed_torrents()
+                torrents, query_error = self.__query_torrents(service, status="seeding")
+                if query_error:
+                    logger.warning(f"下载器 {downloader} 查询已完成种子失败，本轮跳过该下载器")
+                    continue
                 if torrents:
                     logger.info(f"下载器 {downloader} 已完成种子数：{len(torrents)}")
                 else:
@@ -1088,68 +1141,131 @@ class IYUUAutoSeedPlus(_PluginBase):
         self.__clean_recheck_torrents()
         if not self._recheck_torrents:
             return
-        if self._is_recheck_running:
+        recheck_lock = self._recheck_lock
+        if not recheck_lock.acquire(blocking=False):
             return
+        stop_event = self._event
         self._is_recheck_running = True
         try:
             auto_service = self.auto_service_info
             if auto_service:
                 # 检查指定下载器
-                self.check_recheck_service(auto_service)
+                self.check_recheck_service(auto_service, stop_event=stop_event)
                 return
             services = self.service_infos
             if not services:
                 return
             for service in services.values():
                 # 需要检查的种子
-                self.check_recheck_service(service)
+                self.check_recheck_service(service, stop_event=stop_event)
         finally:
             self.__clean_recheck_torrents()
             self._is_recheck_running = False
+            recheck_lock.release()
 
     def __clean_recheck_torrents(self):
         """
         清理已完成的空校验队列，避免定时任务空跑刷日志。
         """
-        self._recheck_torrents = {
-            downloader: torrent_ids
-            for downloader, torrent_ids in self._recheck_torrents.items()
-            if torrent_ids
-        }
+        with self._recheck_queue_lock:
+            self._recheck_torrents = {
+                downloader: torrent_ids
+                for downloader, torrent_ids in self._recheck_torrents.items()
+                if torrent_ids
+            }
 
-    def check_recheck_service(self, service: ServiceInfo):
+    def check_recheck_service(self, service: ServiceInfo, stop_event: Optional[Event] = None):
         """
         检查指定下载器中种子是否校验完成，校验完成且完整的自动开始辅种
         """
         # 需要检查的种子
         downloader = service.name
         downloader_obj = service.instance
-        recheck_torrents = self._recheck_torrents.get(downloader) or []
+        with self._recheck_queue_lock:
+            recheck_torrents = list(dict.fromkeys(self._recheck_torrents.get(downloader) or []))
         if not recheck_torrents:
             return
-        logger.info(f"开始检查下载器 {downloader} 的校验任务 ...")
-        # 获取下载器中的种子状态
-        torrents, query_error = downloader_obj.get_torrents(ids=recheck_torrents)
-        if query_error:
-            logger.info(f"下载器 {downloader} 查询校验任务失败，将在下次继续查询 ...")
-            return
-        if torrents:
-            can_seeding_torrents = []
+        logger.info(f"开始检查下载器 {downloader} 的校验任务，待处理 {len(recheck_torrents)} 个 ...")
+        removed, started, failed, blocked, waiting = set(), 0, 0, 0, 0
+        for offset in range(0, len(recheck_torrents), 50):
+            if stop_event and stop_event.is_set():
+                return
+            batch = recheck_torrents[offset:offset + 50]
+            torrents, query_error = self.__query_torrents(service, ids=batch)
+            if stop_event and stop_event.is_set():
+                return
+            if query_error:
+                failed += len(batch)
+                continue
+            found, ready, batch_removed, unexpected = set(), [], set(), False
             for torrent in torrents:
-                # 获取种子hash
                 hash_str = self.__get_hash(torrent=torrent, dl_type=service.type)
-                if self.__can_seeding(torrent=torrent, dl_type=service.type):
-                    can_seeding_torrents.append(hash_str)
-            if can_seeding_torrents:
-                logger.info(f"共 {len(can_seeding_torrents)} 个任务校验完成，开始辅种 ...")
-                # 开始任务
-                downloader_obj.start_torrents(ids=can_seeding_torrents)
-                # 去除已经处理过的种子
-                self._recheck_torrents[downloader] = list(
-                    set(recheck_torrents).difference(set(can_seeding_torrents)))
+                if hash_str not in batch:
+                    unexpected = True
+                    continue
+                found.add(hash_str)
+                if service.type == "qbittorrent":
+                    state, reason = qb_recheck_state(torrent)
+                else:
+                    state = "ready" if self.__can_seeding(torrent, service.type) else "waiting"
+                    if torrent.percent_done == 1 and not torrent.status.stopped:
+                        state = "seeding"
+                    reason = "等待校验完成"
+                if state == "ready":
+                    ready.append(hash_str)
+                elif state == "seeding":
+                    batch_removed.add(hash_str)
+                else:
+                    blocked += state == "blocked"
+                    waiting += state != "blocked"
+                    self.__log_recheck_wait(service, torrent, hash_str, state, reason)
+            if unexpected:
+                failed += len(batch)
+                logger.warning(f"下载器 {downloader} 返回了查询范围外的种子，本批队列保留，暂停启动操作")
+                continue
+            # 只清理成功查询范围内已消失的 hash，失败批次和并发新增的 hash 必须保留。
+            removed.update(batch_removed)
+            removed.update(set(batch) - found)
+            if ready:
+                if stop_event and stop_event.is_set():
+                    return
+                try:
+                    accepted = downloader_obj.start_torrents(ids=ready)
+                except Exception as error:
+                    accepted = False
+                    logger.warning(f"下载器 {downloader} 启动辅种请求失败：{query_error_message(error)}")
+                if accepted:
+                    started += len(ready)
+                    logger.info(f"下载器 {downloader} 已接受 {len(ready)} 个校验完整任务的启动请求，保留队列等待确认做种状态")
+                else:
+                    failed += len(ready)
+                    logger.warning(f"下载器 {downloader} 启动 {len(ready)} 个任务失败，保留队列下次重试")
+        with self._recheck_queue_lock:
+            current = self._recheck_torrents.get(downloader) or []
+            self._recheck_torrents[downloader] = list(dict.fromkeys(x for x in current if x not in removed))
+        for hash_str in removed:
+            self._recheck_messages.pop((downloader, hash_str), None)
+        logger.info(
+            f"下载器 {downloader} 校验检查完成：启动请求成功 {started}，文件异常或未完整匹配 {blocked}，"
+            f"校验等待 {waiting}，查询或启动失败 {failed}，剩余 {len(self._recheck_torrents[downloader])} 个"
+        )
+
+    def __log_recheck_wait(self, service, torrent, hash_str, state, reason):
+        """状态变化或每半小时提示一次，避免只有循环检查日志却看不到卡住的任务。"""
+        raw_state = torrent.get("state") if service.type == "qbittorrent" else str(torrent.status)
+        key = (service.name, hash_str)
+        previous = self._recheck_messages.get(key)
+        now = monotonic()
+        signature = (state, raw_state, reason)
+        if previous and previous[0] == signature and now - previous[1] < 1800:
+            return
+        self._recheck_messages[key] = (signature, now)
+        name = str(torrent.get("name") or hash_str) if service.type == "qbittorrent" else str(torrent.name)
+        message = f"下载器 {service.name} 待辅种任务 {name[:160]} ({hash_str})，状态 {raw_state}：{reason}"
+        if state == "blocked":
+            logger.warning(message)
         else:
-            logger.info(f"下载器 {downloader} 中没有需要检查的校验任务，清空待处理列表 ...")
-            self._recheck_torrents[downloader] = []
+            logger.info(message)
 
     def __seed_torrents(self, hash_strs: list, service: ServiceInfo, stop_event: Optional[Event] = None):
         """
@@ -1356,6 +1472,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                                              tag=torrent_tags,
                                              category=None,
                                              ignore_category_check=False,
+                                             requests_args={"timeout": (min(self._downloader_timeout, 15), self._downloader_timeout)},
                                              is_skip_checking=self._skipverify)
             )
             if not state:
@@ -1397,7 +1514,8 @@ class IYUUAutoSeedPlus(_PluginBase):
             if not qbc:
                 logger.warn(f"{service.name} 未获取到 qB 客户端，无法设置分类 {category}")
                 return
-            qbc.torrents_set_category(category=category, torrent_hashes=torrent_hash)
+            qbc.torrents_set_category(category=category, torrent_hashes=torrent_hash,
+                                     requests_args={"timeout": (min(self._downloader_timeout, 15), self._downloader_timeout)})
         except Exception as err:
             logger.error(f"{service.name} 设置辅种分类 {category} 失败：{err}")
 
@@ -1416,27 +1534,51 @@ class IYUUAutoSeedPlus(_PluginBase):
 
     def __apply_downloader_timeout(self, service: Optional[ServiceInfo]) -> None:
         """
-        调整 qBittorrent API 请求超时，避免辅种批量任务长时间阻塞在下载器接口。
+        记录辅种专用请求超时；不能修改宿主共享客户端的全局请求参数。
         """
         if not service or service.type != "qbittorrent" or not service.instance:
             return
         qbc = getattr(service.instance, "qbc", None)
         if not qbc:
             return
-        request_args = getattr(qbc, "_REQUESTS_ARGS", None)
-        if not isinstance(request_args, dict):
-            try:
-                setattr(qbc, "_REQUESTS_ARGS", {})
-                request_args = getattr(qbc, "_REQUESTS_ARGS")
-            except Exception as err:
-                logger.debug(f"设置下载器请求超时失败：{service.name} - {err}")
-                return
         service_key = f"{service.name}:{id(qbc)}"
         if self._applied_downloader_timeouts.get(service_key) == self._downloader_timeout:
             return
-        request_args["timeout"] = self._downloader_timeout
         self._applied_downloader_timeouts[service_key] = self._downloader_timeout
-        logger.info(f"下载器 {service.name} 请求超时设置为 {self._downloader_timeout} 秒")
+        logger.info(f"下载器 {service.name} 辅种查询及添加请求超时 {self._downloader_timeout} 秒（独立请求配置）")
+
+    def __query_torrents(self, service, ids=None, status=None, limit=None):
+        """辅种读取使用独立会话，避免与宿主后台任务并发复用连接和登录状态。"""
+        server = service.instance
+        source = getattr(server, "qbc", None)
+        config = getattr(getattr(service, "config", None), "config", None)
+        if service.type != "qbittorrent" or not source or not isinstance(config, dict):
+            if status == "seeding":
+                rows = server.get_completed_torrents()
+                return rows or [], rows is None
+            return server.get_torrents(ids=ids)
+        with self._query_clients_lock:
+            client = self._query_clients.get(service.name)
+            if (client is None or client.source is not source or client.config != config
+                    or client.timeout != self._downloader_timeout):
+                if client is not None:
+                    client.close()
+                client = QbQueryClient(source, config, self._downloader_timeout)
+                self._query_clients[service.name] = client
+        result = client.query(ids=ids, status=status, limit=limit)
+        self._last_queries[service.name] = {
+            "success": not bool(result["error"]), "error": result["error"],
+            "attempts": result["attempts"], "elapsed": result["elapsed"],
+            "count": len(result["torrents"]),
+        }
+        if result["error"]:
+            logger.warning(
+                f"下载器 {service.name} 辅种查询失败，尝试 {result['attempts']} 次，"
+                f"耗时 {result['elapsed']} 秒：{result['error']}；保留待处理任务"
+            )
+        elif result["attempts"] > 1:
+            logger.info(f"下载器 {service.name} 辅种查询连接已重建，重试成功，耗时 {result['elapsed']} 秒")
+        return result["torrents"], bool(result["error"])
 
     def __site_candidates(self, site_url: str) -> list[str]:
         """
@@ -1530,7 +1672,7 @@ class IYUUAutoSeedPlus(_PluginBase):
         self.realtotal += 1
         # 查询hash值是否已经在下载器中
         downloader_obj = service.instance
-        torrent_info, query_error = downloader_obj.get_torrents(ids=[seed.get("info_hash")])
+        torrent_info, query_error = self.__query_torrents(service, ids=[seed.get("info_hash")])
         if query_error:
             logger.warn(f"下载器 {service.name} 查询种子失败，跳过本次辅种添加，避免重复添加：{seed.get('info_hash')}")
             self.fail += 1
@@ -1613,9 +1755,11 @@ class IYUUAutoSeedPlus(_PluginBase):
     def __add_recheck_torrents(self, service: ServiceInfo, download_id: str):
         # 追加校验任务
         logger.info(f"添加校验检查任务：{download_id} ...")
-        if not self._recheck_torrents.get(service.name):
-            self._recheck_torrents[service.name] = []
-        self._recheck_torrents[service.name].append(download_id)
+        with self._recheck_queue_lock:
+            if not self._recheck_torrents.get(service.name):
+                self._recheck_torrents[service.name] = []
+            if download_id not in self._recheck_torrents[service.name]:
+                self._recheck_torrents[service.name].append(download_id)
 
     @staticmethod
     def __get_hash(torrent: Any, dl_type: str):
@@ -1912,6 +2056,9 @@ class IYUUAutoSeedPlus(_PluginBase):
         退出插件
         """
         try:
+            self._event.set()
+            for client in getattr(self, "_query_clients", {}).values():
+                client.close()
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
