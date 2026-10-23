@@ -10,6 +10,7 @@ import pkgutil
 import re
 import sys
 import time
+from datetime import date, timedelta
 from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -36,7 +37,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.29"
+    plugin_version = "1.3.30"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -68,6 +69,7 @@ class sitetoolbox(_PluginBase):
     _mteam_auto_cron = "0 9 * * *"
     _rss_auto_enabled = True
     _rss_auto_cron = "0 8 * * *"
+    _rss_failure_days = 3
     _latest_mteam_login_check: Dict[str, Any] = {}
 
     _patched = False
@@ -78,6 +80,7 @@ class sitetoolbox(_PluginBase):
     _aru_patched = False
     _aru_originals: dict[tuple[type, str], Any] = {}
     _jobs_lock = Lock()
+    _rss_history_lock = Lock()
     _error_log_lock = Lock()
     _error_capture_installed = False
     _original_logger_method: Optional[Callable] = None
@@ -124,6 +127,10 @@ class sitetoolbox(_PluginBase):
         self._mteam_auto_cron = str(config.get("mteam_auto_cron") or "0 9 * * *").strip()
         self._rss_auto_enabled = _to_bool(config.get("rss_auto_enabled", True), True)
         self._rss_auto_cron = str(config.get("rss_auto_cron") or "0 8 * * *").strip()
+        self._rss_failure_days = _int_or_default(config.get("rss_failure_days"), 3, minimum=1, maximum=365)
+        self._latest_results = [
+            _rss_result_status(item, self._rss_failure_days) for item in self._latest_results
+        ]
         self._latest_mteam_login_check = (
             config.get("latest_mteam_login_check")
             if isinstance(config.get("latest_mteam_login_check"), dict)
@@ -155,6 +162,7 @@ class sitetoolbox(_PluginBase):
         self.__class__._mteam_auto_cron = self._mteam_auto_cron
         self.__class__._rss_auto_enabled = self._rss_auto_enabled
         self.__class__._rss_auto_cron = self._rss_auto_cron
+        self.__class__._rss_failure_days = self._rss_failure_days
         self.__class__._latest_mteam_login_check = self._latest_mteam_login_check
         self.__class__._site_rules = _parse_site_config(self._site_conf)
         self.__class__._userdata_rules = [
@@ -509,7 +517,7 @@ class sitetoolbox(_PluginBase):
                                     "props": {
                                         "model": "rss_auto_enabled",
                                         "label": "定时测试 RSS",
-                                        "hint": "按周期测试已选站点的 RSS，只测试不修复，异常时发送系统消息",
+                                        "hint": "按周期测试已选站点的 RSS，连续失败达到设定天数后发送系统消息",
                                     },
                                 }),
                                 _col(12, 6, {
@@ -519,6 +527,23 @@ class sitetoolbox(_PluginBase):
                                         "label": "测试周期(cron)",
                                         "placeholder": "0 8 * * *",
                                         "hint": "默认每天 8 点测试",
+                                    },
+                                }),
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                _col(12, 6, {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "rss_failure_days",
+                                        "label": "RSS 连续失败天数",
+                                        "type": "number",
+                                        "min": 1,
+                                        "max": 365,
+                                        "hint": "默认 3 天；同一天重复测试只计一天，成功或漏测一天即重新累计，保存后生效",
+                                        "persistent-hint": True,
                                     },
                                 }),
                             ],
@@ -654,6 +679,7 @@ class sitetoolbox(_PluginBase):
             "mteam_auto_cron": "0 9 * * *",
             "rss_auto_enabled": True,
             "rss_auto_cron": "0 8 * * *",
+            "rss_failure_days": 3,
             "latest_mteam_login_check": {},
         }
 
@@ -693,10 +719,50 @@ class sitetoolbox(_PluginBase):
             "mteam_auto_cron": self._mteam_auto_cron,
             "rss_auto_enabled": self._rss_auto_enabled,
             "rss_auto_cron": self._rss_auto_cron,
+            "rss_failure_days": self._rss_failure_days,
             "latest_mteam_login_check": self._latest_mteam_login_check,
         }
         payload.update(overrides)
         return payload
+
+    def _record_rss_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """按自然日记录连续失败，独立于配置保存，避免改阈值或重启时清空历史。"""
+        result = dict(result)
+        site_key = str(result.get("site_id"))
+        tested_day = date.fromisoformat(str(result.get("tested_at") or _now())[:10])
+        with self._rss_history_lock:
+            history = self.get_data("rss_failure_history")
+            history = dict(history) if isinstance(history, dict) else {}
+            previous = history.get(site_key)
+            if not isinstance(previous, dict):
+                # 升级前只保留了最后一次结果，最多用它补一条真实的检测记录。
+                last = next((item for item in self._latest_results
+                             if item.get("site_id") == result.get("site_id")), {})
+                previous = {
+                    "date": str(last.get("tested_at") or "")[:10],
+                    "days": last.get("failure_days", 1)
+                    if last.get("rss_state", last.get("state")) in {"error", "warning"} else 0,
+                }
+            try:
+                previous_day = date.fromisoformat(str(previous.get("date") or ""))
+            except ValueError:
+                previous_day = None
+            days = 0
+            if result.get("state") in {"error", "warning"}:
+                try:
+                    previous_days = max(0, int(previous.get("days") or 0))
+                except (TypeError, ValueError):
+                    previous_days = 0
+                if previous_day == tested_day:
+                    days = max(1, previous_days)
+                elif previous_day == tested_day - timedelta(days=1):
+                    days = previous_days + 1
+                else:
+                    days = 1
+            history[site_key] = {"date": tested_day.isoformat(), "days": days}
+            self.save_data("rss_failure_history", history)
+        result["failure_days"] = days
+        return _rss_result_status(result, self._rss_failure_days)
 
     def _save_results(self, results: List[Dict[str, Any]]):
         self._latest_results = results
@@ -818,10 +884,12 @@ class sitetoolbox(_PluginBase):
             ok_count = len([item for item in results if item.get("state") == "success"])
             offline_count = len([item for item in results if item.get("state") == "offline"])
             bad_count = len([item for item in results if item.get("state") in ("error", "warning")])
-            message = f"成功 {ok_count}/{len(results)}，异常 {bad_count}，站点连接失败 {offline_count}"
+            pending_count = len([item for item in results if item.get("state") == "pending"])
+            message = f"成功 {ok_count}/{len(results)}，待观察 {pending_count}，异常 {bad_count}，站点连接失败 {offline_count}"
             self._set_job_state("rss_test_auto", name, "success", message, finished_at=_now())
             if bad_count:
-                self.systemmessage.put(f"RSS定时测试发现异常 {bad_count}/{len(results)}，请在站点工具箱查看。",
+                self.systemmessage.put(f"RSS定时测试发现 {bad_count}/{len(results)} 个站点连续失败达到 "
+                                       f"{self._rss_failure_days} 天，请在站点工具箱查看。",
                                        title=self.plugin_name)
             logger.info(f"站点工具箱 RSS 定时测试完成：{message}")
         except Exception as err:
@@ -1132,7 +1200,8 @@ def _api_test_selected_rss(payload: Optional[dict] = Body(default=None)) -> sche
         plugin._save_results(results)
         ok_count = len([item for item in results if item.get("state") == "success"])
         offline_count = len([item for item in results if item.get("state") == "offline"])
-        return f"RSS测试完成：成功 {ok_count}/{len(results)}，站点连接失败 {offline_count}"
+        pending_count = len([item for item in results if item.get("state") == "pending"])
+        return f"RSS测试完成：成功 {ok_count}/{len(results)}，待观察 {pending_count}，站点连接失败 {offline_count}"
 
     return plugin._start_background_job("rss_test", "RSS测试", worker)
 
@@ -2218,6 +2287,26 @@ def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
         if failure:
             result["state"] = failure[0]
             result["message"] = f"{failure[1]}，RSS 结果不可信（{result.get('message') or '请求失败'}）"
+    plugin = sitetoolbox._instance
+    return plugin._record_rss_result(result) if plugin else result
+
+
+def _rss_result_status(result: Dict[str, Any], threshold: int) -> Dict[str, Any]:
+    """保留原始检测结果，改阈值时只重新判定展示状态，不重复累计天数。"""
+    result = dict(result)
+    state = result.get("rss_state", result.get("state"))
+    message = result.get("rss_message", result.get("message")) or ""
+    result.update(rss_state=state, rss_message=message, state=state, message=message)
+    if state in {"error", "warning"}:
+        days = result.get("failure_days", 1)
+        result["failure_days"] = days
+        if days < threshold:
+            result["state"] = "pending"
+            result["message"] = f"连续失败 {days}/{threshold} 天，待观察：{message}"
+        else:
+            result["message"] = f"已连续失败 {days} 天：{message}"
+    else:
+        result["failure_days"] = 0
     return result
 
 
@@ -3220,7 +3309,7 @@ def _error_record_ts(record: Dict[str, Any]) -> float:
 
 
 def _toolbox_page(plugin: sitetoolbox) -> List[dict]:
-    results = plugin._latest_results or []
+    results = [_rss_result_status(item, plugin._rss_failure_days) for item in plugin._latest_results or []]
     rules = sitetoolbox._site_rules or []
     userdata_results = plugin._latest_userdata_results or []
     missing_preview = plugin._latest_missing_preview or {}
@@ -3431,7 +3520,11 @@ def _details_panel(missing_preview: Dict[str, Any], missing_cleanup: Dict[str, A
                 [_mteam_login_panel(mteam_check, plugin)],
             ),
             _expansion_panel("用户数据健康", f"{len(userdata_results)} 个站点", [_userdata_table(userdata_results)]),
-            _expansion_panel("RSS 结果", f"正常 {rss_ok} / 异常 {rss_bad}", [_result_table(rss_results)]),
+            _expansion_panel(
+                "RSS 结果",
+                f"正常 {rss_ok} / 待观察 {sum(item.get('state') == 'pending' for item in rss_results)} / 异常 {rss_bad}",
+                [_result_table(rss_results)],
+            ),
             _expansion_panel(
                 "系统错误",
                 f"{len(error_records)} 条 / {plugin._error_retention_days} 天",
@@ -4104,6 +4197,7 @@ def _state_text(state: Optional[str]) -> str:
         "warning": "警告",
         "error": "异常",
         "offline": "连接失败",
+        "pending": "待观察",
     }.get(state or "", state or "-")
 
 
