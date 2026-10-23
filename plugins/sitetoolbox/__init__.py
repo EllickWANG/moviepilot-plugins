@@ -39,7 +39,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -2299,6 +2299,13 @@ def _refresh_site_userdata(site: Any):
     indexer = SitesHelper().get_indexer(site.domain)
     if not indexer:
         raise ValueError("站点不支持用户数据采集或未通过认证")
+    # 内置索引定义可能来自共享缓存；使用当前站点的认证和地址，且不修改共享定义。
+    indexer = {**indexer, "id": site.id, "name": site.name,
+               "domain": site.url, "url": site.url,
+               "cookie": getattr(site, "cookie", "") or "",
+               "ua": getattr(site, "ua", None) or settings.USER_AGENT,
+               "proxy": bool(getattr(site, "proxy", False)),
+               "apikey": getattr(site, "apikey", None), "token": getattr(site, "token", None)}
     data = SiteChain().refresh_userdata(site=indexer)
     if not data:
         raise ValueError("采集未返回用户数据")

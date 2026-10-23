@@ -212,7 +212,7 @@ class PluginMonitorTest(unittest.TestCase):
 
 class UserdataRefreshTest(unittest.TestCase):
     def setUp(self):
-        self.site = types.SimpleNamespace(id=26, name='红豆饭', domain='hdfans.org', is_active=True)
+        self.site = types.SimpleNamespace(id=26, name='红豆饭', domain='hdfans.org', url='https://hdfans.org/', is_active=True, cookie='current-cookie', ua='current-UA', proxy=True)
         self.old = types.SimpleNamespace(domain='hdfans.org', username='test', user_level='', upload=1000, download=500,
                                          ratio=2, bonus=1, updated_day='2026-10-23', updated_time='08:48:32')
         self.fresh = copy.copy(self.old)
@@ -270,6 +270,18 @@ class UserdataRefreshTest(unittest.TestCase):
                     PLUGIN._refresh_site_userdata(self.site)
             chain_module.SiteChain.return_value.refresh_userdata.return_value = {'user_level': 'Veteran User'}
             PLUGIN._refresh_site_userdata(self.site)
+
+    def test_collection_uses_current_site_auth_without_mutating_shared_definition(self):
+        import sys
+        module = types.ModuleType('app.chain.site')
+        module.SiteChain = Mock()
+        module.SiteChain.return_value.refresh_userdata.return_value = {'user_level': 'Veteran User'}
+        definition = {'domain': 'https://old.test/', 'cookie': 'old-cookie', 'ua': 'old-UA', 'schema': 'NexusPhp'}
+        with patch.dict(sys.modules, {'app.chain.site': module}), patch.object(PLUGIN.SitesHelper.return_value, 'get_indexer', return_value=definition):
+            PLUGIN._refresh_site_userdata(self.site)
+        actual = module.SiteChain.return_value.refresh_userdata.call_args.kwargs['site']
+        self.assertEqual((actual['cookie'], actual['ua'], actual['domain'], actual['proxy']), ('current-cookie', 'current-UA', 'https://hdfans.org/', True))
+        self.assertEqual(definition['cookie'], 'old-cookie')
 
     def test_one_collection_failure_does_not_stop_other_selected_sites(self):
         other = types.SimpleNamespace(id=27, name='其他站', domain='other.test', is_active=True)

@@ -65,7 +65,7 @@ const config = reactive({
   site_ids: names.map((row) => row[0]),
 });
 const state = reactive({
-  plugin_version: "1.4.1",
+  plugin_version: "1.4.2",
   enabled: true,
   sites: names.map(([id, name, domain]) => ({
     id,

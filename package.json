@@ -38,7 +38,7 @@
   "sitetoolbox": {
     "name": "站点工具箱",
     "description": "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。",
-    "version": "1.4.1",
+    "version": "1.4.2",
     "icon": "mdi-toolbox",
     "author": "Ellick",
     "level": 1,

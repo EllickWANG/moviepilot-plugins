@@ -1150,7 +1150,7 @@ onBeforeUnmount(() => {
         </section>
       </template>
       <footer class="stb-version">
-        站点工具箱 v{{ overview?.plugin_version || "1.4.1"
+        站点工具箱 v{{ overview?.plugin_version || "1.4.2"
         }}<span>所有检测模块共用统一监控计划</span>
       </footer>
     </main>

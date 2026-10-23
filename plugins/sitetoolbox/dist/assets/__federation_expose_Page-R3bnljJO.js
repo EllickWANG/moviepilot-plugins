@@ -1523,7 +1523,7 @@ return (_ctx, _cache) => {
             ], 64))
           : _createCommentVNode("", true),
       _createElementVNode("footer", _hoisted_69, [
-        _createTextVNode(" 站点工具箱 v" + _toDisplayString(overview.value?.plugin_version || "1.4.1"), 1),
+        _createTextVNode(" 站点工具箱 v" + _toDisplayString(overview.value?.plugin_version || "1.4.2"), 1),
         _cache[67] || (_cache[67] = _createElementVNode("span", null, "所有检测模块共用统一监控计划", -1))
       ])
     ], 8, _hoisted_1),
