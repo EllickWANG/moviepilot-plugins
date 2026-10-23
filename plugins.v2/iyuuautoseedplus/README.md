@@ -206,6 +206,10 @@ GET /api/v1/plugin/IYUUAutoSeedPlus/diagnose/downloader?downloader=<下载器名
 
 2.15.17 将旧版 qB 添加种子后按临时标签查找 hash 的操作也统一到独立查询会话，避免添加接口返回 `Ok.` 后再次经过宿主代理。标签必须唯一匹配；可取消等待，不会因查询失败或标签歧义猜测任务 hash。
 
+2.15.18 修复设置分类时的实例超时参数调用，并在扫描前初始化 IYUU 站点表和 `sid_sha1`。日志保留失败接口、HTTP 状态和业务错误；网络、HTTP429/5xx 等可重试错误最多重试三次，认证或响应格式问题立即终止本轮，不会继续跳过大量批次并误报扫描完成。初始化诊断可调用 `GET /api/v1/plugin/IYUUAutoSeedPlus/diagnose/iyuu`，只读取站点元数据，不添加任务。
+
+校验队列会保存到插件数据，重载后恢复。维护时可以通过 `POST /api/v1/plugin/IYUUAutoSeedPlus/recheck/restore` 提交 `{ "下载器名称": ["hash"] }`，只接纳已配置 qB 下载器中、带当前辅种标签的现有任务；接口本身不启动或添加种子。`GET /api/v1/plugin/IYUUAutoSeedPlus/status` 返回运行状态与各下载器待处理数量。
+
 ### 提示没有可辅种站点
 
 需要区分两种情况：

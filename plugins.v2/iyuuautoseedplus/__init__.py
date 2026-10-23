@@ -152,7 +152,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.17"
+    plugin_version = "2.15.18"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -241,7 +241,12 @@ class IYUUAutoSeedPlus(_PluginBase):
         self._recheck_lock = RLock()
         self._recheck_queue_lock = RLock()
         if "_recheck_torrents" not in self.__dict__:
-            self._recheck_torrents = {}
+            saved_queue = self.get_data("recheck_queue") or {}
+            self._recheck_torrents = {
+                name: list(dict.fromkeys(ids)) for name, ids in saved_queue.items()
+                if name in self._downloaders + [self._auto_downloader] and isinstance(ids, list)
+                and all(isinstance(item, str) and re.fullmatch(r"[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", item) for item in ids)
+            } if isinstance(saved_queue, dict) else {}
 
         # 启动定时任务 & 立即运行一次
         if self.get_state() or self._onlyonce:
@@ -402,7 +407,68 @@ class IYUUAutoSeedPlus(_PluginBase):
             "methods": ["GET"],
             "auth": "bear",
             "summary": "只读检查辅种下载器查询连接",
+        }, {
+            "path": "/diagnose/iyuu", "endpoint": self.diagnose_iyuu,
+            "methods": ["GET"], "auth": "bear", "summary": "只检查IYUU站点哈希初始化",
+        }, {
+            "path": "/recheck/restore", "endpoint": self.restore_recheck,
+            "methods": ["POST"], "auth": "bear", "summary": "恢复已添加辅种任务的校验队列",
+        }, {
+            "path": "/status", "endpoint": self.runtime_status,
+            "methods": ["GET"], "auth": "bear", "summary": "辅种运行与校验队列状态",
         }]
+
+    def diagnose_iyuu(self) -> Response:
+        """只初始化站点表与站点哈希，不查询种子、不添加任务。"""
+        if not self._token:
+            return Response(success=False, message="未配置IYUU Token")
+        if not self.iyuu_helper:
+            self.iyuu_helper = IyuuHelper(token=self._token, timeout=self._request_timeout)
+        self.iyuu_helper.prepare()
+        return Response(success=True, data=self.iyuu_helper.status())
+
+    def runtime_status(self) -> Response:
+        return Response(success=True, data={
+            "version": self.plugin_version, "running": self._is_auto_seed_running,
+            "pending": {name: len(ids) for name, ids in self._recheck_torrents.items()},
+            "iyuu": self.iyuu_helper.status() if self.iyuu_helper else None,
+        })
+
+    def restore_recheck(self, payload: Dict[str, List[str]]) -> Response:
+        """重载维护时恢复指定 hash；仅接纳已配置下载器中带辅种标签的现有任务。"""
+        names = set(self._downloaders + [self._auto_downloader])
+        if (not payload or not set(payload).issubset(names) or sum(len(ids) for ids in payload.values()) > 1000
+                or any(not isinstance(item, str) or not re.fullmatch(r"[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", item)
+                       for ids in payload.values() for item in ids)):
+            return Response(success=False, message="仅支持已配置下载器及最多1000个合法种子hash")
+        if self._skipverify and not self._auto_start:
+            return Response(success=False, message="当前配置要求手动开始，不能恢复自动处理队列")
+        plan, skipped = {}, 0
+        labels = {item.strip() for item in self._labelsafterseed.split(',') if item.strip()}
+        if not labels:
+            return Response(success=False, message="未配置辅种标签，无法验证任务来源")
+        for name, ids in payload.items():
+            service = DownloaderHelper().get_service(name=name)
+            if not service or service.type != "qbittorrent":
+                return Response(success=False, message="只能恢复已连接的qBittorrent下载器")
+            plan[name] = []
+            ids = list(dict.fromkeys(item.lower() for item in ids))
+            for offset in range(0, len(ids), 50):
+                rows, failed = self.__query_torrents(service, ids=ids[offset:offset + 50])
+                if failed:
+                    return Response(success=False, message=f"{name} 查询失败，队列未更改")
+                for row in rows:
+                    if row.get("hash") not in ids or not labels.issubset({item.strip() for item in str(row.get("tags") or '').split(',')}):
+                        skipped += 1
+                    elif qb_recheck_state(row)[0] != "seeding":
+                        plan[name].append(row['hash'])
+                    else:
+                        skipped += 1
+        with self._recheck_queue_lock:
+            for name, ids in plan.items():
+                self._recheck_torrents[name] = list(dict.fromkeys((self._recheck_torrents.get(name) or []) + ids))
+            self.__save_recheck_queue()
+        return Response(success=True, data={"restored": sum(len(ids) for ids in plan.values()), "skipped": skipped})
 
     def diagnose_downloader(self, downloader: str, network: bool = False, direct: Optional[bool] = None) -> Response:
         """对比宿主与辅种独立会话，仅查询一条记录，不改变种子状态。"""
@@ -1032,10 +1098,25 @@ class IYUUAutoSeedPlus(_PluginBase):
             if not self.get_state():
                 logger.info("辅种配置不完整或插件已禁用，跳过本次任务")
                 return
-            services = self.service_infos
-            if not self.iyuu_helper or not services:
+            if not self.iyuu_helper:
                 return
             logger.info("开始辅种任务 ...")
+            for attempt in range(3):
+                if stop_event.is_set():
+                    return
+                ready, message = self.iyuu_helper.prepare()
+                if ready:
+                    logger.info("IYUU站点哈希初始化完成")
+                    break
+                logger.warning(f"IYUU站点初始化第 {attempt + 1}/3 次失败：{message}")
+                if not self.iyuu_helper.status()["retryable"] or attempt == 2:
+                    logger.error("IYUU站点初始化失败，本轮未扫描下载器；任务未完成，请查看上方接口错误")
+                    return
+                if stop_event.wait(2 ** attempt):
+                    return
+            services = self.service_infos
+            if not services:
+                return
 
             # 计数器初始化
             self.total = 0
@@ -1261,6 +1342,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             self._recheck_torrents[downloader] = list(dict.fromkeys(x for x in current if x not in removed))
         for hash_str in removed:
             self._recheck_messages.pop((downloader, hash_str), None)
+        self.__save_recheck_queue()
         logger.info(
             f"下载器 {downloader} 校验检查完成：启动请求成功 {started}，文件异常或未完整匹配 {blocked}，"
             f"校验等待 {waiting}，查询或启动失败 {failed}，剩余 {len(self._recheck_torrents[downloader])} 个"
@@ -1310,7 +1392,9 @@ class IYUUAutoSeedPlus(_PluginBase):
             # 判断辅种异常是否是由于Token未认证导致的，由于没有解决接口，只能从返回值来判断
             if self._token and msg == '请求缺少token':
                 logger.warn(f'IYUU辅种失败，疑似站点未绑定插件配置不完整，请先检查是否完成站点绑定！{msg}')
-            elif "超时" in msg or "未获取到返回信息" in msg or "未获取到站点哈希" in msg:
+            elif "站点初始化失败" in msg:
+                logger.warning(f"IYUU站点初始化失败，本批 {len(hash_strs)} 个Hash未完成：{msg}")
+            elif "超时" in msg or "未获取到返回信息" in msg:
                 logger.warn(f"IYUU查询超时或网络异常，本批 {len(hash_strs)} 个Hash未完成：{msg}")
             else:
                 logger.warn(f"当前种子列表没有可辅种的站点：{msg}")
@@ -1539,8 +1623,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                 return None
         return None
 
-    @staticmethod
-    def __set_qb_category(service: ServiceInfo, torrent_hash: str, category: str) -> None:
+    def __set_qb_category(self, service: ServiceInfo, torrent_hash: str, category: str) -> None:
         """
         qB 辅种需要保留真实 save_path，分类在添加完成后再设置。
         """
@@ -1797,6 +1880,11 @@ class IYUUAutoSeedPlus(_PluginBase):
                 self._recheck_torrents[service.name] = []
             if download_id not in self._recheck_torrents[service.name]:
                 self._recheck_torrents[service.name].append(download_id)
+            self.__save_recheck_queue()
+
+    def __save_recheck_queue(self):
+        with self._recheck_queue_lock:
+            self.save_data("recheck_queue", {name: list(ids) for name, ids in self._recheck_torrents.items() if ids})
 
     @staticmethod
     def __get_hash(torrent: Any, dl_type: str):

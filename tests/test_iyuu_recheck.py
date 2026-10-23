@@ -189,6 +189,8 @@ class RecheckTest(unittest.TestCase):
         self.plugin._query_clients_lock = threading.RLock()
         self.plugin._query_clients = {}
         self.plugin._last_queries = {}
+        self.plugin.save_data = Mock()
+        self.plugin.get_data = Mock(return_value={})
         self.plugin._event = Mock()
         self.plugin._event.is_set.return_value = False
         self.plugin._event.wait.return_value = False
@@ -229,6 +231,7 @@ class RecheckTest(unittest.TestCase):
         self.server.start_torrents.return_value = False
         self.plugin.check_recheck_service(self.service)
         self.assertEqual(self.plugin._recheck_torrents["qb"], ["ready", "blocked"])
+        self.plugin.save_data.assert_called_with("recheck_queue", {"qb": ["ready", "blocked"]})
 
     def test_start_exception_keeps_ready_task(self):
         self.fetch.return_value = self.rows(), False
@@ -291,6 +294,28 @@ class RecheckTest(unittest.TestCase):
         self.server.qbc = types.SimpleNamespace(_REQUESTS_ARGS={"timeout": (15, 60)})
         self.plugin._IYUUAutoSeedPlus__apply_downloader_timeout(self.service)
         self.assertEqual(self.server.qbc._REQUESTS_ARGS, {"timeout": (15, 60)})
+
+    def test_category_assignment_uses_instance_timeout_and_preserves_save_path(self):
+        self.plugin._downloader_timeout = 120
+        self.plugin._IYUUAutoSeedPlus__set_qb_category(self.service, "ready", "keep_iyuu")
+        self.server.qbc.torrents_set_category.assert_called_once_with(
+            category="keep_iyuu", torrent_hashes="ready", requests_args={"timeout": (15, 120)})
+        self.server.qbc.torrents_set_location.assert_not_called()
+        PLUGIN.logger.error.assert_not_called()
+
+    def test_legacy_addition_includes_hash_lookup_and_category_assignment(self):
+        self.plugin._labelsafterseed = "辅种"
+        self.plugin._addhosttotag = False
+        self.plugin._skipverify = True
+        PLUGIN.StringUtils.generate_random_str.return_value = "unique-tag"
+        self.server.add_torrent.return_value = (True, [])
+        self.fetch.return_value = [{"hash": "ready", "tags": "unique-tag"}], False
+        result = self.plugin._IYUUAutoSeedPlus__download(self.service, b"torrent", "/original/data", "keep_iyuu", "test")
+        self.assertEqual(result, "ready")
+        self.server.qbc.torrents_set_category.assert_called_once()
+        self.server.add_torrent.assert_called_once()
+        self.assertEqual(self.server.add_torrent.call_args.kwargs["download_dir"], "/original/data")
+        PLUGIN.logger.error.assert_not_called()
 
     def test_diagnostic_compares_core_and_isolated_queries_without_actions(self):
         self.query.stop()
@@ -372,6 +397,70 @@ class RecheckTest(unittest.TestCase):
             self.assertNotEqual(QUERY.qb_recheck_state({"state": state, "progress": 1})[0], "ready")
         self.assertNotEqual(QUERY.qb_recheck_state({"state": "pausedUP", "progress": 0.5})[0], "ready")
         self.assertEqual(QUERY.qb_recheck_state({"state": "stoppedUP", "progress": 1})[0], "ready")
+
+    def test_initialization_business_failure_stops_before_scanning_downloaders(self):
+        self.plugin._enabled, self.plugin._cron, self.plugin._token = True, "0 1 * * *", "test"
+        self.plugin._downloaders = ["qb"]
+        self.plugin.get_config = Mock(return_value={})
+        self.plugin.iyuu_helper = Mock()
+        self.plugin.iyuu_helper.prepare.return_value = False, "reportExisting 业务错误：invalid token"
+        self.plugin.iyuu_helper.status.return_value = {"retryable": False}
+        with patch.object(PLUGIN, "DownloaderHelper") as downloaders:
+            self.plugin.auto_seed()
+        downloaders.assert_not_called()
+        self.assertFalse(self.plugin._is_auto_seed_running)
+        self.assertIn("未扫描下载器", str(PLUGIN.logger.error.call_args))
+
+    def test_initialization_transient_failure_is_retried_with_cancelable_wait(self):
+        self.plugin._enabled, self.plugin._cron, self.plugin._token = True, "0 1 * * *", "test"
+        self.plugin._downloaders = ["qb"]
+        self.plugin.get_config = Mock(return_value={})
+        self.plugin.iyuu_helper = Mock()
+        self.plugin.iyuu_helper.prepare.side_effect = [(False, "HTTP503"), (True, "")]
+        self.plugin.iyuu_helper.status.return_value = {"retryable": True}
+        with patch.object(PLUGIN.IYUUAutoSeedPlus, "service_infos", new_callable=unittest.mock.PropertyMock, return_value={}):
+            self.plugin.auto_seed()
+        self.assertEqual(self.plugin.iyuu_helper.prepare.call_count, 2)
+        self.plugin._event.wait.assert_called_once_with(1)
+
+    def test_restore_queue_only_accepts_tagged_existing_tasks_and_does_not_start(self):
+        self.plugin._downloaders, self.plugin._auto_downloader = ["qb"], ""
+        self.plugin._skipverify, self.plugin._auto_start = True, True
+        self.plugin._labelsafterseed = "辅种"
+        self.plugin._recheck_torrents = {}
+        PLUGIN.DownloaderHelper.return_value.get_service.return_value = self.service
+        first, running, other = "a" * 40, "b" * 40, "c" * 40
+        self.fetch.return_value = [
+            {"hash": first, "state": "pausedUP", "progress": 1, "tags": "辅种"},
+            {"hash": running, "state": "uploading", "progress": 1, "tags": "辅种"},
+            {"hash": other, "state": "pausedUP", "progress": 1, "tags": "manual"},
+        ], False
+        result = self.plugin.restore_recheck({"qb": [first, running, other]})
+        self.assertTrue(result.success)
+        self.assertEqual(self.plugin._recheck_torrents, {"qb": [first]})
+        self.server.start_torrents.assert_not_called()
+        self.plugin.save_data.assert_called_once_with("recheck_queue", {"qb": [first]})
+
+    def test_restore_queue_rejects_unknown_downloaders_and_keeps_queue_on_query_error(self):
+        self.plugin._downloaders, self.plugin._auto_downloader = ["qb"], ""
+        self.plugin._skipverify, self.plugin._auto_start = True, True
+        self.plugin._labelsafterseed = "辅种"
+        before = {k: list(v) for k, v in self.plugin._recheck_torrents.items()}
+        self.assertFalse(self.plugin.restore_recheck({"unknown": ["a" * 40]}).success)
+        self.fetch.return_value = [], True
+        PLUGIN.DownloaderHelper.return_value.get_service.return_value = self.service
+        self.assertFalse(self.plugin.restore_recheck({"qb": ["a" * 40]}).success)
+        self.assertEqual(self.plugin._recheck_torrents, before)
+
+    def test_reload_restores_only_valid_queue_for_configured_downloaders(self):
+        fresh = PLUGIN.IYUUAutoSeedPlus()
+        fresh.get_data = Mock(return_value={"qb": ["a" * 40], "removed-downloader": ["b" * 40], "bad": [None]})
+        fresh.update_config = Mock()
+        fresh.get_config = Mock(return_value={})
+        PLUGIN.SiteOper.return_value.list_order_by_pri.return_value = []
+        fresh.init_plugin({"enabled": False, "downloaders": ["qb", "bad"]})
+        self.assertEqual(fresh._recheck_torrents, {"qb": ["a" * 40]})
+        fresh.get_data.assert_called_once_with("recheck_queue")
 
     def test_legacy_added_hash_lookup_uses_isolated_query_and_checks_exact_tag(self):
         self.fetch.return_value = [{"hash": "a", "tags": "other, unique-tag"}], False

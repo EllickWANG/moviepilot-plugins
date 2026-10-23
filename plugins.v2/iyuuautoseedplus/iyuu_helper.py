@@ -3,7 +3,6 @@ import json
 import time
 from typing import Tuple, Optional
 
-from app.log import logger
 from app.utils.http import RequestUtils
 
 
@@ -20,6 +19,11 @@ class IyuuHelper(object):
     def __init__(self, token: str, timeout: int = 60):
         self._token = token
         self._timeout = timeout or 60
+        self._sites = {}
+        self._sid_sha1 = None
+        self._last_error = ""
+        self._last_request = {}
+        self._retryable = False
         if self._token:
             self.init_config()
 
@@ -30,69 +34,105 @@ class IyuuHelper(object):
         """
         向IYUUApi发送请求
         """
-        if method == "post":
-            ret = RequestUtils(
-                accept_type="application/json",
-                headers={'token': self._token},
-                timeout=self._timeout
-            ).post_res(f'{self._api_base + url}', json=params)
-        else:
-            ret = RequestUtils(
-                accept_type="application/json",
-                headers={'token': self._token},
-                timeout=self._timeout
-            ).get_res(f'{self._api_base + url}', params=params)
-        if ret:
-            result = ret.json()
-            if result.get('code') == 0:
-                return result.get('data'), ""
+        started = time.monotonic()
+        self._retryable = False
+        self._last_request = {"path": url}
+        try:
+            request = RequestUtils(headers={'token': self._token, 'Accept': 'application/json'}, timeout=self._timeout)
+            if method == "post":
+                ret = request.post_res(self._api_base + url, json=params)
             else:
-                return None, f'请求IYUU失败，状态码：{result.get("code")}，返回信息：{result.get("msg")}'
-        elif ret is not None:
-            return None, f"请求IYUU失败，状态码：{ret.status_code}，错误原因：{ret.reason}"
-        else:
-            return None, f"请求IYUU失败，未获取到返回信息（超时或网络异常，timeout={self._timeout}秒）"
+                ret = request.get_res(self._api_base + url, params=params)
+            if ret is None:
+                self._retryable = True
+                return None, f"IYUU接口 {url} 未获取到返回信息（超时或网络异常，timeout={self._timeout}秒）"
+            self._last_request["http_status"] = ret.status_code
+            if ret.status_code >= 400:
+                self._retryable = ret.status_code == 429 or ret.status_code >= 500
+                message = ""
+                try:
+                    body = ret.json()
+                    if isinstance(body, dict):
+                        message = str(body.get('msg') or body.get('message') or '')[:500]
+                        if self._token:
+                            message = message.replace(self._token, '<token>')
+                except (TypeError, ValueError):
+                    pass
+                return None, f"IYUU接口 {url} 返回HTTP {ret.status_code}：{message}"
+            try:
+                result = ret.json()
+            except (ValueError, TypeError):
+                self._retryable = True
+                return None, f"IYUU接口 {url} 返回非JSON内容（HTTP {ret.status_code}）"
+            if not isinstance(result, dict):
+                return None, f"IYUU接口 {url} 返回格式错误（{type(result).__name__}）"
+            self._last_request["code"] = result.get('code')
+            if result.get('code') in (0, "0"):
+                return result.get('data'), ""
+            message = str(result.get('msg') or result.get('message') or '无错误说明')[:500]
+            if self._token:
+                message = message.replace(self._token, '<token>')
+            self._retryable = str(result.get('code')) in {"429", "500", "502", "503", "504"}
+            return None, f'IYUU接口 {url} 业务错误 {result.get("code")}：{message}'
+        except Exception as error:
+            self._retryable = True
+            return None, f"IYUU接口 {url} 请求异常（{type(error).__name__}）"
+        finally:
+            self._last_request["elapsed"] = round(time.monotonic() - started, 3)
 
     def get_torrent_url(self, sid: str) -> Tuple[Optional[str], Optional[str]]:
         if not sid:
             return None, None
         if not self._sites:
-            self._sites = self.__get_sites()
+            self._sites, self._last_error = self.__get_sites()
         if not self._sites.get(sid):
             return None, None
         site = self._sites.get(sid)
         return site.get('base_url'), site.get('download_page')
 
-    def __get_sites(self) -> dict:
+    def __get_sites(self) -> Tuple[dict, str]:
         """
         返回支持辅种的全部站点
         :return: 站点列表、错误信息
         """
         result, msg = self.__request_iyuu(url='/reseed/sites/index')
-        if result:
+        if isinstance(result, dict) and isinstance(result.get('sites'), list) and result['sites']:
             ret_sites = {}
             sites = result.get('sites')
             for site in sites:
+                if not isinstance(site, dict) or site.get('id') is None:
+                    return {}, "IYUU站点列表响应包含无效站点ID"
                 ret_sites[site.get('id')] = site
-            return ret_sites
+            return ret_sites, ""
         else:
-            logger.warning(msg)
-            return {}
+            return {}, msg or "IYUU站点列表响应缺少有效 sites"
 
-    def __report_existing(self) -> Optional[str]:
+    def __report_existing(self) -> Tuple[Optional[str], str]:
         """
         汇报辅种的站点
         :return:
         """
         if not self._sites:
-            self._sites = self.__get_sites()
+            self._sites, msg = self.__get_sites()
+            if not self._sites:
+                return None, msg
         sid_list = list(self._sites.keys())
         result, msg = self.__request_iyuu(url='/reseed/sites/reportExisting',
                                           method='post',
                                           params={'sid_list': sid_list})
-        if result:
-            return result.get('sid_sha1')
-        return None
+        if isinstance(result, dict) and isinstance(result.get('sid_sha1'), str) and result['sid_sha1'].strip():
+            return result['sid_sha1'], ""
+        return None, msg or "IYUU接口 /reseed/sites/reportExisting 响应缺少 sid_sha1"
+
+    def prepare(self) -> Tuple[bool, str]:
+        """在扫描下载器前初始化站点哈希，保留失败接口和真实业务原因。"""
+        if not self._sid_sha1:
+            self._sid_sha1, self._last_error = self.__report_existing()
+        return bool(self._sid_sha1), self._last_error
+
+    def status(self) -> dict:
+        return {"ready": bool(self._sid_sha1), "sites_count": len(self._sites),
+                "error": self._last_error, "retryable": self._retryable, "request": dict(self._last_request)}
 
     def get_seed_info(self, info_hashs: list) -> Tuple[Optional[dict], str]:
         """
@@ -104,9 +144,9 @@ class IyuuHelper(object):
         if not info_hashs:
             return None, "请求IYUU失败，未提供种子Hash"
         if not self._sid_sha1:
-            self._sid_sha1 = self.__report_existing()
+            self.prepare()
         if not self._sid_sha1:
-            return None, "请求IYUU失败，未获取到站点哈希 sid_sha1，本批稍后重试"
+            return None, f"IYUU站点初始化失败：{self._last_error}"
         info_hashs.sort()
         json_data = json.dumps(info_hashs, separators=(',', ':'), ensure_ascii=False)
         sha1 = self.get_sha1(json_data)
