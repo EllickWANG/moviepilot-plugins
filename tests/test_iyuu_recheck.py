@@ -132,6 +132,19 @@ class QueryClientTest(unittest.TestCase):
         self.client.query(limit=1)
         self.assertFalse(self.api.Client.call_args.kwargs["VERIFY_WEBUI_CERTIFICATE"])
 
+    def test_direct_queries_override_proxies_only_on_private_client(self):
+        self.client.direct = True
+        self.api.Client.return_value.torrents_info.return_value = []
+        self.client.query(limit=1)
+        args = self.api.Client.call_args.kwargs["REQUESTS_ARGS"]
+        self.assertEqual(args["proxies"], {"http": "", "https": "", "all": ""})
+        self.assertEqual(self.source._REQUESTS_ARGS["proxies"], {"https": "http://proxy"})
+        import requests
+        from requests.utils import select_proxy
+        with patch.dict("os.environ", {"HTTPS_PROXY": "http://environment-proxy:8080", "ALL_PROXY": "http://fallback:8080"}):
+            settings = requests.Session().merge_environment_settings("https://qb.example", args["proxies"].copy(), False, None, None)
+        self.assertFalse(select_proxy("https://qb.example", settings["proxies"]))
+
     def test_concurrent_queries_do_not_share_session_concurrently(self):
         entered, release = threading.Event(), threading.Event()
         active = []
@@ -285,7 +298,7 @@ class RecheckTest(unittest.TestCase):
         self.server.qbc = source
         self.service.config = types.SimpleNamespace(config={"host": "https://qb.example", "password": "secret"})
         PLUGIN.DownloaderHelper.return_value.get_service.return_value = self.service
-        isolated = Mock(source=source, config=self.service.config.config, timeout=self.plugin._downloader_timeout)
+        isolated = Mock(source=source, config=self.service.config.config, timeout=self.plugin._downloader_timeout, direct=False)
         isolated.query.return_value = {"torrents": [{"hash": "a"}], "error": None, "attempts": 1, "elapsed": 0.1}
         with patch.object(PLUGIN, "QbQueryClient", return_value=isolated):
             result = self.plugin.diagnose_downloader("qb")
@@ -296,6 +309,33 @@ class RecheckTest(unittest.TestCase):
         self.server.add_torrent.assert_not_called()
         self.server.delete_torrents.assert_not_called()
         self.assertNotIn("secret", str(result.data))
+
+    def test_diagnostic_direct_override_does_not_save_or_change_configuration(self):
+        self.query.stop()
+        self.plugin._downloaders = ["qb"]
+        self.plugin._auto_downloader = ""
+        self.plugin._downloader_direct = False
+        source = types.SimpleNamespace(torrents_info=Mock(return_value=[]), _VERIFY_WEBUI_CERTIFICATE=True)
+        self.server.qbc = source
+        self.service.config = types.SimpleNamespace(config={"host": "https://qb.example"})
+        PLUGIN.DownloaderHelper.return_value.get_service.return_value = self.service
+        isolated = Mock()
+        isolated.query.return_value = {"torrents": [], "error": None, "attempts": 1, "elapsed": 0.1}
+        with patch.object(PLUGIN, "QbQueryClient", return_value=isolated) as factory:
+            result = self.plugin.diagnose_downloader("qb", direct=True)
+        self.assertTrue(factory.call_args.kwargs["direct"])
+        self.assertEqual(result.data["iyuu"]["connection_mode"], "direct")
+        self.assertFalse(self.plugin._downloader_direct)
+        self.server.start_torrents.assert_not_called()
+
+    def test_direct_configuration_is_loaded_and_saved(self):
+        PLUGIN.SiteOper.return_value.list_order_by_pri.return_value = []
+        with patch.object(self.plugin, "get_config", return_value={}, create=True), \
+                patch.object(self.plugin, "update_config", create=True) as save:
+            self.plugin._IYUUAutoSeedPlus__load_config({"downloader_direct": "true"})
+            self.plugin._IYUUAutoSeedPlus__update_config()
+        self.assertTrue(self.plugin._downloader_direct)
+        self.assertTrue(save.call_args.args[0]["downloader_direct"])
 
     def test_diagnostic_rejects_downloaders_outside_plugin_configuration(self):
         self.plugin._downloaders = ["other"]

@@ -18,10 +18,11 @@ def query_error_message(error):
 
 
 class QbQueryClient:
-    def __init__(self, source, config, timeout):
+    def __init__(self, source, config, timeout, direct=False):
         self.source = source
         self.config = dict(config)
         self.timeout = timeout
+        self.direct = direct
         self._client = None
         self._lock = RLock()
         self._closed = False
@@ -32,6 +33,9 @@ class QbQueryClient:
         # 保留宿主的证书、请求和认证设置，不改动共享客户端。
         request_args = dict(getattr(self.source, "_REQUESTS_ARGS", None) or {})
         request_args["timeout"] = (min(self.timeout, 15), self.timeout)
+        if self.direct:
+            # 空协议代理覆盖 Requests 从环境合并的代理，仅作用于该独立客户端。
+            request_args["proxies"] = {"http": "", "https": "", "all": ""}
         return Client(
             host=self.config.get("host") or self.source.host,
             port=self.config.get("port"),

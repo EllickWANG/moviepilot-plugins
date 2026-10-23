@@ -152,7 +152,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.15"
+    plugin_version = "2.15.16"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -190,6 +190,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     _auto_start = False
     _request_timeout = 60
     _downloader_timeout = 15
+    _downloader_direct = False
     _chunk_size = 50
     _site_aliases_text = ""
     _site_aliases = {}
@@ -297,6 +298,7 @@ class IYUUAutoSeedPlus(_PluginBase):
         self._size = _float_config(config.get("size"))
         self._request_timeout = _int_config(config.get("request_timeout"), 60, 5, 300)
         self._downloader_timeout = _int_config(config.get("downloader_timeout"), 15, 3, 300)
+        self._downloader_direct = _bool_config(config.get("downloader_direct"))
         self._chunk_size = _int_config(config.get("chunk_size"), 50, 1, 200)
         self._site_aliases_text = _text_config(config.get("site_aliases"))
         self._site_aliases = _parse_site_aliases(self._site_aliases_text)
@@ -402,7 +404,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "summary": "只读检查辅种下载器查询连接",
         }]
 
-    def diagnose_downloader(self, downloader: str, network: bool = False) -> Response:
+    def diagnose_downloader(self, downloader: str, network: bool = False, direct: Optional[bool] = None) -> Response:
         """对比宿主与辅种独立会话，仅查询一条记录，不改变种子状态。"""
         if downloader not in set(self._downloaders + [self._auto_downloader]):
             return Response(success=False, message="下载器未在辅种配置中启用")
@@ -419,7 +421,7 @@ class IYUUAutoSeedPlus(_PluginBase):
         except Exception as error:
             core = {"success": False, "error": query_error_message(error)}
         core["elapsed"] = round(monotonic() - started, 3)
-        self.__query_torrents(service, limit=1)
+        self.__query_torrents(service, limit=1, direct=direct)
         from importlib.metadata import PackageNotFoundError, version
         import platform
         import ssl
@@ -607,6 +609,15 @@ class IYUUAutoSeedPlus(_PluginBase):
                                             'min': 3,
                                             'max': 300,
                                             'placeholder': '默认15秒'
+                                        }
+                                    },
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'downloader_direct',
+                                            'label': '下载器查询直连',
+                                            'hint': '跳过代理，只影响 IYUU 查询；下载器可直连时开启',
+                                            'persistent-hint': True
                                         }
                                     }
                                 ]
@@ -966,6 +977,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "size": "",
             "request_timeout": 60,
             "downloader_timeout": 15,
+            "downloader_direct": False,
             "chunk_size": 50,
             "site_aliases": ""
         }
@@ -995,6 +1007,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "size": self._size,
             "request_timeout": self._request_timeout,
             "downloader_timeout": self._downloader_timeout,
+            "downloader_direct": self._downloader_direct,
             "chunk_size": self._chunk_size,
             "site_aliases": self._site_aliases_text,
             "success_caches": self._success_caches,
@@ -1550,11 +1563,12 @@ class IYUUAutoSeedPlus(_PluginBase):
         self._applied_downloader_timeouts[service_key] = self._downloader_timeout
         logger.info(f"下载器 {service.name} 辅种查询及添加请求超时 {self._downloader_timeout} 秒（独立请求配置）")
 
-    def __query_torrents(self, service, ids=None, status=None, limit=None):
+    def __query_torrents(self, service, ids=None, status=None, limit=None, direct=None):
         """辅种读取使用独立会话，避免与宿主后台任务并发复用连接和登录状态。"""
         server = service.instance
         source = getattr(server, "qbc", None)
         config = getattr(getattr(service, "config", None), "config", None)
+        direct_mode = self._downloader_direct if direct is None else direct
         if service.type != "qbittorrent" or not source or not isinstance(config, dict):
             if status == "seeding":
                 rows = server.get_completed_torrents()
@@ -1563,16 +1577,17 @@ class IYUUAutoSeedPlus(_PluginBase):
         with self._query_clients_lock:
             client = self._query_clients.get(service.name)
             if (client is None or client.source is not source or client.config != config
-                    or client.timeout != self._downloader_timeout):
+                    or client.timeout != self._downloader_timeout or client.direct != direct_mode):
                 if client is not None:
                     client.close()
-                client = QbQueryClient(source, config, self._downloader_timeout)
+                client = QbQueryClient(source, config, self._downloader_timeout, direct=direct_mode)
                 self._query_clients[service.name] = client
         result = client.query(ids=ids, status=status, limit=limit)
         self._last_queries[service.name] = {
             "success": not bool(result["error"]), "error": result["error"],
             "attempts": result["attempts"], "elapsed": result["elapsed"],
             "count": len(result["torrents"]),
+            "connection_mode": "direct" if direct_mode else "inherit",
         }
         if result["error"]:
             logger.warning(
