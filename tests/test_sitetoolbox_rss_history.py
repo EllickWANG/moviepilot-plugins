@@ -66,7 +66,7 @@ def load_plugin():
     path = ROOT / "plugins.v2/sitetoolbox/__init__.py"
     spec = importlib.util.spec_from_file_location("sitetoolbox_rss_test", path)
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, modules):
+    with patch.dict(sys.modules, {**modules, "sitetoolbox_rss_test": module}):
         spec.loader.exec_module(module)
     return module
 
@@ -133,11 +133,11 @@ class RssFailureHistoryTest(unittest.TestCase):
         self.record(21)
         self.assertEqual(self.record(23)["failure_days"], 1)
 
-    def test_offline_is_separate_and_interrupts_rss_streak(self):
+    def test_offline_is_visible_and_uses_the_shared_streak(self):
         self.record(21)
         offline = self.record(22, "offline")
-        self.assertEqual((offline["state"], offline["failure_days"]), ("offline", 0))
-        self.assertEqual(self.record(23)["failure_days"], 1)
+        self.assertEqual((offline["state"], offline["failure_days"], offline["confirmed"]), ("offline", 2, False))
+        self.assertEqual(self.record(23)["failure_days"], 3)
 
     def test_warning_and_error_share_failure_streak(self):
         self.record(21, "warning")
@@ -158,7 +158,7 @@ class RssFailureHistoryTest(unittest.TestCase):
         self.record(22)
         history = copy.deepcopy(self.storage)
         for threshold, state in ((2, "error"), (5, "pending"), (1, "error")):
-            self.configure(**{**self.plugin.config, "rss_failure_days": threshold})
+            self.configure(**{**self.plugin.config, "monitor_failure_days": threshold})
             result = self.plugin._latest_results[0]
             self.assertEqual(result["state"], state)
             self.assertEqual(result["failure_days"], 2)
@@ -214,13 +214,15 @@ class RssFailureHistoryTest(unittest.TestCase):
             page = PLUGIN._toolbox_page(self.plugin)
         self.assertEqual(overview.call_args.kwargs["rss_bad"], 0)
         self.assertIn("待观察", str(page))
-        self.assertIn("连续失败 1/3 天", str(page))
+        self.assertIn("连续异常 1/3 天", str(page))
 
     def test_form_exposes_failure_days_with_default(self):
         with patch.object(PLUGIN, "_downloader_options", return_value=[]):
             form, defaults = self.plugin.get_form()
-        self.assertEqual(defaults["rss_failure_days"], 3)
-        self.assertIn("rss_failure_days", str(form))
+        self.assertEqual(defaults["monitor_failure_days"], 3)
+        self.assertNotIn("rss_failure_days", defaults)
+        self.assertIsNone(form)
+        self.assertEqual(self.plugin.get_render_mode(), ("vue", "dist/assets"))
 
 
 if __name__ == "__main__":

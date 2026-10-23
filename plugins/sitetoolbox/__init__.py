@@ -10,7 +10,7 @@ import pkgutil
 import re
 import sys
 import time
-from datetime import date, timedelta
+from datetime import datetime
 from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -32,12 +32,14 @@ from app.schemas.types import SystemConfigKey
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
+from .monitor import MODULES, classify as classify_monitor, is_due, next_run, normalize_plan, observe
+
 
 class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
-    plugin_desc = "站点诊断与适配工具集合，支持 RSS 测试修复、站点索引、用户数据解析适配、缺失文件种子清理和馒头登录检查。"
+    plugin_desc = "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.3.30"
+    plugin_version = "1.4.0"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -81,6 +83,8 @@ class sitetoolbox(_PluginBase):
     _aru_originals: dict[tuple[type, str], Any] = {}
     _jobs_lock = Lock()
     _rss_history_lock = Lock()
+    _monitor_run_lock = Lock()
+    _monitor_plan = normalize_plan({})
     _error_log_lock = Lock()
     _error_capture_installed = False
     _original_logger_method: Optional[Callable] = None
@@ -100,6 +104,8 @@ class sitetoolbox(_PluginBase):
             config.get("latest_userdata_results") if isinstance(config.get("latest_userdata_results"), list) else []
         )
         self._latest_userdata_checked_at = str(config.get("latest_userdata_checked_at") or "")
+        self._latest_userdata_results = [{**item, "tested_at": item.get("tested_at") or self._latest_userdata_checked_at}
+                                         for item in self._latest_userdata_results]
         self._latest_job_states = _normalize_job_states(config.get("latest_job_states"))
         self._patch_userdata = _to_bool(config.get("patch_userdata", True), True)
         self._site_conf = config.get("site_conf") or _merge_legacy_site_conf(
@@ -127,7 +133,9 @@ class sitetoolbox(_PluginBase):
         self._mteam_auto_cron = str(config.get("mteam_auto_cron") or "0 9 * * *").strip()
         self._rss_auto_enabled = _to_bool(config.get("rss_auto_enabled", True), True)
         self._rss_auto_cron = str(config.get("rss_auto_cron") or "0 8 * * *").strip()
-        self._rss_failure_days = _int_or_default(config.get("rss_failure_days"), 3, minimum=1, maximum=365)
+        self._monitor_plan = normalize_plan(config)
+        self._rss_failure_days = self._monitor_plan["monitor_failure_days"]
+        self.__class__._monitor_plan = self._monitor_plan
         self._latest_results = [
             _rss_result_status(item, self._rss_failure_days) for item in self._latest_results
         ]
@@ -201,52 +209,32 @@ class sitetoolbox(_PluginBase):
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if not self._enabled:
+        if not self._enabled or not self._monitor_plan["monitor_enabled"] or not self._monitor_plan["monitor_modules"]:
             return []
-        services: List[Dict[str, Any]] = []
-        if self._cleanup_auto_enabled and self._cleanup_auto_cron and self._cleanup_downloader_names:
-            try:
-                trigger = CronTrigger.from_crontab(self._cleanup_auto_cron)
-            except Exception as err:
-                logger.error(f"站点工具箱缺失种子定时任务 cron 无效：{self._cleanup_auto_cron} - {err}")
-            else:
-                services.append({
-                    "id": "sitetoolbox_missing_preview",
-                    "name": "站点工具箱缺失种子扫描/清理",
-                    "trigger": trigger,
-                    "func": self.auto_preview_missing_torrents,
-                    "kwargs": {},
-                })
-        if self._mteam_auto_enabled and self._mteam_auto_cron:
-            try:
-                trigger = CronTrigger.from_crontab(self._mteam_auto_cron)
-            except Exception as err:
-                logger.error(f"站点工具箱馒头登录检查定时任务 cron 无效：{self._mteam_auto_cron} - {err}")
-            else:
-                services.append({
-                    "id": "sitetoolbox_mteam_login_check",
-                    "name": "站点工具箱馒头登录检查",
-                    "trigger": trigger,
-                    "func": self.auto_check_mteam_login,
-                    "kwargs": {},
-                })
-        if self._rss_auto_enabled and self._rss_auto_cron and self._site_ids:
-            try:
-                trigger = CronTrigger.from_crontab(self._rss_auto_cron)
-            except Exception as err:
-                logger.error(f"站点工具箱 RSS 定时测试 cron 无效：{self._rss_auto_cron} - {err}")
-            else:
-                services.append({
-                    "id": "sitetoolbox_rss_test",
-                    "name": "站点工具箱 RSS 定时测试",
-                    "trigger": trigger,
-                    "func": self.auto_test_rss,
-                    "kwargs": {},
-                })
-        return services
+        # 统一入口按分钟检查计划，执行时段、跨午夜和定点时间都由同一份配置判定。
+        return [{
+            "id": "sitetoolbox_monitor",
+            "name": "站点工具箱统一监控",
+            "trigger": CronTrigger.from_crontab("* * * * *"),
+            "func": self.run_scheduled_monitor,
+            "kwargs": {},
+        }]
+
+    def run_scheduled_monitor(self):
+        now = datetime.now()
+        if not is_due(self._monitor_plan, now):
+            return
+        slot = now.strftime("%Y-%m-%d %H:%M")
+        if self.get_data("monitor_last_slot") == slot:
+            return
+        self.run_monitor(notify=True, slot=slot)
 
     def get_api(self) -> List[dict]:
         return [
+            {"path": "/overview", "endpoint": _api_overview, "methods": ["GET"], "auth": "bear", "summary": "工具箱工作台"},
+            {"path": "/options", "endpoint": _api_options, "methods": ["GET"], "auth": "bear", "summary": "配置范围选项"},
+            {"path": "/monitor/run", "endpoint": _api_monitor_run, "methods": ["POST"], "auth": "bear", "summary": "执行统一监控"},
+            {"path": "/errors", "endpoint": _api_errors, "methods": ["GET"], "auth": "bear", "summary": "最近系统错误聚合"},
             {
                 "path": "/test/rss",
                 "endpoint": _api_test_selected_rss,
@@ -345,346 +333,21 @@ class sitetoolbox(_PluginBase):
             },
         ]
 
+    @staticmethod
+    def get_render_mode() -> Tuple[str, Optional[str]]:
+        return "vue", "dist/assets"
+
     def get_form(self) -> Tuple[Optional[List[dict]], dict]:
-        sites = [site for site in SiteOper().list_order_by_pri() if site and site.id]
-        site_options = [
-            {
-                "title": f"{site.name} ({site.domain})" if site.domain else site.name,
-                "value": site.id,
-            }
-            for site in sites
-        ]
-        downloader_options = _downloader_options()
-        mteam_site_options = [
-            {
-                "title": f"{site.name} ({site.domain})" if site.domain else site.name,
-                "value": site.id,
-            }
-            for site in sites
-            if _is_mteam_site(site)
-        ]
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    _form_section("基础设置", "控制工具箱是否启用，以及系统错误记录保留时间。", [
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 6, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "enabled",
-                                        "label": "启用站点工具箱",
-                                        "hint": "关闭后会停用站点适配、系统错误记录和定时任务",
-                                    },
-                                }),
-                                _col(12, 6, {
-                                    "component": "VSelect",
-                                    "props": {
-                                        "model": "error_retention_days",
-                                        "label": "系统错误保留时间",
-                                        "items": _error_retention_options(),
-                                        "hint": "仅记录 ERROR/CRITICAL，详情页折叠展示",
-                                    },
-                                }),
-                            ],
-                        },
-                    ]),
-                    _form_section("缺失文件种子", "选择下载器并维护 missingFiles 种子；手动清理和定时自动清理都会先复查状态。", [
-                        {
-                            "component": "VAlert",
-                            "props": {
-                                "type": "warning",
-                                "variant": "tonal",
-                                "class": "mb-3",
-                                "text": "打开“同时删除数据文件”不会立即删除；只有点击详情页“清理”，或同时开启“定时自动清理”后才会执行删除。",
-                            },
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 8, {
-                                    "component": "VSelect",
-                                    "props": {
-                                        "model": "cleanup_downloader_names",
-                                        "label": "下载器",
-                                        "items": downloader_options,
-                                        "multiple": True,
-                                        "chips": True,
-                                        "clearable": True,
-                                        "hint": "仅支持 qBittorrent 的 missingFiles 状态",
-                                    },
-                                }),
-                                _col(12, 4, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "cleanup_delete_files",
-                                        "label": "同时删除数据文件",
-                                        "color": "warning",
-                                        "hint": "高风险：清理时要求下载器同步删除数据",
-                                    },
-                                }),
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 4, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "cleanup_auto_enabled",
-                                        "label": "定时扫描",
-                                        "hint": "只刷新预览，不会自动清理",
-                                    },
-                                }),
-                                _col(12, 4, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "cleanup_auto_cleanup",
-                                        "label": "定时自动清理",
-                                        "color": "warning",
-                                        "hint": "开启后定时扫描会自动清理仍为 missingFiles 的种子",
-                                    },
-                                }),
-                                _col(12, 4, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "cleanup_auto_cron",
-                                        "label": "扫描周期(cron)",
-                                        "placeholder": "0 */6 * * *",
-                                        "hint": "默认每 6 小时扫描一次",
-                                    },
-                                }),
-                            ],
-                        },
-                    ]),
-                    _form_section("RSS 诊断", "测试或修复站点 RSS 配置，操作入口在详情页。", [
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 8, {
-                                    "component": "VSelect",
-                                    "props": {
-                                        "model": "site_ids",
-                                        "label": "RSS 站点",
-                                        "items": site_options,
-                                        "multiple": True,
-                                        "chips": True,
-                                        "clearable": True,
-                                        "hint": "不影响站点订阅，只作为工具箱测试范围",
-                                    },
-                                }),
-                                _col(12, 4, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "timeout",
-                                        "label": "请求超时(秒)",
-                                        "type": "number",
-                                        "min": 5,
-                                        "max": 120,
-                                        "hint": "RSS 获取和解析共用",
-                                    },
-                                }),
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 6, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "auto_discover",
-                                        "label": "未配置 RSS 时自动获取",
-                                        "hint": "站点没有 RSS 地址时访问站点页面尝试生成",
-                                    },
-                                }),
-                                _col(12, 6, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "save_discovered",
-                                        "label": "保存自动获取到的 RSS",
-                                        "hint": "自动获取成功后写回站点配置",
-                                    },
-                                }),
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 6, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "rss_auto_enabled",
-                                        "label": "定时测试 RSS",
-                                        "hint": "按周期测试已选站点的 RSS，连续失败达到设定天数后发送系统消息",
-                                    },
-                                }),
-                                _col(12, 6, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "rss_auto_cron",
-                                        "label": "测试周期(cron)",
-                                        "placeholder": "0 8 * * *",
-                                        "hint": "默认每天 8 点测试",
-                                    },
-                                }),
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 6, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "rss_failure_days",
-                                        "label": "RSS 连续失败天数",
-                                        "type": "number",
-                                        "min": 1,
-                                        "max": 365,
-                                        "hint": "默认 3 天；同一天重复测试只计一天，成功或漏测一天即重新累计，保存后生效",
-                                        "persistent-hint": True,
-                                    },
-                                }),
-                            ],
-                        },
-                    ]),
-                    _form_section("站点适配", "补充或覆盖站点索引规则，并可启用用户数据解析修正。", [
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 4, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "patch_userdata",
-                                        "label": "启用用户数据解析修正",
-                                        "hint": "只修正账号数据字段，不参与做种数和做种体积完整性判断",
-                                    },
-                                }),
-                                _col(12, 3, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "userdata_stale_days",
-                                        "label": "用户数据过期天数",
-                                        "type": "number",
-                                        "min": 1,
-                                        "max": 365,
-                                        "hint": "超过该天数未更新的用户数据标记为警告",
-                                        "persistent-hint": True,
-                                    },
-                                }),
-                                _col(12, 5, {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "info",
-                                        "variant": "tonal",
-                                        "text": "适配配置兼容原 siteadapter，可直接粘贴 JSON 或 domain|base64(json) 多行格式。",
-                                    },
-                                }),
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, None, {
-                                    "component": "VTextarea",
-                                    "props": {
-                                        "model": "site_conf",
-                                        "label": "适配规则",
-                                        "rows": 10,
-                                        "auto-grow": True,
-                                        "placeholder": "domain|base64(json)",
-                                    },
-                                }),
-                            ],
-                        },
-                    ]),
-                    _form_section("馒头登录检查", "检查 M-Team 真实登录历史，用于判断是否满足站点亲自浏览器登录要求。", [
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 6, {
-                                    "component": "VSelect",
-                                    "props": {
-                                        "model": "mteam_site_ids",
-                                        "label": "馒头站点",
-                                        "items": mteam_site_options,
-                                        "multiple": True,
-                                        "chips": True,
-                                        "clearable": True,
-                                        "hint": "不选择时检查全部馒头站点",
-                                        "persistent-hint": True,
-                                    },
-                                }),
-                                _col(12, 3, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "mteam_warning_days",
-                                        "label": "提醒天数",
-                                        "type": "number",
-                                        "min": 1,
-                                        "max": 365,
-                                    },
-                                }),
-                                _col(12, 3, {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "mteam_auto_enabled",
-                                        "label": "定时检查",
-                                    },
-                                }),
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                _col(12, 6, {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "mteam_auto_cron",
-                                        "label": "检查周期(cron)",
-                                        "placeholder": "0 9 * * *",
-                                        "hint": "默认每天 9 点检查",
-                                    },
-                                }),
-                            ],
-                        },
-                    ]),
-                ],
-            }
-        ], {
-            "enabled": True,
-            "site_ids": [],
-            "timeout": 20,
-            "auto_discover": True,
-            "save_discovered": False,
-            "latest_results": [],
-            "latest_userdata_results": [],
-            "latest_userdata_checked_at": "",
-            "latest_job_states": {},
-            "patch_userdata": True,
-            "site_conf": "",
-            "cleanup_downloader_names": [],
-            "cleanup_delete_files": False,
-            "cleanup_auto_enabled": False,
-            "cleanup_auto_cleanup": False,
-            "cleanup_auto_cron": "0 */6 * * *",
-            "latest_missing_preview": {},
-            "latest_missing_cleanup": {},
-            "error_retention_days": 3,
-            "mteam_site_ids": [],
-            "mteam_warning_days": 25,
-            "userdata_stale_days": 2,
-            "mteam_auto_enabled": False,
-            "mteam_auto_cron": "0 9 * * *",
-            "rss_auto_enabled": True,
-            "rss_auto_cron": "0 8 * * *",
-            "rss_failure_days": 3,
-            "latest_mteam_login_check": {},
-        }
+        return None, self._settings_snapshot()
 
     def get_page(self) -> Optional[List[dict]]:
-        return _toolbox_page(self)
+        return None
+
+    def _settings_snapshot(self) -> dict:
+        return {key: value for key, value in self._config_payload().items()
+                if not key.startswith("latest_") and key not in {
+                    "cleanup_auto_enabled", "cleanup_auto_cron", "mteam_auto_enabled", "mteam_auto_cron",
+                    "rss_auto_enabled", "rss_auto_cron", "rss_failure_days"}}
 
     def stop_service(self):
         self._unpatch_userdata()
@@ -722,54 +385,128 @@ class sitetoolbox(_PluginBase):
             "rss_failure_days": self._rss_failure_days,
             "latest_mteam_login_check": self._latest_mteam_login_check,
         }
+        payload.update(self._monitor_plan)
         payload.update(overrides)
         return payload
 
-    def _record_rss_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """按自然日记录连续失败，独立于配置保存，避免改阈值或重启时清空历史。"""
-        result = dict(result)
-        site_key = str(result.get("site_id"))
-        tested_day = date.fromisoformat(str(result.get("tested_at") or _now())[:10])
+    def _record_monitor_results(self, module: str, results: List[dict]) -> List[dict]:
         with self._rss_history_lock:
-            history = self.get_data("rss_failure_history")
-            history = dict(history) if isinstance(history, dict) else {}
-            previous = history.get(site_key)
-            if not isinstance(previous, dict):
-                # 升级前只保留了最后一次结果，最多用它补一条真实的检测记录。
-                last = next((item for item in self._latest_results
-                             if item.get("site_id") == result.get("site_id")), {})
-                previous = {
-                    "date": str(last.get("tested_at") or "")[:10],
-                    "days": last.get("failure_days", 1)
-                    if last.get("rss_state", last.get("state")) in {"error", "warning"} else 0,
-                }
-            try:
-                previous_day = date.fromisoformat(str(previous.get("date") or ""))
-            except ValueError:
-                previous_day = None
-            days = 0
-            if result.get("state") in {"error", "warning"}:
+            history = self.get_data("monitor_failure_history") or {}
+            history = history if isinstance(history, dict) else {}
+            legacy = (self.get_data("rss_failure_history") or {}) if module == "rss" else {}
+            recorded = []
+            for item in results:
+                item = dict(item)
+                object_id = str(item.get("object_id", item.get("site_id", "module")))
+                key = f"{module}:{object_id}"
+                if key not in history and module == "rss":
+                    previous = legacy.get(object_id) if isinstance(legacy, dict) else None
+                    if not previous:
+                        last = next((row for row in self._latest_results if str(row.get("site_id")) == object_id), {})
+                        previous = {"date": str(last.get("tested_at") or "")[:10],
+                                    "days": last.get("failure_days", 1)
+                                    if last.get("raw_state", last.get("rss_state", last.get("state"))) in {"error", "warning", "offline"} else 0}
+                    history[key] = previous
+                item.setdefault("tested_at", item.get("checked_at") or _now())
+                result, history = observe(history, key, item, self._rss_failure_days)
+                if module == "rss":
+                    result.update(rss_state=result["raw_state"], rss_message=result["raw_message"])
+                recorded.append(result)
+            self.save_data("monitor_failure_history", history)
+        return recorded
+
+    def _record_rss_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        return self._record_monitor_results("rss", [result])[0]
+
+    def run_monitor(self, site_ids: Optional[List[int]] = None, modules: Optional[List[str]] = None,
+                    notify: bool = False, slot: str = "", _lock_held: bool = False) -> str:
+        if not _lock_held and not self._monitor_run_lock.acquire(blocking=False):
+            return "已有检测正在运行，请等待当前检测完成"
+        started = _now()
+        run = {"id": str(time.time_ns()), "started_at": started, "status": "running", "steps": []}
+        try:
+            if slot:
+                self.save_data("monitor_last_slot", slot)
+            selected = modules if modules is not None else self._monitor_plan["monitor_modules"]
+            selected = [key for key in MODULES if key in selected]
+            ids = site_ids if site_ids is not None else self._site_ids
+            ids = ids or [site.id for site in SiteOper().list_order_by_pri() if site and site.id and getattr(site, "is_active", True)]
+            confirmed = 0
+            for index, module in enumerate(selected):
+                self._set_job_state("monitor", "统一检测", "running", f"{index + 1}/{len(selected)} · {MODULES[module]}",
+                                    started_at=started, finished_at="")
+                if module != "missing" and not ids:
+                    run["steps"].append({"module": module, "state": "skipped", "message": "没有启用的目标站点"})
+                    continue
                 try:
-                    previous_days = max(0, int(previous.get("days") or 0))
-                except (TypeError, ValueError):
-                    previous_days = 0
-                if previous_day == tested_day:
-                    days = max(1, previous_days)
-                elif previous_day == tested_day - timedelta(days=1):
-                    days = previous_days + 1
-                else:
-                    days = 1
-            history[site_key] = {"date": tested_day.isoformat(), "days": days}
-            self.save_data("rss_failure_history", history)
-        result["failure_days"] = days
-        return _rss_result_status(result, self._rss_failure_days)
+                    if module == "rss":
+                        results = [_test_site_rss(site_id) for site_id in ids]
+                        kept = [row for row in self._latest_results if row.get("site_id") not in ids]
+                        self._save_results([*results, *kept])
+                    elif module == "userdata":
+                        results = _check_userdata_health(ids)
+                        self._save_userdata_results(results)
+                        results = [row for row in self._latest_userdata_results if row.get("site_id") in ids]
+                    elif module == "mteam":
+                        mteam_ids = [site_id for site_id in ids if not self._mteam_site_ids or site_id in self._mteam_site_ids]
+                        if not mteam_ids:
+                            run["steps"].append({"module": module, "state": "skipped", "message": "没有匹配的馒头站点"})
+                            continue
+                        result = _build_mteam_login_check(mteam_ids, self._mteam_warning_days)
+                        self._save_mteam_login_check(result, site_ids=mteam_ids)
+                        results = [row for row in result["items"] if row.get("site_id") in mteam_ids]
+                    else:
+                        if not self._cleanup_downloader_names:
+                            run["steps"].append({"module": module, "state": "skipped", "message": "未选择下载器"})
+                            continue
+                        preview = _build_missing_torrent_preview(self._cleanup_downloader_names)
+                        self._save_missing_preview(preview)
+                        results = [item["monitor"] for item in preview["items"]] + preview.get("downloader_status", [])
+                        cleanup_items = self._confirmed_missing_items(preview)
+                        if notify and self._cleanup_auto_cleanup and cleanup_items:
+                            self._save_missing_cleanup(_cleanup_missing_torrents_from_preview(cleanup_items, self._cleanup_delete_files))
+                            self._save_missing_preview(_build_missing_torrent_preview(self._cleanup_downloader_names))
+                    self._record_monitor_results(module, [{"object_id": "module", "state": "success", "message": "模块执行完成"}])
+                    bad = sum(bool(row.get("confirmed")) for row in results)
+                    pending = sum(row.get("state") == "pending" for row in results)
+                    confirmed += bad
+                    run["steps"].append({"module": module, "state": "success", "total": len(results),
+                                         "confirmed": bad, "pending": pending, "message": f"检测 {len(results)} 项，待观察 {pending}，确认异常 {bad}"})
+                except Exception as err:
+                    result = self._record_monitor_results(module, [{"object_id": "module", "state": "error", "message": str(err)}])[0]
+                    confirmed += int(result["confirmed"])
+                    run["steps"].append({"module": module, "state": "error", "message": result["message"]})
+                    logger.error(f"站点工具箱 {MODULES[module]} 执行失败：{err}")
+            run.update(finished_at=_now(), status="error" if any(step["state"] == "error" for step in run["steps"]) else "success",
+                       confirmed=confirmed)
+            failures = sum(step["state"] == "error" for step in run["steps"])
+            message = f"完成 {len(run['steps'])} 项检测，确认异常 {confirmed} 项" + (f"，{failures} 项执行失败" if failures else "")
+            self._set_job_state("monitor", "统一检测", run["status"], message, started_at=started, finished_at=run["finished_at"])
+            runs = self.get_data("monitor_runs") or []
+            runs = runs if isinstance(runs, list) else []
+            self.save_data("monitor_runs", [run, *runs][:50])
+            if notify and confirmed:
+                self.systemmessage.put(f"站点工具箱发现 {confirmed} 项连续异常达到 {self._rss_failure_days} 天，请查看诊断详情。", title=self.plugin_name)
+            return message
+        finally:
+            self._monitor_run_lock.release()
+
+    def _confirmed_missing_items(self, preview: dict) -> List[dict]:
+        return [item for item in preview.get("items", [])
+                if classify_monitor(item.get("monitor") or {"state": "error"}, self._rss_failure_days)["confirmed"]]
 
     def _save_results(self, results: List[Dict[str, Any]]):
+        ids = {item.get("site_id") for item in results}
+        results = [*results, *[item for item in self._latest_results if item.get("site_id") not in ids]]
         self._latest_results = results
         self.__class__._latest_results = results
         self.update_config(self._config_payload(latest_results=results))
 
     def _save_userdata_results(self, results: List[Dict[str, Any]]):
+        results = self._record_monitor_results("userdata", results)
+        observed = list(results)
+        ids = {row.get("site_id") for row in results}
+        results += [row for row in self._latest_userdata_results if row.get("site_id") not in ids]
         self._latest_userdata_results = results
         self.__class__._latest_userdata_results = results
         self._latest_userdata_checked_at = _now()
@@ -778,8 +515,30 @@ class sitetoolbox(_PluginBase):
             latest_userdata_results=results,
             latest_userdata_checked_at=self._latest_userdata_checked_at,
         ))
+        return observed
 
     def _save_missing_preview(self, preview: Dict[str, Any]):
+        seen = self.get_data("missing_seen") or {}
+        seen = seen if isinstance(seen, dict) else {}
+        failed = {row["downloader"] for row in preview.get("errors", [])}
+        observations = []
+        for name in preview.get("downloaders", []):
+            if name in failed:
+                message = next(row["message"] for row in preview["errors"] if row["downloader"] == name)
+                observations.append({"object_id": f"downloader:{name}", "state": "error", "message": message})
+                continue
+            observations.append({"object_id": f"downloader:{name}", "state": "success", "message": "下载器连接正常"})
+            hashes = {item["hash"] for item in preview.get("items", []) if item["downloader"] == name}
+            for torrent_hash in set(seen.get(name, [])) - hashes:
+                observations.append({"object_id": f"torrent:{name}:{torrent_hash}", "state": "success", "message": "文件缺失已恢复"})
+            seen[name] = sorted(hashes)
+        for item in preview.get("items", []):
+            observations.append({"object_id": f"torrent:{item['downloader']}:{item['hash']}", "state": "error", "message": "下载器报告文件缺失"})
+        results = {row["object_id"]: row for row in self._record_monitor_results("missing", observations)}
+        for item in preview.get("items", []):
+            item["monitor"] = results[f"torrent:{item['downloader']}:{item['hash']}"]
+        preview["downloader_status"] = [results[f"downloader:{name}"] for name in preview.get("downloaders", [])]
+        self.save_data("missing_seen", seen)
         self._latest_missing_preview = preview
         self.__class__._latest_missing_preview = preview
         self.update_config(self._config_payload(latest_missing_preview=preview))
@@ -789,10 +548,18 @@ class sitetoolbox(_PluginBase):
         self.__class__._latest_missing_cleanup = cleanup
         self.update_config(self._config_payload(latest_missing_cleanup=cleanup))
 
-    def _save_mteam_login_check(self, result: Dict[str, Any]):
+    def _save_mteam_login_check(self, result: Dict[str, Any], site_ids: Optional[List[int]] = None):
+        items = self._record_monitor_results("mteam", result.get("items", []))
+        observed = list(items)
+        ids = set(site_ids) if site_ids is not None else {row.get("site_id") for row in items}
+        kept = [row for row in self._latest_mteam_login_check.get("items", []) if row.get("site_id") not in ids]
+        items += kept
+        result.update(items=items, total_count=len(items), warning_count=sum(row["state"] == "warning" for row in items),
+                      error_count=sum(row["state"] == "error" for row in items), pending_count=sum(row["state"] == "pending" for row in items))
         self._latest_mteam_login_check = result
         self.__class__._latest_mteam_login_check = result
         self.update_config(self._config_payload(latest_mteam_login_check=result))
+        return observed
 
     def _set_job_state(self, key: str, name: str, status: str, message: str = "",
                        started_at: Optional[str] = None, finished_at: Optional[str] = None):
@@ -829,7 +596,10 @@ class sitetoolbox(_PluginBase):
         def runner():
             try:
                 message = func() or "任务完成"
-                self._set_job_state(key, name, "success", message, finished_at=_now())
+                # 统一监控会自行记录各阶段失败，不能被外层后台任务覆盖成成功。
+                state = (self._latest_job_states or {}).get(key) or {}
+                status = state.get("status") if state.get("status") in {"error", "success"} else "success"
+                self._set_job_state(key, name, status, message, finished_at=_now())
             except Exception as err:
                 logger.error(f"站点工具箱后台任务失败：{name} - {err}")
                 self._set_job_state(key, name, "error", str(err), finished_at=_now())
@@ -852,8 +622,8 @@ class sitetoolbox(_PluginBase):
             self._save_missing_preview(preview)
             total_count = int(preview.get("total_count") or 0)
             message = f"{total_count} 个，{_format_size(preview.get('total_size', 0))}"
-            if self._cleanup_auto_cleanup and total_count:
-                cleanup_items = preview.get("items") if isinstance(preview.get("items"), list) else []
+            cleanup_items = self._confirmed_missing_items(preview)
+            if self._cleanup_auto_cleanup and cleanup_items:
                 cleanup = _cleanup_missing_torrents_from_preview(
                     cleanup_items,
                     delete_files=self._cleanup_delete_files,
@@ -1187,11 +957,160 @@ class _SiteToolboxErrorHandler(logging.Handler):
             return
 
 
+def _api_options() -> schemas.Response:
+    sites = [{"value": site.id, "title": f"{site.name} ({site.domain})", "mteam": _is_mteam_site(site)}
+             for site in SiteOper().list_order_by_pri() if site and site.id]
+    return schemas.Response(success=True, data={"sites": sites, "downloaders": _downloader_options(), "modules": MODULES})
+
+
+def _selected_site_ids(plugin, payload: Optional[dict] = None) -> List[int]:
+    return (_int_list((payload or {}).get("site_ids")) or plugin._site_ids
+            or [site.id for site in SiteOper().list_order_by_pri() if site and site.id and getattr(site, "is_active", True)])
+
+
+def _api_monitor_run(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    payload = payload or {}
+    ids = _int_list(payload.get("site_ids")) if "site_ids" in payload else None
+    modules = payload.get("modules")
+    if modules is not None and (not isinstance(modules, list) or any(key not in MODULES for key in modules)):
+        return schemas.Response(success=False, message="检测模块无效")
+    if not (modules if modules is not None else plugin._monitor_plan["monitor_modules"]):
+        return schemas.Response(success=False, message="请在设置中至少选择一个检测模块")
+    if ids is not None and not ids:
+        return schemas.Response(success=False, message="请选择需要复测的站点")
+    # 在后台线程启动前预留执行锁，避免与同一分钟的定时任务同时启动并覆盖进度。
+    if not plugin._monitor_run_lock.acquire(blocking=False):
+        return schemas.Response(success=False, message="已有检测正在运行，请等待当前检测完成")
+    def worker():
+        try:
+            plugin.run_monitor(ids, modules, _lock_held=True)
+        except Exception as err:
+            logger.error(f"站点工具箱统一检测执行失败：{err}")
+            plugin._set_job_state("monitor", "统一检测", "error", str(err), finished_at=_now())
+    try:
+        plugin._set_job_state("monitor", "统一检测", "running", "正在准备检测", started_at=_now(), finished_at="")
+        Thread(target=worker, name="sitetoolbox-monitor", daemon=True).start()
+    except Exception:
+        plugin._monitor_run_lock.release()
+        raise
+    return schemas.Response(success=True, message="统一检测已开始，结果会自动更新", data=plugin._latest_job_states.get("monitor"))
+
+
+def _view_monitor_result(item: Optional[dict], threshold: int, tested_at: str = "") -> dict:
+    if not item:
+        return {"state": "unknown", "raw_state": "unknown", "message": "尚未检测", "failure_days": 0, "confirmed": False}
+    result = classify_monitor(item, threshold)
+    result.setdefault("tested_at", item.get("checked_at") or tested_at)
+    return result
+
+
+def _api_overview() -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    threshold = plugin._rss_failure_days
+    rss = {row.get("site_id"): row for row in plugin._latest_results}
+    userdata = {row.get("site_id"): row for row in plugin._latest_userdata_results}
+    mteam = {row.get("site_id"): row for row in plugin._latest_mteam_login_check.get("items", [])}
+    rows = []
+    for site in SiteOper().list_order_by_pri():
+        if not site or not site.id:
+            continue
+        checks = {"rss": _view_monitor_result(rss.get(site.id), threshold),
+                  "userdata": _view_monitor_result(userdata.get(site.id), threshold, plugin._latest_userdata_checked_at)}
+        if _is_mteam_site(site):
+            checks["mteam"] = _view_monitor_result(mteam.get(site.id), threshold)
+        active_checks = [item for module, item in checks.items() if module in plugin._monitor_plan["monitor_modules"]]
+        states = {item["state"] for item in active_checks}
+        overall = next((state for state in ("offline", "error", "warning", "pending", "success") if state in states), "unknown")
+        if any(item["confirmed"] for item in active_checks):
+            overall = "error"
+        # 未检测项目不能由其他项目的成功结果推断为正常。
+        if overall == "success" and "unknown" in states:
+            overall = "unknown"
+        times = [item.get("tested_at") or "" for item in checks.values()]
+        url = urlparse(site.url or "")
+        safe_url = urlunparse((url.scheme or "https", url.netloc.rsplit("@", 1)[-1], url.path or "/", "", "", ""))
+        rows.append({"id": site.id, "name": site.name, "domain": site.domain, "url": safe_url,
+                     "active": bool(getattr(site, "is_active", True)), "adapted": _site_has_rule(site.domain),
+                     "monitored": not plugin._site_ids or site.id in plugin._site_ids,
+                     "checks": checks, "state": overall, "confirmed": any(item["confirmed"] for item in active_checks),
+                     "failure_days": max((item["failure_days"] for item in active_checks), default=0), "last_checked_at": max(times, default="")})
+    upcoming = next_run(plugin._monitor_plan, datetime.now()) if plugin._enabled else None
+    preview = dict(plugin._latest_missing_preview)
+    preview["items"] = [{**item, "monitor": _view_monitor_result(item.get("monitor") or {"state": "error", "message": "下载器报告文件缺失"}, threshold)}
+                        for item in preview.get("items", [])]
+    preview["confirmed_count"] = sum(item["monitor"]["confirmed"] for item in preview["items"])
+    preview["downloader_status"] = [_view_monitor_result(item, threshold) for item in preview.get("downloader_status", [])]
+    return schemas.Response(success=True, data={
+        "plugin_version": plugin.plugin_version, "enabled": plugin._enabled, "sites": rows,
+        "plan": {**plugin._monitor_plan, "timezone": str(getattr(settings, "TZ", "服务器本地时区")),
+                 "next_run_at": upcoming.strftime("%Y-%m-%d %H:%M:%S") if upcoming else ""},
+        "jobs": plugin._latest_job_states, "runs": plugin.get_data("monitor_runs") or [],
+        "maintenance": {"missing": preview, "cleanup": plugin._latest_missing_cleanup,
+                        "delete_files": plugin._cleanup_delete_files, "auto_cleanup": plugin._cleanup_auto_cleanup},
+        "rules": [{"domain": rule.get("domain"), "indexer": isinstance(rule.get("indexer"), dict),
+                   "userdata": isinstance(rule.get("userdata"), dict), "asyncfix": bool(rule.get("asyncfix"))}
+                  for rule in plugin._site_rules],
+    })
+
+
+def _redact_error_text(text: str) -> str:
+    text = re.sub(r"https?://[^\s<>\"']+", lambda match: _mask_url(match.group()), str(text))
+    # HTTP 头可能含空格、分号及多项 Cookie，需要整体隐藏，不能只替换 Bearer 或首个值。
+    text = re.sub(r'''(?im)(["']?(?:authorization|cookie|set-cookie)["']?\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\r\n}\]]*)''', r"\1***", text)
+    return re.sub(r'''(?i)(["']?(?:api[-_]?key|passkey|token|password)["']?\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}'"\]]+)''', r"\1***", text)
+
+
+def _api_errors(query: str = "", level: str = "all", page: int = 1, limit: int = 20) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    # 只读取最近的有界样本，避免每次刷新工作台都载入数十万条日志。
+    path = plugin._error_log_path()
+    groups = {}
+    sampled = False
+    if path.exists():
+        with path.open("rb") as file_obj:
+            file_obj.seek(0, 2)
+            size = file_obj.tell()
+            offset = max(0, size - 2 * 1024 * 1024)
+            sampled = offset > 0
+            file_obj.seek(offset)
+            if offset:
+                file_obj.readline()
+            lines = file_obj.read().decode("utf-8", errors="replace").splitlines()
+        cutoff = time.time() - plugin._error_retention_days * 86400
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if _error_record_ts(item) < cutoff or (level != "all" and item.get("level") != level):
+                continue
+            message = _clip_text(_redact_error_text(_error_record_message(item)), 500)
+            source = str(item.get("source") or "系统")
+            if query.lower() not in f"{message} {source}".lower():
+                continue
+            key = (source, item.get("level"), message)
+            group = groups.setdefault(key, {"source": source, "level": item.get("level"), "message": message,
+                                             "count": 0, "first_at": item.get("time", ""), "last_at": item.get("time", "")})
+            group["count"] += 1
+            group["last_at"] = max(group["last_at"], item.get("time", ""))
+    items = sorted(groups.values(), key=lambda item: item["last_at"], reverse=True)
+    page, limit = max(1, page), max(1, min(100, limit))
+    return schemas.Response(success=True, data={"items": items[(page - 1) * limit:page * limit], "total": len(items),
+                                               "page": page, "limit": limit, "sampled": sampled})
+
+
 def _api_test_selected_rss(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
     plugin = sitetoolbox._instance
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
-    site_ids = _int_list((payload or {}).get("site_ids")) or plugin._site_ids
+    site_ids = _selected_site_ids(plugin, payload)
     if not site_ids:
         return schemas.Response(success=False, message="未选择站点")
 
@@ -1224,7 +1143,7 @@ def _api_repair_selected_rss(payload: Optional[dict] = Body(default=None)) -> sc
     plugin = sitetoolbox._instance
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
-    site_ids = _int_list((payload or {}).get("site_ids")) or plugin._site_ids
+    site_ids = _selected_site_ids(plugin, payload)
     if not site_ids:
         return schemas.Response(success=False, message="未选择站点")
 
@@ -1256,14 +1175,17 @@ def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas
     plugin = sitetoolbox._instance
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
-    site_ids = _int_list((payload or {}).get("site_ids"))
+    site_ids = _selected_site_ids(plugin, payload)
+    if not site_ids:
+        return schemas.Response(success=False, message="没有启用的目标站点")
 
     def worker() -> str:
         results = _check_userdata_health(site_ids=site_ids)
-        plugin._save_userdata_results(results)
-        bad_count = len([item for item in results if item.get("state") in ("error", "warning")])
+        results = plugin._save_userdata_results(results)
+        bad_count = sum(bool(item.get("confirmed")) for item in results)
+        pending_count = sum(item.get("state") == "pending" for item in results)
         offline_count = len([item for item in results if item.get("state") == "offline"])
-        return f"用户数据检查完成：异常 {bad_count}/{len(results)}，站点连接失败 {offline_count}"
+        return f"用户数据检查完成：确认异常 {bad_count}/{len(results)}，待观察 {pending_count}，站点连接失败 {offline_count}"
 
     return plugin._start_background_job("userdata_check", "用户数据检查", worker)
 
@@ -1751,9 +1673,9 @@ def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) 
         return schemas.Response(success=False, message="请先预览缺失文件种子")
 
     selected_names = set(downloader_names)
-    cleanup_items = [item for item in preview_items if item.get("downloader") in selected_names]
+    cleanup_items = [item for item in plugin._confirmed_missing_items(preview) if item.get("downloader") in selected_names]
     if not cleanup_items:
-        return schemas.Response(success=False, message="最近一次预览中没有选中下载器的缺失种子")
+        return schemas.Response(success=False, message="没有达到连续异常确认天数的缺失种子")
 
     delete_files = _to_bool((payload or {}).get("delete_files"), plugin._cleanup_delete_files)
 
@@ -1784,15 +1706,18 @@ def _api_check_mteam_login(payload: Optional[dict] = Body(default=None)) -> sche
     plugin = sitetoolbox._instance
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
-    site_ids = _int_list((payload or {}).get("site_ids")) or plugin._mteam_site_ids
+    site_ids = _selected_site_ids(plugin, payload)
+    if plugin._mteam_site_ids:
+        site_ids = [site_id for site_id in site_ids if site_id in plugin._mteam_site_ids]
+    if not site_ids:
+        return schemas.Response(success=False, message="没有匹配的馒头检查站点")
 
     def worker() -> str:
         result = _build_mteam_login_check(site_ids, plugin._mteam_warning_days)
-        plugin._save_mteam_login_check(result)
-        warning_count = int(result.get("warning_count") or 0)
-        error_count = int(result.get("error_count") or 0)
-        total_count = int(result.get("total_count") or 0)
-        return f"馒头登录检查完成：异常 {warning_count + error_count}/{total_count}"
+        items = plugin._save_mteam_login_check(result, site_ids=site_ids)
+        confirmed = sum(bool(item.get("confirmed")) for item in items)
+        pending = sum(item.get("state") == "pending" for item in items)
+        return f"馒头登录检查完成：确认异常 {confirmed}/{len(items)}，待观察 {pending}"
 
     return plugin._start_background_job("mteam_login_check", "馒头登录检查", worker)
 
@@ -2292,21 +2217,8 @@ def _test_site_rss(site_id: int, repair: bool = False) -> Dict[str, Any]:
 
 
 def _rss_result_status(result: Dict[str, Any], threshold: int) -> Dict[str, Any]:
-    """保留原始检测结果，改阈值时只重新判定展示状态，不重复累计天数。"""
-    result = dict(result)
-    state = result.get("rss_state", result.get("state"))
-    message = result.get("rss_message", result.get("message")) or ""
-    result.update(rss_state=state, rss_message=message, state=state, message=message)
-    if state in {"error", "warning"}:
-        days = result.get("failure_days", 1)
-        result["failure_days"] = days
-        if days < threshold:
-            result["state"] = "pending"
-            result["message"] = f"连续失败 {days}/{threshold} 天，待观察：{message}"
-        else:
-            result["message"] = f"已连续失败 {days} 天：{message}"
-    else:
-        result["failure_days"] = 0
+    result = classify_monitor(result, threshold)
+    result.update(rss_state=result["raw_state"], rss_message=result["raw_message"])
     return result
 
 
@@ -4275,10 +4187,9 @@ def _mask_url(url: str) -> str:
     if not url:
         return ""
     parsed = urlparse(url)
-    if not parsed.query:
-        return url
+    parsed = parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1], fragment="")
     masked_query = []
-    sensitive_keys = {"passkey", "pass", "key", "token", "auth", "uid", "secure"}
+    sensitive_keys = {"passkey", "pass", "password", "key", "api_key", "api-key", "token", "auth", "authorization", "cookie", "uid", "secure"}
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
         if key.lower() in sensitive_keys or len(value) >= 16:
             value = "***"
@@ -4320,7 +4231,8 @@ def _is_site_home_url(site_url: str, rss_url: str) -> bool:
 
 
 def _parse_rss(site: Any, rss_url: str):
-    headers = {"Cookie": site.cookie} if site.cookie else None
+    # 宿主使用自定义 headers 时不会补 UA，带 Cookie 的 RSS 请求也需保留站点 UA。
+    headers = {"Cookie": site.cookie, "User-Agent": site.ua or settings.USER_AGENT} if site.cookie else None
     return RssHelper().parse(
         url=rss_url,
         proxy=bool(site.proxy),

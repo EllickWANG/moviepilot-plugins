@@ -66,10 +66,12 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 
 ### 站点工具箱
 
-`sitetoolbox` 用于测试和修复站点 RSS，并已整合原 `siteadapter` 的站点索引与用户数据解析适配能力。
+`sitetoolbox` 是站点诊断与维护工作台，统一监控 RSS、用户数据、缺失种子及馒头登录，并整合原 `siteadapter` 的站点索引与用户数据解析适配能力。
 
 主要能力：
 
+- 表格搜索、筛选、单站复测和诊断侧栏，支持深浅主题及手机抽屉。
+- 所有检测模块共用执行时段、周期 / 固定时刻和连续异常确认天数。
 - 测试已有站点 RSS 是否可获取和解析。
 - 尝试重新生成或规范化 RSS 地址并写回站点配置。
 - 配置化接入站点索引规则。
