@@ -210,6 +210,81 @@ class PluginMonitorTest(unittest.TestCase):
             for secret in ['abcdef12345', 'alice', 'secret', 'two words', '12345']:
                 self.assertNotIn(secret, result)
 
+class UserdataRefreshTest(unittest.TestCase):
+    def setUp(self):
+        self.site = types.SimpleNamespace(id=26, name='红豆饭', domain='hdfans.org', is_active=True)
+        self.old = types.SimpleNamespace(domain='hdfans.org', username='test', user_level='', upload=1000, download=500,
+                                         ratio=2, bonus=1, updated_day='2026-10-23', updated_time='08:48:32')
+        self.fresh = copy.copy(self.old)
+        self.fresh.user_level = 'Veteran User'
+        self.fresh.updated_time = '14:47:03'
+
+    def check(self, refresh, latest=None, sites=None, ids=None):
+        with patch.object(PLUGIN.SiteOper.return_value, 'list_order_by_pri', return_value=sites or [self.site]), \
+             patch.object(PLUGIN.SiteOper.return_value, 'get_userdata_latest', side_effect=latest or (lambda: [self.old])), \
+             patch.object(PLUGIN, '_refresh_site_userdata', side_effect=refresh), \
+             patch.object(PLUGIN, '_site_statistics', return_value={}), \
+             patch.object(PLUGIN, '_site_has_rule', return_value=False):
+            return PLUGIN._check_userdata_health(ids if ids is not None else [26])
+
+    def test_retest_collects_before_reading_snapshot_and_recovers_missing_level(self):
+        collected = []
+        def refresh(site):
+            collected.append(site.id)
+        def latest():
+            self.assertEqual(collected, [26])
+            return [self.fresh]
+        result = self.check(refresh, latest=latest)[0]
+        self.assertEqual((result['state'], result['user_level'], result['updated_at']),
+                         ('success', 'Veteran User', '2026-10-23 14:47:03'))
+        self.assertTrue(result['refreshed'])
+
+    def test_failed_collection_cannot_pass_using_complete_old_data(self):
+        self.old.user_level = 'Veteran User'
+        result = self.check(lambda _: (_ for _ in ()).throw(TimeoutError('请求超时')))[0]
+        self.assertEqual(result['state'], 'error')
+        self.assertFalse(result['refreshed'])
+        self.assertIn('本次用户数据采集失败', result['message'])
+        self.assertIn('08:48:32', result['message'])
+
+    def test_single_site_retest_does_not_refresh_other_sites(self):
+        other = types.SimpleNamespace(id=1, name='其他站', domain='other.test', is_active=True)
+        refreshed = []
+        self.check(lambda site: refreshed.append(site.id), sites=[other, self.site])
+        self.assertEqual(refreshed, [26])
+
+    def test_collector_failure_uses_shared_observation_instead_of_resetting_history(self):
+        result = self.check(lambda _: (_ for _ in ()).throw(RuntimeError('采集失败')))[0]
+        result['tested_at'] = '2026-10-23 15:00:00'
+        recorded, history = monitor.observe({'userdata:26': {'date': '2026-10-22', 'days': 1}}, 'userdata:26', result, 3)
+        self.assertEqual((recorded['state'], recorded['failure_days'], recorded['confirmed']), ('pending', 2, False))
+
+    def test_collector_empty_and_error_payloads_are_not_success(self):
+        import sys
+        chain_module = types.ModuleType('app.chain.site')
+        chain_module.SiteChain = Mock()
+        with patch.dict(sys.modules, {'app.chain.site': chain_module}), patch.object(PLUGIN.SitesHelper.return_value, 'get_indexer', return_value={'domain': 'hdfans.org'}):
+            for payload in (None, {}, {'err_msg': 'Cookie 失效'}, types.SimpleNamespace(err_msg='请求失败')):
+                chain_module.SiteChain.return_value.refresh_userdata.return_value = payload
+                with self.assertRaises(ValueError):
+                    PLUGIN._refresh_site_userdata(self.site)
+            chain_module.SiteChain.return_value.refresh_userdata.return_value = {'user_level': 'Veteran User'}
+            PLUGIN._refresh_site_userdata(self.site)
+
+    def test_one_collection_failure_does_not_stop_other_selected_sites(self):
+        other = types.SimpleNamespace(id=27, name='其他站', domain='other.test', is_active=True)
+        other_data = copy.copy(self.fresh)
+        other_data.domain = 'other.test'
+        calls = []
+        def refresh(site):
+            calls.append(site.id)
+            if site.id == 26:
+                raise RuntimeError()
+        results = self.check(refresh, latest=lambda: [self.old, other_data], sites=[self.site, other], ids=[26, 27])
+        self.assertEqual(calls, [26, 27])
+        self.assertEqual([row['state'] for row in results], ['error', 'success'])
+        self.assertIn('RuntimeError', results[0]['message'])
+
 
 if __name__ == '__main__':
     unittest.main()

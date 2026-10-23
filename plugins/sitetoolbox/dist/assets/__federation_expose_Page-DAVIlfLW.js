@@ -1256,7 +1256,7 @@ return (_ctx, _cache) => {
                               _createElementVNode("article", null, [
                                 _cache[54] || (_cache[54] = _createElementVNode("div", null, [
                                   _createElementVNode("h3", null, "用户数据完整性"),
-                                  _createElementVNode("p", null, "检查最新账号数据中的缺失字段、连接状态与过期情况。")
+                                  _createElementVNode("p", null, "先重新采集站点账号数据，再检查缺失字段、连接状态与过期情况。")
                                 ], -1)),
                                 _createVNode(_component_v_btn, {
                                   variant: "outlined",
@@ -1523,7 +1523,7 @@ return (_ctx, _cache) => {
             ], 64))
           : _createCommentVNode("", true),
       _createElementVNode("footer", _hoisted_69, [
-        _createTextVNode(" 站点工具箱 v" + _toDisplayString(overview.value?.plugin_version || "1.4.0"), 1),
+        _createTextVNode(" 站点工具箱 v" + _toDisplayString(overview.value?.plugin_version || "1.4.1"), 1),
         _cache[67] || (_cache[67] = _createElementVNode("span", null, "所有检测模块共用统一监控计划", -1))
       ])
     ], 8, _hoisted_1),

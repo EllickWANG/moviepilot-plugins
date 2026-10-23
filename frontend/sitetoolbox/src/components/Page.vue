@@ -923,7 +923,7 @@ onBeforeUnmount(() => {
             <article>
               <div>
                 <h3>用户数据完整性</h3>
-                <p>检查最新账号数据中的缺失字段、连接状态与过期情况。</p>
+                <p>先重新采集站点账号数据，再检查缺失字段、连接状态与过期情况。</p>
               </div>
               <v-btn
                 variant="outlined"
@@ -1150,7 +1150,7 @@ onBeforeUnmount(() => {
         </section>
       </template>
       <footer class="stb-version">
-        站点工具箱 v{{ overview?.plugin_version || "1.4.0"
+        站点工具箱 v{{ overview?.plugin_version || "1.4.1"
         }}<span>所有检测模块共用统一监控计划</span>
       </footer>
     </main>

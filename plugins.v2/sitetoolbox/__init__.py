@@ -39,7 +39,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -2291,11 +2291,34 @@ def _test_site_rss_inner(site_id: int, repair: bool = False) -> Dict[str, Any]:
     )
 
 
+def _refresh_site_userdata(site: Any):
+    """沿用宿主的单站采集入口；不能把读取旧快照当作本次采集成功。"""
+    if not getattr(site, "is_active", True):
+        raise ValueError("站点未启用")
+    from app.chain.site import SiteChain
+    indexer = SitesHelper().get_indexer(site.domain)
+    if not indexer:
+        raise ValueError("站点不支持用户数据采集或未通过认证")
+    data = SiteChain().refresh_userdata(site=indexer)
+    if not data:
+        raise ValueError("采集未返回用户数据")
+    error = data.get("err_msg") if isinstance(data, dict) else getattr(data, "err_msg", None)
+    if error:
+        raise ValueError(str(error))
+
+
 def _check_userdata_health(site_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     sites = [
         site for site in SiteOper().list_order_by_pri()
         if site and site.id and (not site_ids or site.id in site_ids)
     ]
+    # 单站复测、专项检查和统一定时检测都先采集，再读取宿主保存的新记录。
+    refresh_errors = {}
+    for site in sites:
+        try:
+            _refresh_site_userdata(site)
+        except Exception as err:
+            refresh_errors[site.id] = _redact_error_text(str(err).strip() or type(err).__name__)
     latest_by_domain = {}
     for data in SiteOper().get_userdata_latest() or []:
         domain = getattr(data, "domain", "") or ""
@@ -2303,12 +2326,20 @@ def _check_userdata_health(site_ids: Optional[List[int]] = None) -> List[Dict[st
             latest_by_domain[domain] = data
 
     statistics = _site_statistics()
-    return [
-        _userdata_health_result(site, latest_by_domain.get(site.domain or ""),
-                                failure=_site_failure(site, statistics.get(site.domain or "")),
-                                stale_days=sitetoolbox._userdata_stale_days)
-        for site in sites
-    ]
+    results = []
+    for site in sites:
+        error = refresh_errors.get(site.id)
+        result = _userdata_health_result(
+            site, latest_by_domain.get(site.domain or ""),
+            failure=None if error else _site_failure(site, statistics.get(site.domain or "")),
+            stale_days=sitetoolbox._userdata_stale_days,
+        )
+        result["refreshed"] = not bool(error)
+        if error:
+            retained = f"；保留上次数据（{result['updated_at']}）" if result.get("updated_at") else ""
+            result.update(state="error", message=f"本次用户数据采集失败：{error}{retained}", refresh_error=error)
+        results.append(result)
+    return results
 
 
 def _site_statistics() -> Dict[str, Any]:
