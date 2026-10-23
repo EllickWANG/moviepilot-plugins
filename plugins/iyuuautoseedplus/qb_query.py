@@ -1,4 +1,4 @@
-"""辅种查询使用独立、串行的 qB 会话，连接失败时只重试读取操作。"""
+"""辅种查询与幂等控制使用独立、串行的 qB 会话。"""
 from collections.abc import Mapping, Sequence
 from threading import RLock
 from time import monotonic
@@ -14,7 +14,7 @@ def query_error_message(error):
     name = type(error).__name__
     if "timeout" in name.lower() or "timed out" in text.lower():
         return f"下载器请求超时（{name}）"
-    return f"下载器查询失败（{name}）"
+    return f"下载器请求失败（{name}）"
 
 
 class QbQueryClient:
@@ -95,6 +95,42 @@ class QbQueryClient:
                             result["error"] = "辅种查询会话已停止"
                         else:
                             result.update(torrents=list(rows), error=None)
+                        break
+                    except Exception as error:
+                        result["error"] = query_error_message(error)
+                        self._discard_client()
+                        if self._closed or not isinstance(error, (APIConnectionError, ConnectionError, Timeout)):
+                            break
+            finally:
+                result["elapsed"] = round(monotonic() - started, 3)
+                if self._closed:
+                    self._discard_client()
+        return result
+
+    def command(self, method, **params):
+        """仅允许辅种需要的幂等控制操作；添加、删除种子不走自动重试。"""
+        from qbittorrentapi import APIConnectionError
+        from requests.exceptions import ConnectionError, Timeout
+
+        allowed = {"torrents_resume", "torrents_recheck", "torrents_delete_tags", "torrents_set_category"}
+        result = {"success": False, "error": None, "attempts": 0}
+        started = monotonic()
+        if method not in allowed:
+            result.update(error="不支持的辅种控制操作", elapsed=0)
+            return result
+        with self._lock:
+            try:
+                if self._closed:
+                    result["error"] = "辅种连接已停止"
+                    return result
+                for attempt in range(1, 3):
+                    result["attempts"] = attempt
+                    try:
+                        if self._client is None:
+                            self._client = self._new_client()
+                        getattr(self._client, method)(
+                            **params, requests_args={"timeout": (min(self.timeout, 15), self.timeout)})
+                        result.update(success=not self._closed, error="辅种连接已停止" if self._closed else None)
                         break
                     except Exception as error:
                         result["error"] = query_error_message(error)

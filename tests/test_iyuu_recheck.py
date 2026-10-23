@@ -179,6 +179,48 @@ class QueryClientTest(unittest.TestCase):
         self.assertEqual(result["torrents"], [])
         self.assertIsNotNone(result["error"])
 
+    def test_idempotent_control_reuses_private_client_and_reconnects_on_eof(self):
+        first, second = Mock(), Mock()
+        first.torrents_resume.side_effect = ConnectionFailure("UNEXPECTED_EOF_WHILE_READING")
+        self.api.Client.side_effect = [first, second]
+        result = self.client.command("torrents_resume", torrent_hashes=["a"])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["attempts"], 2)
+        second.torrents_resume.assert_called_once_with(torrent_hashes=["a"], requests_args={"timeout": (15, 120)})
+        self.assertEqual(self.source._REQUESTS_ARGS["timeout"], (15, 60))
+
+    def test_failed_control_is_bounded_and_reported_as_failure(self):
+        self.api.Client.return_value.torrents_resume.side_effect = ConnectionFailure("UNEXPECTED_EOF_WHILE_READING")
+        result = self.client.command("torrents_resume", torrent_hashes=["a"])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["attempts"], 2)
+
+    def test_destructive_or_add_commands_are_not_accepted_by_retry_helper(self):
+        for method in ["torrents_delete", "torrents_add", "torrents_set_location"]:
+            result = self.client.command(method, torrent_hashes=["a"])
+            self.assertFalse(result["success"])
+            self.assertEqual(result["attempts"], 0)
+        self.api.Client.assert_not_called()
+
+    def test_query_and_control_share_the_same_serial_lock(self):
+        entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+        def query(**kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            completed.set()
+            return []
+        def command(**kwargs):
+            self.assertTrue(completed.is_set())
+        self.api.Client.return_value.torrents_info.side_effect = query
+        self.api.Client.return_value.torrents_resume.side_effect = command
+        with ThreadPoolExecutor(2) as pool:
+            first = pool.submit(self.client.query, ["a"])
+            self.assertTrue(entered.wait(2))
+            second = pool.submit(self.client.command, "torrents_resume", torrent_hashes=["a"])
+            release.set()
+            self.assertIsNone(first.result()["error"])
+            self.assertTrue(second.result()["success"])
+
 
 class RecheckTest(unittest.TestCase):
     def setUp(self):
@@ -189,6 +231,7 @@ class RecheckTest(unittest.TestCase):
         self.plugin._query_clients_lock = threading.RLock()
         self.plugin._query_clients = {}
         self.plugin._last_queries = {}
+        self.plugin._last_commands = {}
         self.plugin.save_data = Mock()
         self.plugin.get_data = Mock(return_value={})
         self.plugin._event = Mock()
@@ -200,6 +243,9 @@ class RecheckTest(unittest.TestCase):
         self.query = patch.object(self.plugin, "_IYUUAutoSeedPlus__query_torrents")
         self.fetch = self.query.start()
         self.addCleanup(self.query.stop)
+        self.control_patch = patch.object(self.plugin, "_IYUUAutoSeedPlus__qb_control", return_value=True)
+        self.control = self.control_patch.start()
+        self.addCleanup(self.control_patch.stop)
         PLUGIN.logger.reset_mock()
 
     def rows(self):
@@ -212,7 +258,7 @@ class RecheckTest(unittest.TestCase):
     def test_partial_success_removes_deleted_and_running_but_keeps_incomplete(self):
         self.fetch.return_value = self.rows(), False
         self.plugin.check_recheck_service(self.service)
-        self.server.start_torrents.assert_called_once_with(ids=["ready"])
+        self.control.assert_called_once_with(self.service, "torrents_resume", torrent_hashes=["ready"])
         self.assertEqual(self.plugin._recheck_torrents["qb"], ["ready", "blocked"])
         self.assertIn("文件未完整匹配", str(PLUGIN.logger.warning.call_args))
 
@@ -224,18 +270,18 @@ class RecheckTest(unittest.TestCase):
         self.fetch.return_value = [{"hash": "ready", "state": "uploading", "progress": 1}], False
         self.plugin.check_recheck_service(self.service)
         self.assertEqual(self.plugin._recheck_torrents["qb"], [])
-        self.server.start_torrents.assert_called_once_with(ids=["ready"])
+        self.control.assert_called_once_with(self.service, "torrents_resume", torrent_hashes=["ready"])
 
     def test_start_failure_keeps_ready_task_for_retry(self):
         self.fetch.return_value = self.rows(), False
-        self.server.start_torrents.return_value = False
+        self.control.return_value = False
         self.plugin.check_recheck_service(self.service)
         self.assertEqual(self.plugin._recheck_torrents["qb"], ["ready", "blocked"])
         self.plugin.save_data.assert_called_with("recheck_queue", {"qb": ["ready", "blocked"]})
 
     def test_start_exception_keeps_ready_task(self):
         self.fetch.return_value = self.rows(), False
-        self.server.start_torrents.side_effect = RuntimeError("failure")
+        self.control.side_effect = RuntimeError("failure")
         self.plugin.check_recheck_service(self.service)
         self.assertEqual(self.plugin._recheck_torrents["qb"], ["ready", "blocked"])
 
@@ -247,6 +293,7 @@ class RecheckTest(unittest.TestCase):
         self.fetch.side_effect = fetch
         self.plugin.check_recheck_service(self.service, stop_event=stopped)
         self.server.start_torrents.assert_not_called()
+        self.control.assert_not_called()
         self.assertEqual(self.plugin._recheck_torrents["qb"], ["ready", "blocked", "gone", "running"])
 
     def test_query_failure_keeps_whole_batch(self):
@@ -255,6 +302,7 @@ class RecheckTest(unittest.TestCase):
         self.plugin.check_recheck_service(self.service)
         self.assertEqual(self.plugin._recheck_torrents["qb"], before)
         self.server.start_torrents.assert_not_called()
+        self.control.assert_not_called()
 
     def test_unexpected_hash_cannot_clear_queue_or_start_tasks(self):
         before = list(self.plugin._recheck_torrents["qb"])
@@ -298,8 +346,8 @@ class RecheckTest(unittest.TestCase):
     def test_category_assignment_uses_instance_timeout_and_preserves_save_path(self):
         self.plugin._downloader_timeout = 120
         self.plugin._IYUUAutoSeedPlus__set_qb_category(self.service, "ready", "keep_iyuu")
-        self.server.qbc.torrents_set_category.assert_called_once_with(
-            category="keep_iyuu", torrent_hashes="ready", requests_args={"timeout": (15, 120)})
+        self.control.assert_called_once_with(self.service, "torrents_set_category", category="keep_iyuu", torrent_hashes="ready")
+        self.assertEqual(self.plugin._IYUUAutoSeedPlus__qb_request_args()["timeout"], (15, 120))
         self.server.qbc.torrents_set_location.assert_not_called()
         PLUGIN.logger.error.assert_not_called()
 
@@ -312,10 +360,27 @@ class RecheckTest(unittest.TestCase):
         self.fetch.return_value = [{"hash": "ready", "tags": "unique-tag"}], False
         result = self.plugin._IYUUAutoSeedPlus__download(self.service, b"torrent", "/original/data", "keep_iyuu", "test")
         self.assertEqual(result, "ready")
-        self.server.qbc.torrents_set_category.assert_called_once()
+        self.control.assert_any_call(self.service, "torrents_set_category", category="keep_iyuu", torrent_hashes="ready")
         self.server.add_torrent.assert_called_once()
         self.assertEqual(self.server.add_torrent.call_args.kwargs["download_dir"], "/original/data")
         PLUGIN.logger.error.assert_not_called()
+
+    def test_control_uses_same_private_connection_as_queries(self):
+        self.control_patch.stop()
+        self.plugin._downloader_direct = True
+        self.service.config = types.SimpleNamespace(config={"host": "https://qb.example"})
+        client = Mock(source=self.server.qbc, config=self.service.config.config,
+                      timeout=self.plugin._downloader_timeout, direct=True)
+        client.command.return_value = {"success": True, "error": None, "attempts": 1, "elapsed": 0.1}
+        self.plugin._query_clients["qb"] = client
+        self.assertTrue(self.plugin._IYUUAutoSeedPlus__qb_control(self.service, "torrents_resume", torrent_hashes=["ready"]))
+        client.command.assert_called_once_with("torrents_resume", torrent_hashes=["ready"])
+        self.server.start_torrents.assert_not_called()
+        self.assertTrue(self.plugin._last_commands["qb"]["success"])
+
+    def test_addition_request_honors_direct_mode_without_changing_shared_configuration(self):
+        self.plugin._downloader_direct = True
+        self.assertEqual(self.plugin._IYUUAutoSeedPlus__qb_request_args()["proxies"], {"http": "", "https": "", "all": ""})
 
     def test_diagnostic_compares_core_and_isolated_queries_without_actions(self):
         self.query.stop()

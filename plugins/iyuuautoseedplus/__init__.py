@@ -152,7 +152,7 @@ class IYUUAutoSeedPlus(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-seed-plus"
     # 插件版本
-    plugin_version = "2.15.18"
+    plugin_version = "2.15.19"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -237,6 +237,7 @@ class IYUUAutoSeedPlus(_PluginBase):
         self._query_clients = {}
         self._query_clients_lock = RLock()
         self._last_queries = {}
+        self._last_commands = {}
         self._recheck_messages = {}
         self._recheck_lock = RLock()
         self._recheck_queue_lock = RLock()
@@ -432,6 +433,7 @@ class IYUUAutoSeedPlus(_PluginBase):
             "version": self.plugin_version, "running": self._is_auto_seed_running,
             "pending": {name: len(ids) for name, ids in self._recheck_torrents.items()},
             "iyuu": self.iyuu_helper.status() if self.iyuu_helper else None,
+            "commands": self._last_commands,
         })
 
     def restore_recheck(self, payload: Dict[str, List[str]]) -> Response:
@@ -681,8 +683,8 @@ class IYUUAutoSeedPlus(_PluginBase):
                                         'component': 'VSwitch',
                                         'props': {
                                             'model': 'downloader_direct',
-                                            'label': '下载器查询直连',
-                                            'hint': '跳过代理，只影响 IYUU 查询；下载器可直连时开启',
+                                            'label': '下载器请求直连',
+                                            'hint': '仅影响 IYUU 的查询、添加和控制请求，不改系统代理',
                                             'persistent-hint': True
                                         }
                                     }
@@ -1327,7 +1329,8 @@ class IYUUAutoSeedPlus(_PluginBase):
                 if stop_event and stop_event.is_set():
                     return
                 try:
-                    accepted = downloader_obj.start_torrents(ids=ready)
+                    accepted = self.__qb_control(service, "torrents_resume", torrent_hashes=ready) \
+                        if service.type == "qbittorrent" else downloader_obj.start_torrents(ids=ready)
                 except Exception as error:
                     accepted = False
                     logger.warning(f"下载器 {downloader} 启动辅种请求失败：{query_error_message(error)}")
@@ -1572,7 +1575,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                                              tag=torrent_tags,
                                              category=None,
                                              ignore_category_check=False,
-                                             requests_args={"timeout": (min(self._downloader_timeout, 15), self._downloader_timeout)},
+                                             requests_args=self.__qb_request_args(),
                                              is_skip_checking=self._skipverify)
             )
             if not state:
@@ -1585,7 +1588,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                 if not torrent_hash:
                     logger.error(f"{service.name} 下载任务添加成功，但获取任务信息失败！")
                     return None
-                service.instance.delete_torrents_tag(torrent_hash, tag)
+                self.__qb_control(service, "torrents_delete_tags", torrent_hashes=torrent_hash, tags=tag)
                 if save_category:
                     self.__set_qb_category(service=service, torrent_hash=torrent_hash, category=save_category)
             return torrent_hash
@@ -1632,8 +1635,8 @@ class IYUUAutoSeedPlus(_PluginBase):
             if not qbc:
                 logger.warn(f"{service.name} 未获取到 qB 客户端，无法设置分类 {category}")
                 return
-            qbc.torrents_set_category(category=category, torrent_hashes=torrent_hash,
-                                     requests_args={"timeout": (min(self._downloader_timeout, 15), self._downloader_timeout)})
+            if not self.__qb_control(service, "torrents_set_category", category=category, torrent_hashes=torrent_hash):
+                logger.error(f"{service.name} 设置辅种分类 {category} 失败，请查看控制请求日志")
         except Exception as err:
             logger.error(f"{service.name} 设置辅种分类 {category} 失败：{err}")
 
@@ -1665,17 +1668,13 @@ class IYUUAutoSeedPlus(_PluginBase):
         self._applied_downloader_timeouts[service_key] = self._downloader_timeout
         logger.info(f"下载器 {service.name} 辅种查询及添加请求超时 {self._downloader_timeout} 秒（独立请求配置）")
 
-    def __query_torrents(self, service, ids=None, status=None, limit=None, direct=None, tag=None):
-        """辅种读取使用独立会话，避免与宿主后台任务并发复用连接和登录状态。"""
+    def __qb_client(self, service, direct=None):
         server = service.instance
         source = getattr(server, "qbc", None)
         config = getattr(getattr(service, "config", None), "config", None)
         direct_mode = self._downloader_direct if direct is None else direct
         if service.type != "qbittorrent" or not source or not isinstance(config, dict):
-            if status == "seeding":
-                rows = server.get_completed_torrents()
-                return rows or [], rows is None
-            return server.get_torrents(ids=ids, tags=tag)
+            return None
         with self._query_clients_lock:
             client = self._query_clients.get(service.name)
             if (client is None or client.source is not source or client.config != config
@@ -1684,6 +1683,36 @@ class IYUUAutoSeedPlus(_PluginBase):
                     client.close()
                 client = QbQueryClient(source, config, self._downloader_timeout, direct=direct_mode)
                 self._query_clients[service.name] = client
+        return client
+
+    def __qb_request_args(self):
+        args = {"timeout": (min(self._downloader_timeout, 15), self._downloader_timeout)}
+        if self._downloader_direct:
+            args["proxies"] = {"http": "", "https": "", "all": ""}
+        return args
+
+    def __qb_control(self, service, method, **params):
+        client = self.__qb_client(service)
+        if client is None:
+            logger.warning(f"下载器 {service.name} 缺少独立控制连接配置")
+            return False
+        result = client.command(method, **params)
+        self._last_commands[service.name] = {**result, "method": method}
+        if not result["success"]:
+            logger.warning(f"下载器 {service.name} 辅种控制 {method} 失败：{result['error']}；保留待处理任务")
+        elif result["attempts"] > 1:
+            logger.info(f"下载器 {service.name} 辅种控制 {method} 重建连接后成功")
+        return result["success"]
+
+    def __query_torrents(self, service, ids=None, status=None, limit=None, direct=None, tag=None):
+        """辅种读取使用独立会话，避免与宿主后台任务并发复用连接和登录状态。"""
+        client = self.__qb_client(service, direct=direct)
+        if client is None:
+            if status == "seeding":
+                rows = service.instance.get_completed_torrents()
+                return rows or [], rows is None
+            return service.instance.get_torrents(ids=ids, tags=tag)
+        direct_mode = self._downloader_direct if direct is None else direct
         result = client.query(ids=ids, status=status, limit=limit, tag=tag)
         self._last_queries[service.name] = {
             "success": not bool(result["error"]), "error": result["error"],
@@ -1791,7 +1820,6 @@ class IYUUAutoSeedPlus(_PluginBase):
             return False
         self.realtotal += 1
         # 查询hash值是否已经在下载器中
-        downloader_obj = service.instance
         torrent_info, query_error = self.__query_torrents(service, ids=[seed.get("info_hash")])
         if query_error:
             logger.warn(f"下载器 {service.name} 查询种子失败，跳过本次辅种添加，避免重复添加：{seed.get('info_hash')}")
@@ -1862,7 +1890,7 @@ class IYUUAutoSeedPlus(_PluginBase):
                         logger.info(f"{download_id} 跳过校验，请自行检查手动开始任务...")
                 else:
                     # 开始校验种子
-                    downloader_obj.recheck_torrents(ids=[download_id])
+                    self.__qb_control(service, "torrents_recheck", torrent_hashes=[download_id])
                     self.__add_recheck_torrents(service, download_id)
             else:
                 self.__add_recheck_torrents(service, download_id)
