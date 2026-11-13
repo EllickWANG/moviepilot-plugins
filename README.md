@@ -26,6 +26,7 @@ https://raw.githubusercontent.com/EllickWANG/moviepilot-plugins/main/package.v2.
 | `sourceprioritysubscribefix` | 订阅外部源优先 | 正式使用 | [README](plugins.v2/sourceprioritysubscribefix/README.md) |
 | `siteadapter` | 站点适配器 | 已整合到站点工具箱 | [README](plugins.v2/siteadapter/README.md) |
 | `sitetoolbox` | 站点工具箱 | 正式使用 | [README](plugins.v2/sitetoolbox/README.md) |
+| `sitedatastat` | 站点数据统计 | 跟随核心站点管理采集 | [README](plugins.v2/sitedatastat/README.md) |
 | `IYUUAutoSeedPlus` | IYUU自动辅种增强 | 正式使用 | [README](plugins.v2/iyuuautoseedplus/README.md) |
 | `sourceprioritysubscribe` | 订阅外部源优先 | 旧兼容版 | [README](plugins.v2/sourceprioritysubscribe/README.md) |
 

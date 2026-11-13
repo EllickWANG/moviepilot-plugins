@@ -1,4 +1,3 @@
-import inspect
 import warnings
 from datetime import datetime, timedelta
 from threading import Lock
@@ -8,20 +7,21 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.chain.site import SiteChain
 from app.core.config import settings
+from app.core.event import eventmanager
+from app.db.site_oper import SiteOper
 from app.helper.sites import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import NotificationType
+from app.schemas.types import EventType, NotificationType
 from app.utils.string import StringUtils
-
-from .parser import SiteParserBase
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 lock = Lock()
 
-# 自主采集字段
+# 兼容已有历史快照的统计字段
 DATA_FIELDS = [
     "name", "domain", "username", "userid", "user_level", "join_at",
     "upload", "download", "ratio", "bonus",
@@ -33,11 +33,11 @@ class sitedatastat(_PluginBase):
     # 插件名称
     plugin_name = "站点数据统计"
     # 插件描述
-    plugin_desc = "完全自主抓取并解析各站点用户数据（上传/下载/分享率/魔力/做种），不依赖核心解析流程。"
+    plugin_desc = "跟随站点管理采集用户数据，提供历史趋势、上传下载增量和做种统计。"
     # 插件图标
     plugin_icon = "statistic.png"
     # 插件版本
-    plugin_version = "1.1.8"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "Nyxara"
     # 作者主页
@@ -57,8 +57,6 @@ class sitedatastat(_PluginBase):
     _retry = True
     _notify_type = ""
     _scheduler = None
-    # 解析器类（按 schema 索引）
-    _parser_classes: Dict[str, type] = {}
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -70,8 +68,9 @@ class sitedatastat(_PluginBase):
             self._retry = bool(config.get("retry", True))
             self._notify_type = config.get("notify_type") or ""
 
-        # 构建 schema -> 解析器类映射（来自插件内置 fork，独立于核心）
-        self._parser_classes = self._load_parser_classes()
+        # 升级后直接接入站点管理已有结果，不重抓站点、不改写历史。
+        if self._enabled:
+            self.sync_core_data()
 
         if self._onlyonce:
             logger.info("站点数据统计：立即运行一次采集")
@@ -109,175 +108,144 @@ class sitedatastat(_PluginBase):
             }]
         return []
 
+    # ---------------- 核心数据同步与采集 ----------------
+
+    def _targets(self) -> List[dict]:
+        return [site for site in (SitesHelper().get_indexers() or [])
+                if site.get("is_active")
+                and (not self._site_ids or site.get("id") in self._site_ids)]
+
     @staticmethod
-    def _load_parser_classes() -> Dict[str, type]:
-        """
-        加载插件内置 fork（单文件 parser 模块）的全部站点解析器，按 schema 值索引。
-        """
-        classes: Dict[str, type] = {}
-        from . import parser as parser_mod
-        for _, obj in inspect.getmembers(parser_mod, inspect.isclass):
-            if obj is SiteParserBase:
+    def _domain(site: dict) -> str:
+        return StringUtils.get_url_domain(site.get("domain") or site.get("url") or "")
+
+    @classmethod
+    def _empty_data(cls, site: dict) -> dict:
+        data = {field: None for field in DATA_FIELDS}
+        data.update({
+            "name": site.get("name"), "domain": cls._domain(site),
+            "upload": 0, "download": 0, "ratio": 0.0, "bonus": 0.0,
+            "seeding": 0, "leeching": 0, "seeding_size": 0,
+        })
+        return data
+
+    @classmethod
+    def _normalize_userdata(cls, site: dict, payload: dict) -> dict:
+        if payload.get("err_msg"):
+            raise ValueError(payload["err_msg"])
+        # 核心也可能返回未解析的默认对象，不能把它当作真实的全零账户。
+        if not payload.get("userid") and not payload.get("username"):
+            raise ValueError("核心未返回有效用户信息")
+        data = cls._empty_data(site)
+        data.update({field: payload[field] for field in DATA_FIELDS if field in payload})
+        data.update(name=site.get("name"), domain=cls._domain(site), err_msg=None)
+        day, time = payload.get("updated_day"), payload.get("updated_time")
+        data["updated_at"] = (f"{day} {time}" if day and time
+                              else datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        return data
+
+    def _get_core_snapshot(self, targets: List[dict]) -> Dict[str, dict]:
+        sites = {self._domain(site): site for site in targets}
+        result = {}
+        for row in SiteOper().get_userdata_latest() or []:
+            payload = row.to_dict()
+            domain = StringUtils.get_url_domain(payload.get("domain") or "")
+            if domain not in sites:
                 continue
             try:
-                if issubclass(obj, SiteParserBase) and getattr(obj, "schema", None):
-                    classes[obj.schema.value] = obj
-            except TypeError:
+                data = self._normalize_userdata(sites[domain], payload)
+            except ValueError:
                 continue
-        logger.info(f"站点数据统计：加载内置解析器 {len(classes)} 个 schema")
-        return classes
+            # 兼容核心返回同日多条记录的版本，始终取最后成功采集的结果。
+            previous = result.get(domain)
+            if not previous or data["updated_at"] > previous["updated_at"]:
+                result[domain] = data
+        return result
 
-    # ---------------- 采集 ----------------
+    def _save_snapshot(self, today: str, result: Dict[str, dict]):
+        self.save_data(today, result)
+        dates = sorted(set((self.get_data("_dates") or []) + [today]))[-90:]
+        self.save_data("_dates", dates)
+
+    @eventmanager.register(EventType.SiteRefreshed)
+    def on_site_refreshed(self, event):
+        """站点管理手动或定时刷新后，同步结果，不再发起第二次抓取。"""
+        if self._enabled and event:
+            self.sync_core_data()
+
+    def sync_core_data(self):
+        """用核心最新成功数据更新今日快照，保留已有历史。"""
+        # 插件主动采集会触发同一事件，由 collect 统一保存，避免递归或等待自己。
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            targets = self._targets()
+            current = self._get_core_snapshot(targets)
+            if not current:
+                return
+            previous = self._get_latest_snapshot() or {}
+            result = {}
+            for site in targets:
+                domain = self._domain(site)
+                if domain in current:
+                    data = current[domain]
+                    last = previous.get(domain) or {}
+                    # 失败采集也可能触发核心事件；旧缓存不能清除本次失败标记。
+                    if last.get("err_msg") and data["updated_at"] <= (last.get("updated_at") or ""):
+                        data = dict(data, err_msg=last["err_msg"])
+                    result[domain] = data
+                elif domain in previous:
+                    result[domain] = previous[domain]
+            self._save_snapshot(datetime.now().strftime("%Y-%m-%d"), result)
+        except Exception as err:
+            logger.warning(f"站点数据统计：同步核心数据失败 - {err}")
+        finally:
+            lock.release()
 
     def collect(self):
-        """
-        自主采集全部（或所选）站点用户数据并落库到插件自有存储。
-        """
+        """通过站点管理的采集流程刷新数据，并保存统计快照。"""
         with lock:
-            indexers = SitesHelper().get_indexers() or []
-            # 站点过滤
-            targets = []
-            for site in indexers:
-                if not site.get("is_active"):
-                    continue
-                if self._site_ids and site.get("id") not in self._site_ids:
-                    continue
-                targets.append(site)
-
+            targets = self._targets()
             if not targets:
                 logger.warning("站点数据统计：没有可采集的站点")
                 return
 
             today = datetime.now().strftime("%Y-%m-%d")
-            # 读取上一次快照用于抗抖动（失败/归零时沿用好值）
-            prev_snapshot = self._get_latest_snapshot()
+            previous = self._get_latest_snapshot() or {}
+            core_snapshot = self._get_core_snapshot(targets)
             result: Dict[str, dict] = {}
-
-            ok, fail = 0, 0
+            ok = fail = 0
             for site in targets:
-                domain = StringUtils.get_url_domain(site.get("url") or site.get("domain") or "")
+                domain = self._domain(site)
                 data = self._parse_site(site)
-                prev = (prev_snapshot or {}).get(domain)
-                data = self._stabilize(data, prev)
-                if data.get("err_msg") and prev:
-                    # 本次失败但有历史：沿用历史，仅标记
-                    merged = dict(prev)
-                    merged["err_msg"] = data.get("err_msg")
-                    merged["updated_at"] = prev.get("updated_at")
-                    result[domain] = merged
+                if data.get("err_msg"):
+                    # 优先沿用核心成功数据；升级前的插件历史仅作最后兜底。
+                    fallback = core_snapshot.get(domain) or previous.get(domain)
+                    if fallback:
+                        data = dict(fallback, err_msg=data["err_msg"])
                     fail += 1
                 else:
-                    result[domain] = data
-                    if data.get("err_msg"):
-                        fail += 1
-                    else:
-                        ok += 1
+                    ok += 1
+                result[domain] = data
 
-            # calculate_ratio 站点：用最终（含沿用历史）的上传/下载补算分享率，
-            # 避免站点流量页格式不匹配导致分享率为 0（如天雪）
-            from .parser import SITE_RULES
-            calc_domains = [d for d, r in SITE_RULES.items() if r.get("calculate_ratio")]
-            for dom, rec in result.items():
-                if not any(dom == cd or dom.endswith("." + cd) for cd in calc_domains):
-                    continue
-                if not rec.get("ratio") and rec.get("download"):
-                    try:
-                        rec["ratio"] = round(float(rec["upload"]) / float(rec["download"]), 3)
-                    except (TypeError, ValueError, ZeroDivisionError):
-                        pass
-
-            # 落库（插件自有存储，不写核心 SiteUserData）
-            self.save_data(today, result)
-            dates = self.get_data("_dates") or []
-            if today not in dates:
-                dates.append(today)
-                dates = sorted(dates)[-90:]  # 最多保留 90 天
-                self.save_data("_dates", dates)
-            logger.info(f"站点数据统计：采集完成，成功 {ok}，失败/沿用 {fail}，共 {len(result)} 站")
-
-            # 通知
-            self._notify(today, result, prev_snapshot)
+            self._save_snapshot(today, result)
+            logger.info(f"站点数据统计：核心采集完成，成功 {ok}，失败/沿用 {fail}，共 {len(result)} 站")
+            self._notify(today, result, previous)
 
     def _parse_site(self, site: dict) -> dict:
-        """
-        用插件内置 fork 解析器抓取并解析单站，带一次失败重试。
-        """
-        schema = site.get("schema")
-        parser_cls = self._parser_classes.get(schema)
-        base = {f: None for f in DATA_FIELDS}
-        base.update({
-            "name": site.get("name"),
-            "domain": StringUtils.get_url_domain(site.get("url") or site.get("domain") or ""),
-            "upload": 0, "download": 0, "ratio": 0.0, "bonus": 0.0,
-            "seeding": 0, "leeching": 0, "seeding_size": 0,
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        })
-        if not parser_cls:
-            base["err_msg"] = f"未找到解析器 schema={schema}"
-            return base
-
+        """复用站点管理的核心采集和适配规则，失败时重试一次。"""
+        data = self._empty_data(site)
         attempts = 2 if self._retry else 1
-        last_err = None
-        for i in range(attempts):
+        for attempt in range(attempts):
             try:
-                parser = parser_cls(
-                    site_name=site.get("name"),
-                    url=site.get("url"),
-                    site_cookie=site.get("cookie"),
-                    apikey=site.get("apikey"),
-                    token=site.get("token"),
-                    ua=site.get("ua") or settings.USER_AGENT,
-                    proxy=site.get("proxy"),
-                )
-                parser.parse()
-                if parser.err_msg and i + 1 < attempts:
-                    last_err = parser.err_msg
-                    continue
-                base.update({
-                    "username": parser.username,
-                    "userid": parser.userid,
-                    "user_level": parser.user_level,
-                    "join_at": parser.join_at,
-                    "upload": parser.upload or 0,
-                    "download": parser.download or 0,
-                    "ratio": parser.ratio or 0.0,
-                    "bonus": parser.bonus or 0.0,
-                    "seeding": parser.seeding or 0,
-                    "leeching": parser.leeching or 0,
-                    "seeding_size": parser.seeding_size or 0,
-                    "err_msg": parser.err_msg or None,
-                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                })
-                return base
+                userdata = SiteChain().refresh_userdata(site=site)
+                if userdata is None:
+                    raise ValueError("核心未返回站点用户数据")
+                return self._normalize_userdata(site, userdata.model_dump())
             except Exception as err:
-                last_err = str(err)
-                logger.debug(f"站点数据统计：{site.get('name')} 解析异常({i + 1}/{attempts}) - {err}")
-        base["err_msg"] = last_err or "解析失败"
-        return base
-
-    @staticmethod
-    def _stabilize(data: dict, prev: Optional[dict]) -> dict:
-        """
-        抗抖动：本次已登录但做种为 0（多为做种子页抓取失败），且历史有好值时沿用，避免归零跳变。
-        """
-        if not prev:
-            return data
-        if data.get("err_msg"):
-            return data
-        # 本次上传/下载全为 0 但历史有上传：多为静默抓取失败（如 m-team apikey 偶发），整条沿用历史
-        if not data.get("upload") and not data.get("download") and prev.get("upload"):
-            carried = dict(prev)
-            carried["err_msg"] = None
-            return carried
-        if not data.get("upload"):
-            return data
-        if not data.get("seeding") and prev.get("seeding"):
-            data["seeding"] = prev.get("seeding")
-            if not data.get("seeding_size") and prev.get("seeding_size"):
-                data["seeding_size"] = prev.get("seeding_size")
-        # 等级偶发抓不到时沿用历史
-        if not data.get("user_level") and prev.get("user_level"):
-            data["user_level"] = prev.get("user_level")
+                data["err_msg"] = str(err) or "核心采集失败"
+                logger.warning(f"站点数据统计：{site.get('name')} 核心采集失败"
+                               f"({attempt + 1}/{attempts}) - {err}")
         return data
 
     # ---------------- 存储读取 ----------------
@@ -413,7 +381,7 @@ class sitedatastat(_PluginBase):
                             {"component": "VCol", "props": {"cols": 12},
                              "content": [{"component": "VAlert",
                                           "props": {"type": "info", "variant": "tonal",
-                                                    "text": "本插件完全自主抓取解析，不依赖核心 SiteUserData。数据存于插件自有存储。"}}]},
+                                                    "text": "采集与站点管理保持一致，站点管理刷新后自动同步。历史快照和图表保存在插件中；采集失败时保留上次成功数据。"}}]},
                         ],
                     },
                 ],
@@ -528,6 +496,11 @@ class sitedatastat(_PluginBase):
                 cell = {"component": "td", "text": c["text"]}
                 if c["cls"]:
                     cell["props"] = {"class": c["cls"]}
+                if c is cells[0]:
+                    cell.setdefault("props", {})["title"] = (
+                        f"最近成功采集：{r.get('updated_at') or '暂无'}"
+                        + (f"；本次失败：{r['err_msg']}" if r.get("err_msg") else "")
+                    )
                 content.append(cell)
             table_rows.append({"component": "tr", "props": {"class": "text-sm"}, "content": content})
 
