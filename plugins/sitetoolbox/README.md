@@ -155,3 +155,11 @@ MoviePilot 的站点诊断、监控和维护工作台，整合 RSS、用户数�
 - 站点适配配置不应写入站点 Cookie、账号、密钥等敏感信息。
 - 从 `siteadapter` 迁移时，可以把原插件的 `站点适配配置` 原样复制到工具箱。
 - 缺失种子清理当前面向 qBittorrent 的 `missingFiles` 状态；清理前应先查看详情页预览结果。
+
+## 馒头网络只读探针
+
+`GET /api/v1/plugin/sitetoolbox/probe/mteam/{site_id}`（需已登录管理员认证）
+
+用于定位 API Key 有效但服务器返回 403 的情形。仅请求馒头 `.cc` / `.io` 的固定 profile 接口，报告系统 DNS、相关 hosts 覆盖、脱敏代理位置、实际连接地址，以及核心请求、排除环境变量的直连/代理、公共 DNS 地址连接的结果。公共地址连接保留原域名 SNI 和证书校验。
+
+探针不修改站点配置，不返回 API Key、代理密码、Cookie 或完整账户响应。

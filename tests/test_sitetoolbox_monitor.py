@@ -224,7 +224,8 @@ class UserdataRefreshTest(unittest.TestCase):
              patch.object(PLUGIN.SiteOper.return_value, 'get_userdata_latest', side_effect=latest or (lambda: [self.old])), \
              patch.object(PLUGIN, '_refresh_site_userdata', side_effect=refresh), \
              patch.object(PLUGIN, '_site_statistics', return_value={}), \
-             patch.object(PLUGIN, '_site_has_rule', return_value=False):
+             patch.object(PLUGIN, '_site_has_rule', return_value=False), \
+             patch.object(PLUGIN.time, 'time', return_value=datetime(2026, 10, 23, 15, 0).timestamp()):
             return PLUGIN._check_userdata_health(ids if ids is not None else [26])
 
     def test_retest_collects_before_reading_snapshot_and_recovers_missing_level(self):

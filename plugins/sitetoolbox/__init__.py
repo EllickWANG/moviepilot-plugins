@@ -39,7 +39,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.4.2"
+    plugin_version = "1.4.3"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -275,6 +275,8 @@ class sitetoolbox(_PluginBase):
                 "summary": "检查站点用户数据完整性",
                 "description": "检查站点最新用户数据是否存在错误、缺失或关键字段异常。",
             },
+            {"path": "/probe/mteam/{site_id}", "endpoint": _api_probe_mteam,
+             "methods": ["GET"], "auth": "bear", "summary": "馒头 DNS 与认证访问链路诊断"},
             {
                 "path": "/probe/indexer/{site_id}",
                 "endpoint": _api_probe_indexer,
@@ -1188,6 +1190,17 @@ def _api_check_userdata(payload: Optional[dict] = Body(default=None)) -> schemas
         return f"用户数据检查完成：确认异常 {bad_count}/{len(results)}，待观察 {pending_count}，站点连接失败 {offline_count}"
 
     return plugin._start_background_job("userdata_check", "用户数据检查", worker)
+
+
+def _api_probe_mteam(site_id: int) -> schemas.Response:
+    from .network_probe import probe_mteam
+    site = SiteOper().get(site_id)
+    if not site or not _is_mteam_site(site):
+        return schemas.Response(success=False, message="只允许诊断已配置的馒头站点")
+    try:
+        return schemas.Response(success=True, data=probe_mteam(site, settings, RequestUtils))
+    except ValueError as err:
+        return schemas.Response(success=False, message=str(err))
 
 
 def _api_probe_indexer(site_id: int, steps: Optional[str] = None) -> schemas.Response:
