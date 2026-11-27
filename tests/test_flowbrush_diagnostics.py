@@ -21,7 +21,11 @@ with patch.dict(sys.modules, {"flowbrush_test.diagnostics": DIAG}):
 
 
 def load_plugin():
-    modules = {"flowbrush_test.diagnostics": DIAG, "flowbrush_test.direct_downloader": DIRECT}
+    workspace_spec = importlib.util.spec_from_file_location("flowbrush_test.workspace", PACKAGE / "workspace.py")
+    workspace = importlib.util.module_from_spec(workspace_spec)
+    workspace_spec.loader.exec_module(workspace)
+    modules = {"flowbrush_test.diagnostics": DIAG, "flowbrush_test.direct_downloader": DIRECT,
+               "flowbrush_test.workspace": workspace}
     dependencies = {
         "pytz": {},
         "apscheduler.schedulers.background": {"BackgroundScheduler": Mock()},
