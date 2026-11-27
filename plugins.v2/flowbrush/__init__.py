@@ -268,7 +268,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.9"
+    plugin_version = "4.3.10"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -3697,12 +3697,15 @@ class FlowBrush(_PluginBase):
                 dltime = 0
             else:
                 dltime = date_now - torrent.get("added_on")
-            # 做种时间
-            if (not torrent.get("completion_on")
-                    or torrent.get("completion_on") < 0):
+            # 使用 qB 累计做种计时；完成后的墙钟时间会误计暂停、离线时间。
+            # 数据缺失、损坏或仅完成选中文件时不允许凭时间触发删除。
+            seeding_time = torrent.get("seeding_time")
+            if (type(seeding_time) is not int or seeding_time < 0
+                    or torrent.get("progress") != 1
+                    or torrent.get("amount_left") != 0
+                    or not torrent.get("total_size")
+                    or torrent.get("size") != torrent.get("total_size")):
                 seeding_time = 0
-            else:
-                seeding_time = date_now - torrent.get("completion_on")
             # 分享率
             ratio = torrent.get("ratio") or 0
             # 上传量
