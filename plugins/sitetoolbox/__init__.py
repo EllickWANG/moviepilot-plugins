@@ -32,6 +32,7 @@ from app.schemas.types import SystemConfigKey
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
+from .direct_downloader import direct_downloader
 from .monitor import MODULES, classify as classify_monitor, is_due, next_run, normalize_plan, observe
 
 
@@ -39,7 +40,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.4.3"
+    plugin_version = "1.4.4"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -2001,13 +2002,11 @@ def _build_missing_torrent_preview(downloader_names: List[str]) -> Dict[str, Any
             errors.append({"downloader": downloader_name, "message": f"暂不支持 {service.type or '未知'} 下载器"})
             continue
 
-        server = service.instance
         try:
-            if hasattr(server, "is_inactive") and server.is_inactive():
-                server.reconnect()
-            torrents, failed = server.get_torrents()
+            with direct_downloader(service) as server:
+                torrents, failed = server.get_torrents()
         except Exception as err:
-            errors.append({"downloader": downloader_name, "message": f"查询失败：{err}"})
+            errors.append({"downloader": downloader_name, "message": f"查询失败：{type(err).__name__}"})
             continue
         if failed:
             errors.append({"downloader": downloader_name, "message": "查询种子列表失败"})
@@ -2055,57 +2054,62 @@ def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_f
             result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
             continue
 
-        server = service.instance
-        hashes = [item.get("hash") for item in downloader_items if item.get("hash")]
         try:
-            if hasattr(server, "is_inactive") and server.is_inactive():
-                server.reconnect()
-            torrents, failed = server.get_torrents(ids=hashes)
+            with direct_downloader(service) as server:
+                hashes = [item.get("hash") for item in downloader_items if item.get("hash")]
+                try:
+                    torrents, failed = server.get_torrents(ids=hashes)
+                except Exception as err:
+                    message = f"清理前复查失败：{type(err).__name__}"
+                    errors.append({"downloader": downloader_name, "message": message})
+                    failed_count += len(downloader_items)
+                    result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
+                    continue
+                if failed:
+                    message = "清理前复查种子状态失败"
+                    errors.append({"downloader": downloader_name, "message": message})
+                    failed_count += len(downloader_items)
+                    result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
+                    continue
+
+                missing_hashes = {_torrent_hash(torrent) for torrent in torrents or [] if _is_missing_torrent(torrent)}
+                missing_hashes.discard("")
+                skipped_items = [item for item in downloader_items if item.get("hash") not in missing_hashes]
+                skipped_count += len(skipped_items)
+                result_items.extend(_cleanup_result_rows(skipped_items, "skipped", "当前已不是 missingFiles 状态"))
+
+                delete_hashes = [item.get("hash") for item in downloader_items if item.get("hash") in missing_hashes]
+                if not delete_hashes:
+                    continue
+                try:
+                    logger.info(
+                        f"站点工具箱调用下载器删除缺失种子：downloader={downloader_name}，"
+                        f"count={len(delete_hashes)}，delete_files={delete_files}"
+                    )
+                    deleted = bool(server.delete_torrents(delete_file=delete_files, ids=delete_hashes))
+                except Exception as err:
+                    deleted = False
+                    errors.append({"downloader": downloader_name, "message": f"删除失败：{type(err).__name__}"})
+                if deleted:
+                    deleted_count += len(delete_hashes)
+                    result_items.extend(_cleanup_result_rows(
+                        [item for item in downloader_items if item.get("hash") in missing_hashes],
+                        "deleted",
+                        "已删除下载器任务",
+                    ))
+                else:
+                    failed_count += len(delete_hashes)
+                    result_items.extend(_cleanup_result_rows(
+                        [item for item in downloader_items if item.get("hash") in missing_hashes],
+                        "failed",
+                        "删除失败",
+                    ))
+
         except Exception as err:
-            message = f"清理前复查失败：{err}"
+            message = f"创建下载器直连会话失败：{type(err).__name__}"
             errors.append({"downloader": downloader_name, "message": message})
             failed_count += len(downloader_items)
             result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
-            continue
-        if failed:
-            message = "清理前复查种子状态失败"
-            errors.append({"downloader": downloader_name, "message": message})
-            failed_count += len(downloader_items)
-            result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
-            continue
-
-        missing_hashes = {_torrent_hash(torrent) for torrent in torrents or [] if _is_missing_torrent(torrent)}
-        missing_hashes.discard("")
-        skipped_items = [item for item in downloader_items if item.get("hash") not in missing_hashes]
-        skipped_count += len(skipped_items)
-        result_items.extend(_cleanup_result_rows(skipped_items, "skipped", "当前已不是 missingFiles 状态"))
-
-        delete_hashes = [item.get("hash") for item in downloader_items if item.get("hash") in missing_hashes]
-        if not delete_hashes:
-            continue
-        try:
-            logger.info(
-                f"站点工具箱调用下载器删除缺失种子：downloader={downloader_name}，"
-                f"count={len(delete_hashes)}，delete_files={delete_files}"
-            )
-            deleted = bool(server.delete_torrents(delete_file=delete_files, ids=delete_hashes))
-        except Exception as err:
-            deleted = False
-            errors.append({"downloader": downloader_name, "message": f"删除失败：{err}"})
-        if deleted:
-            deleted_count += len(delete_hashes)
-            result_items.extend(_cleanup_result_rows(
-                [item for item in downloader_items if item.get("hash") in missing_hashes],
-                "deleted",
-                "已删除下载器任务",
-            ))
-        else:
-            failed_count += len(delete_hashes)
-            result_items.extend(_cleanup_result_rows(
-                [item for item in downloader_items if item.get("hash") in missing_hashes],
-                "failed",
-                "删除失败",
-            ))
 
     return {
         "cleaned_at": _now(),
