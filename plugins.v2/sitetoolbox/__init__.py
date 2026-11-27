@@ -33,6 +33,7 @@ from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 from .direct_downloader import direct_downloader
+from .stalled_crossseed import is_stalled_crossseed
 from .monitor import MODULES, classify as classify_monitor, is_due, next_run, normalize_plan, observe
 
 
@@ -40,7 +41,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.4.4"
+    plugin_version = "1.5.0"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -58,6 +59,10 @@ class sitetoolbox(_PluginBase):
     _patch_userdata = True
     _site_conf = ""
     _cleanup_downloader_names: List[str] = []
+    _cleanup_stalled_tag = "keep_iyuu"
+    _cleanup_stalled_days = 7
+    _cleanup_stalled_auto = False
+    _latest_stalled_cleanup: Dict[str, Any] = {}
     _cleanup_delete_files = False
     _cleanup_auto_enabled = False
     _cleanup_auto_cleanup = False
@@ -116,6 +121,10 @@ class sitetoolbox(_PluginBase):
         self._cleanup_downloader_names = _str_list(
             config.get("cleanup_downloader_names") or config.get("cleanup_downloaders")
         )
+        self._cleanup_stalled_tag = str(config.get("cleanup_stalled_tag", "keep_iyuu") or "").strip()
+        self._cleanup_stalled_days = _int_or_default(config.get("cleanup_stalled_days"), 7, minimum=1, maximum=365)
+        self._cleanup_stalled_auto = _to_bool(config.get("cleanup_stalled_auto", False), False)
+        self._latest_stalled_cleanup = config.get("latest_stalled_cleanup") or {}
         self._cleanup_delete_files = _to_bool(config.get("cleanup_delete_files", False), False)
         self._cleanup_auto_enabled = _to_bool(config.get("cleanup_auto_enabled", False), False)
         self._cleanup_auto_cleanup = _to_bool(config.get("cleanup_auto_cleanup", False), False)
@@ -157,6 +166,10 @@ class sitetoolbox(_PluginBase):
         self.__class__._patch_userdata = self._patch_userdata
         self.__class__._site_conf = self._site_conf
         self.__class__._cleanup_downloader_names = self._cleanup_downloader_names
+        self.__class__._cleanup_stalled_tag = self._cleanup_stalled_tag
+        self.__class__._cleanup_stalled_days = self._cleanup_stalled_days
+        self.__class__._cleanup_stalled_auto = self._cleanup_stalled_auto
+        self.__class__._latest_stalled_cleanup = self._latest_stalled_cleanup
         self.__class__._cleanup_delete_files = self._cleanup_delete_files
         self.__class__._cleanup_auto_enabled = self._cleanup_auto_enabled
         self.__class__._cleanup_auto_cleanup = self._cleanup_auto_cleanup
@@ -316,7 +329,15 @@ class sitetoolbox(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "预览缺失文件种子",
-                "description": "扫描配置的下载器，预览 qBittorrent missingFiles 状态的种子。",
+                "description": "扫描配置下载器的缺文件种子和带指定标签的长期未启动辅种。",
+            },
+            {
+                "path": "/cleanup/stalled",
+                "endpoint": _api_cleanup_stalled_torrents,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清理已确认的长期未启动辅种",
+                "description": "复查标签、未启动状态及同路径任务，只删除任务记录，保留数据文件。",
             },
             {
                 "path": "/cleanup/missing",
@@ -371,6 +392,10 @@ class sitetoolbox(_PluginBase):
             "patch_userdata": self._patch_userdata,
             "site_conf": self._site_conf,
             "cleanup_downloader_names": self._cleanup_downloader_names,
+            "cleanup_stalled_tag": self._cleanup_stalled_tag,
+            "cleanup_stalled_days": self._cleanup_stalled_days,
+            "cleanup_stalled_auto": self._cleanup_stalled_auto,
+            "latest_stalled_cleanup": self._latest_stalled_cleanup,
             "cleanup_delete_files": self._cleanup_delete_files,
             "cleanup_auto_enabled": self._cleanup_auto_enabled,
             "cleanup_auto_cleanup": self._cleanup_auto_cleanup,
@@ -464,10 +489,14 @@ class sitetoolbox(_PluginBase):
                             continue
                         preview = _build_missing_torrent_preview(self._cleanup_downloader_names)
                         self._save_missing_preview(preview)
-                        results = [item["monitor"] for item in preview["items"]] + preview.get("downloader_status", [])
+                        results = [item["monitor"] for item in [*preview["items"], *preview.get("stalled_items", [])]] + preview.get("downloader_status", [])
                         cleanup_items = self._confirmed_missing_items(preview)
                         if notify and self._cleanup_auto_cleanup and cleanup_items:
                             self._save_missing_cleanup(_cleanup_missing_torrents_from_preview(cleanup_items, self._cleanup_delete_files))
+                            self._save_missing_preview(_build_missing_torrent_preview(self._cleanup_downloader_names))
+                        stalled_items = self._confirmed_stalled_items(self._latest_missing_preview)
+                        if notify and self._cleanup_stalled_auto and stalled_items:
+                            self._save_stalled_cleanup(_cleanup_missing_torrents_from_preview(stalled_items, kind="stalled"))
                             self._save_missing_preview(_build_missing_torrent_preview(self._cleanup_downloader_names))
                     self._record_monitor_results(module, [{"object_id": "module", "state": "success", "message": "模块执行完成"}])
                     bad = sum(bool(row.get("confirmed")) for row in results)
@@ -497,6 +526,14 @@ class sitetoolbox(_PluginBase):
     def _confirmed_missing_items(self, preview: dict) -> List[dict]:
         return [item for item in preview.get("items", [])
                 if classify_monitor(item.get("monitor") or {"state": "error"}, self._rss_failure_days)["confirmed"]]
+
+    def _confirmed_stalled_items(self, preview: dict) -> List[dict]:
+        return self._confirmed_missing_items({"items": preview.get("stalled_items", [])})
+
+    def _save_stalled_cleanup(self, cleanup: Dict[str, Any]):
+        self._latest_stalled_cleanup = cleanup
+        self.__class__._latest_stalled_cleanup = cleanup
+        self.update_config(self._config_payload(latest_stalled_cleanup=cleanup))
 
     def _save_results(self, results: List[Dict[str, Any]]):
         ids = {item.get("site_id") for item in results}
@@ -537,7 +574,21 @@ class sitetoolbox(_PluginBase):
             seen[name] = sorted(hashes)
         for item in preview.get("items", []):
             observations.append({"object_id": f"torrent:{item['downloader']}:{item['hash']}", "state": "error", "message": "下载器报告文件缺失"})
+        stalled_seen = self.get_data("stalled_seen") or {}
+        for name in preview.get("downloaders", []):
+            if name in failed:
+                continue
+            hashes = {item["hash"] for item in preview.get("stalled_items", []) if item["downloader"] == name}
+            for torrent_hash in set(stalled_seen.get(name, [])) - hashes:
+                observations.append({"object_id": f"stalled:{name}:{torrent_hash}", "state": "success", "message": "已不符合长期未启动辅种条件"})
+            stalled_seen[name] = sorted(hashes)
+        for item in preview.get("stalled_items", []):
+            observations.append({"object_id": f"stalled:{item['downloader']}:{item['hash']}", "state": "warning",
+                                 "message": "辅种任务长期未启动，文件是否存在尚未确认"})
         results = {row["object_id"]: row for row in self._record_monitor_results("missing", observations)}
+        for item in preview.get("stalled_items", []):
+            item["monitor"] = results[f"stalled:{item['downloader']}:{item['hash']}"]
+        self.save_data("stalled_seen", stalled_seen)
         for item in preview.get("items", []):
             item["monitor"] = results[f"torrent:{item['downloader']}:{item['hash']}"]
         preview["downloader_status"] = [results[f"downloader:{name}"] for name in preview.get("downloaders", [])]
@@ -639,6 +690,10 @@ class sitetoolbox(_PluginBase):
                     f"跳过 {cleanup.get('skipped_count', 0)} 个，失败 {cleanup.get('failed_count', 0)} 个，"
                     f"剩余 {refreshed.get('total_count', 0)} 个"
                 )
+            stalled_items = self._confirmed_stalled_items(self._latest_missing_preview)
+            if self._cleanup_stalled_auto and stalled_items:
+                self._save_stalled_cleanup(_cleanup_missing_torrents_from_preview(stalled_items, kind="stalled"))
+                self._save_missing_preview(_build_missing_torrent_preview(self._cleanup_downloader_names))
             self._set_job_state("missing_auto", name, "success", message, finished_at=_now())
             logger.info(
                 f"站点工具箱缺失种子定时扫描完成：{message}，"
@@ -1046,6 +1101,9 @@ def _api_overview() -> schemas.Response:
     preview = dict(plugin._latest_missing_preview)
     preview["items"] = [{**item, "monitor": _view_monitor_result(item.get("monitor") or {"state": "error", "message": "下载器报告文件缺失"}, threshold)}
                         for item in preview.get("items", [])]
+    preview["stalled_items"] = [{**item, "monitor": _view_monitor_result(item.get("monitor") or {"state": "warning", "message": "长期未启动辅种"}, threshold)}
+                               for item in preview.get("stalled_items", [])]
+    preview["stalled_confirmed_count"] = sum(item["monitor"]["confirmed"] for item in preview["stalled_items"])
     preview["confirmed_count"] = sum(item["monitor"]["confirmed"] for item in preview["items"])
     preview["downloader_status"] = [_view_monitor_result(item, threshold) for item in preview.get("downloader_status", [])]
     return schemas.Response(success=True, data={
@@ -1054,7 +1112,10 @@ def _api_overview() -> schemas.Response:
                  "next_run_at": upcoming.strftime("%Y-%m-%d %H:%M:%S") if upcoming else ""},
         "jobs": plugin._latest_job_states, "runs": plugin.get_data("monitor_runs") or [],
         "maintenance": {"missing": preview, "cleanup": plugin._latest_missing_cleanup,
-                        "delete_files": plugin._cleanup_delete_files, "auto_cleanup": plugin._cleanup_auto_cleanup},
+                        "delete_files": plugin._cleanup_delete_files, "auto_cleanup": plugin._cleanup_auto_cleanup,
+                        "stalled_cleanup": plugin._latest_stalled_cleanup,
+                        "stalled_tag": plugin._cleanup_stalled_tag, "stalled_days": plugin._cleanup_stalled_days,
+                        "stalled_auto": plugin._cleanup_stalled_auto},
         "rules": [{"domain": rule.get("domain"), "indexer": isinstance(rule.get("indexer"), dict),
                    "userdata": isinstance(rule.get("userdata"), dict), "asyncfix": bool(rule.get("asyncfix"))}
                   for rule in plugin._site_rules],
@@ -1664,7 +1725,7 @@ def _api_preview_missing_torrents(payload: Optional[dict] = Body(default=None)) 
         total_count = preview.get("total_count", 0)
         total_size = _format_size(preview.get("total_size", 0))
         error_count = len(preview.get("errors") or [])
-        message = f"缺失种子预览完成：{total_count} 个，{total_size}"
+        message = f"种子扫描完成：缺文件 {total_count} 个（{total_size}），长期未启动辅种 {preview.get('stalled_count', 0)} 个"
         if error_count:
             message += f"，{error_count} 个下载器异常"
         return message
@@ -1714,6 +1775,27 @@ def _api_cleanup_missing_torrents(payload: Optional[dict] = Body(default=None)) 
         return message
 
     return plugin._start_background_job("missing_cleanup", "缺失种子清理", worker)
+
+
+def _api_cleanup_stalled_torrents(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+    plugin = sitetoolbox._instance
+    if not plugin:
+        return schemas.Response(success=False, message="插件未初始化")
+    names = _str_list((payload or {}).get("downloader_names")) or plugin._cleanup_downloader_names
+    items = [item for item in plugin._confirmed_stalled_items(plugin._latest_missing_preview)
+             if item.get("downloader") in names]
+    if not items:
+        return schemas.Response(success=False, message="没有达到连续异常确认天数的长期未启动辅种")
+
+    def worker() -> str:
+        # 此接口不接收删除文件参数，未启动不代表磁盘上没有数据。
+        result = _cleanup_missing_torrents_from_preview(items, kind="stalled")
+        plugin._save_stalled_cleanup(result)
+        plugin._save_missing_preview(_build_missing_torrent_preview(names))
+        return (f"未启动辅种清理完成：删除 {result['deleted_count']} 个，"
+                f"跳过 {result['skipped_count']} 个，失败 {result['failed_count']} 个；数据文件保留")
+
+    return plugin._start_background_job("stalled_cleanup", "长期未启动辅种清理", worker)
 
 
 def _api_check_mteam_login(payload: Optional[dict] = Body(default=None)) -> schemas.Response:
@@ -1988,7 +2070,15 @@ def _is_mteam_site(site: Any) -> bool:
     return domain in {"m-team.cc", "m-team.io"} or domain.endswith(".m-team.cc") or domain.endswith(".m-team.io") or "m-team" in url
 
 
+def _stalled_policy():
+    plugin = sitetoolbox._instance
+    return {"required_tag": getattr(plugin, "_cleanup_stalled_tag", "keep_iyuu"),
+            "age_days": getattr(plugin, "_cleanup_stalled_days", 7)}
+
+
 def _build_missing_torrent_preview(downloader_names: List[str]) -> Dict[str, Any]:
+    stalled_items: List[Dict[str, Any]] = []
+    policy = _stalled_policy()
     items: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     services = DownloaderHelper().get_services(name_filters=downloader_names)
@@ -2013,14 +2103,20 @@ def _build_missing_torrent_preview(downloader_names: List[str]) -> Dict[str, Any
             continue
 
         for torrent in torrents or []:
-            if not _is_missing_torrent(torrent):
-                continue
-            items.append(_missing_torrent_item(downloader_name, torrent))
+            if _is_missing_torrent(torrent):
+                items.append(_missing_torrent_item(downloader_name, torrent))
+            elif is_stalled_crossseed(torrent, torrents, **policy):
+                item = _missing_torrent_item(downloader_name, torrent)
+                item.update(kind="stalled", added_on=_format_timestamp(_torrent_int(torrent, "added_on")),
+                            age_days=int((time.time() - _torrent_int(torrent, "added_on")) // 86400))
+                stalled_items.append(item)
 
     items = sorted(items, key=lambda item: (item.get("downloader") or "", item.get("save_path") or "", item.get("name") or ""))
     total_size = sum(int(item.get("size") or 0) for item in items)
     return {
         "created_at": _now(),
+        "stalled_items": sorted(stalled_items, key=lambda row: (row["downloader"], row["name"])),
+        "stalled_count": len(stalled_items),
         "downloaders": downloader_names,
         "total_count": len(items),
         "total_size": total_size,
@@ -2031,7 +2127,12 @@ def _build_missing_torrent_preview(downloader_names: List[str]) -> Dict[str, Any
     }
 
 
-def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_files: bool = False) -> Dict[str, Any]:
+def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_files: bool = False,
+                                         kind: str = "missing") -> Dict[str, Any]:
+    if kind not in {"missing", "stalled"}:
+        raise ValueError("Unknown cleanup kind")
+    if kind == "stalled":
+        delete_files = False
     services = DownloaderHelper().get_services(name_filters=list(dict.fromkeys(item.get("downloader") for item in items)))
     errors: List[Dict[str, Any]] = []
     result_items: List[Dict[str, Any]] = []
@@ -2058,7 +2159,7 @@ def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_f
             with direct_downloader(service) as server:
                 hashes = [item.get("hash") for item in downloader_items if item.get("hash")]
                 try:
-                    torrents, failed = server.get_torrents(ids=hashes)
+                    torrents, failed = server.get_torrents(ids=None if kind == "stalled" else hashes)
                 except Exception as err:
                     message = f"清理前复查失败：{type(err).__name__}"
                     errors.append({"downloader": downloader_name, "message": message})
@@ -2072,18 +2173,22 @@ def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_f
                     result_items.extend(_cleanup_result_rows(downloader_items, "failed", message))
                     continue
 
-                missing_hashes = {_torrent_hash(torrent) for torrent in torrents or [] if _is_missing_torrent(torrent)}
+                if kind == "stalled":
+                    missing_hashes = {_torrent_hash(torrent) for torrent in torrents or []
+                                      if is_stalled_crossseed(torrent, torrents, **_stalled_policy())}
+                else:
+                    missing_hashes = {_torrent_hash(torrent) for torrent in torrents or [] if _is_missing_torrent(torrent)}
                 missing_hashes.discard("")
                 skipped_items = [item for item in downloader_items if item.get("hash") not in missing_hashes]
                 skipped_count += len(skipped_items)
-                result_items.extend(_cleanup_result_rows(skipped_items, "skipped", "当前已不是 missingFiles 状态"))
+                result_items.extend(_cleanup_result_rows(skipped_items, "skipped", "当前已不符合长期未启动辅种条件" if kind == "stalled" else "当前已不是 missingFiles 状态"))
 
                 delete_hashes = [item.get("hash") for item in downloader_items if item.get("hash") in missing_hashes]
                 if not delete_hashes:
                     continue
                 try:
                     logger.info(
-                        f"站点工具箱调用下载器删除缺失种子：downloader={downloader_name}，"
+                        f"站点工具箱调用下载器清理种子：kind={kind}，downloader={downloader_name}，"
                         f"count={len(delete_hashes)}，delete_files={delete_files}"
                     )
                     deleted = bool(server.delete_torrents(delete_file=delete_files, ids=delete_hashes))
@@ -2113,6 +2218,7 @@ def _cleanup_missing_torrents_from_preview(items: List[Dict[str, Any]], delete_f
 
     return {
         "cleaned_at": _now(),
+        "kind": kind,
         "delete_files": delete_files,
         "candidate_count": len(items),
         "deleted_count": deleted_count,

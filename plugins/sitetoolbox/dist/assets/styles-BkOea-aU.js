@@ -56,7 +56,7 @@ function createClient(api, pluginId = "sitetoolbox") {
 const MODULES = {
   rss: "RSS 检测",
   userdata: "用户数据",
-  missing: "缺失种子扫描",
+  missing: "缺失种子与未启动辅种",
   mteam: "馒头登录检查",
 };
 const STATES = {
@@ -94,6 +94,9 @@ const DEFAULTS = {
   cleanup_downloader_names: [],
   cleanup_delete_files: false,
   cleanup_auto_cleanup: false,
+  cleanup_stalled_tag: "keep_iyuu",
+  cleanup_stalled_days: 7,
+  cleanup_stalled_auto: false,
   error_retention_days: 3,
   mteam_site_ids: [],
   mteam_warning_days: 25,
@@ -173,6 +176,7 @@ function validateSettings(config) {
     ["timeout", "请求超时", 5, 120],
     ["mteam_warning_days", "登录记录最长间隔", 1, 365],
     ["userdata_stale_days", "数据过期天数", 1, 365],
+    ["cleanup_stalled_days", "辅种最少添加天数", 1, 365],
   ]) {
     const n = Number(config[key]);
     if (!Number.isInteger(n) || n < min || n > max)
@@ -200,6 +204,8 @@ function validateSettings(config) {
         errors.push("固定时刻需要位于允许执行的时段内");
     }
   }
+  const tag = String(config.cleanup_stalled_tag || "").trim();
+  if (!tag || /[,，]/.test(tag)) errors.push("请填写一个完整的辅种标签，不能包含逗号");
   const rules = String(config.site_conf || "").trim();
   if (rules) {
     try {
@@ -318,9 +324,11 @@ function submit() {
     "timeout",
     "mteam_warning_days",
     "userdata_stale_days",
+    "cleanup_stalled_days",
     "error_retention_days",
   ])
     body[key] = Number(body[key]);
+  body.cleanup_stalled_tag = String(body.cleanup_stalled_tag || "").trim();
   emit("save", body);
 }
 
@@ -347,7 +355,7 @@ return (_ctx, _cache) => {
     class: _normalizeClass(["stb-settings", { 'stb-is-light': isLight.value }])
   }, [
     _createElementVNode("header", _hoisted_1, [
-      _cache[26] || (_cache[26] = _createElementVNode("div", null, [
+      _cache[29] || (_cache[29] = _createElementVNode("div", null, [
         _createElementVNode("h2", null, "统一监控与设置"),
         _createElementVNode("p", null, "一次配置，所有检测模块共用。")
       ], -1)),
@@ -366,19 +374,19 @@ return (_ctx, _cache) => {
     }, {
       default: _withCtx(() => [
         _createVNode(_component_v_tab, { value: "monitor" }, {
-          default: _withCtx(() => [...(_cache[27] || (_cache[27] = [
+          default: _withCtx(() => [...(_cache[30] || (_cache[30] = [
             _createTextVNode("监控计划", -1)
           ]))]),
           _: 1
         }),
         _createVNode(_component_v_tab, { value: "scope" }, {
-          default: _withCtx(() => [...(_cache[28] || (_cache[28] = [
+          default: _withCtx(() => [...(_cache[31] || (_cache[31] = [
             _createTextVNode("范围与策略", -1)
           ]))]),
           _: 1
         }),
         _createVNode(_component_v_tab, { value: "advanced" }, {
-          default: _withCtx(() => [...(_cache[29] || (_cache[29] = [
+          default: _withCtx(() => [...(_cache[32] || (_cache[32] = [
             _createTextVNode("高级适配", -1)
           ]))]),
           _: 1
@@ -415,7 +423,7 @@ return (_ctx, _cache) => {
                 density: "compact",
                 class: "mb-5"
               }, {
-                default: _withCtx(() => [...(_cache[30] || (_cache[30] = [
+                default: _withCtx(() => [...(_cache[33] || (_cache[33] = [
                   _createTextVNode("检测正在运行，可以先编辑，完成后再保存设置。", -1)
                 ]))]),
                 _: 1
@@ -423,7 +431,7 @@ return (_ctx, _cache) => {
             : _createCommentVNode("", true),
           _withDirectives(_createElementVNode("div", null, [
             _createElementVNode("div", _hoisted_3, [
-              _cache[31] || (_cache[31] = _createElementVNode("div", null, [
+              _cache[34] || (_cache[34] = _createElementVNode("div", null, [
                 _createElementVNode("h3", null, "统一监控计划"),
                 _createElementVNode("p", null, "按服务器时间执行；手动检测不受时段限制。")
               ], -1)),
@@ -456,8 +464,8 @@ return (_ctx, _cache) => {
                 density: "comfortable"
               }, null, 8, ["modelValue"])
             ]),
-            _cache[36] || (_cache[36] = _createElementVNode("p", { class: "stb-field-note" }, " 支持跨午夜，例如 22:00–06:00；开始与结束相同表示全天。 ", -1)),
-            _cache[37] || (_cache[37] = _createElementVNode("h3", { class: "mt-5 mb-3" }, "执行方式", -1)),
+            _cache[39] || (_cache[39] = _createElementVNode("p", { class: "stb-field-note" }, " 支持跨午夜，例如 22:00–06:00；开始与结束相同表示全天。 ", -1)),
+            _cache[40] || (_cache[40] = _createElementVNode("h3", { class: "mt-5 mb-3" }, "执行方式", -1)),
             _createVNode(_component_v_btn_toggle, {
               modelValue: draft.monitor_mode,
               "onUpdate:modelValue": _cache[4] || (_cache[4] = $event => ((draft.monitor_mode) = $event)),
@@ -472,7 +480,7 @@ return (_ctx, _cache) => {
                   value: "interval",
                   "prepend-icon": "mdi-timer-outline"
                 }, {
-                  default: _withCtx(() => [...(_cache[32] || (_cache[32] = [
+                  default: _withCtx(() => [...(_cache[35] || (_cache[35] = [
                     _createTextVNode("周期执行", -1)
                   ]))]),
                   _: 1
@@ -481,7 +489,7 @@ return (_ctx, _cache) => {
                   value: "fixed",
                   "prepend-icon": "mdi-clock-outline"
                 }, {
-                  default: _withCtx(() => [...(_cache[33] || (_cache[33] = [
+                  default: _withCtx(() => [...(_cache[36] || (_cache[36] = [
                     _createTextVNode("固定时刻", -1)
                   ]))]),
                   _: 1
@@ -520,8 +528,8 @@ return (_ctx, _cache) => {
                   hint: "多个时刻用逗号分隔，需位于允许执行的时段内",
                   "persistent-hint": ""
                 }, null, 8, ["modelValue"])),
-            _cache[38] || (_cache[38] = _createElementVNode("h3", { class: "mt-6 mb-1" }, "检测模块", -1)),
-            _cache[39] || (_cache[39] = _createElementVNode("p", { class: "stb-field-note" }, " 以下模块共用同一套执行计划和异常确认规则。 ", -1)),
+            _cache[41] || (_cache[41] = _createElementVNode("h3", { class: "mt-6 mb-1" }, "检测模块", -1)),
+            _cache[42] || (_cache[42] = _createElementVNode("p", { class: "stb-field-note" }, " 以下模块共用同一套执行计划和异常确认规则。 ", -1)),
             _createElementVNode("div", _hoisted_5, [
               (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(_unref(MODULES), (label, key) => {
                 return (_openBlock(), _createBlock(_component_v_checkbox, {
@@ -537,7 +545,7 @@ return (_ctx, _cache) => {
               }), 128))
             ]),
             _createElementVNode("div", _hoisted_6, [
-              _cache[34] || (_cache[34] = _createElementVNode("div", null, [
+              _cache[37] || (_cache[37] = _createElementVNode("div", null, [
                 _createElementVNode("h3", null, "异常确认天数"),
                 _createElementVNode("p", null, "连续异常达到设定天数，才确认问题并提醒。")
               ], -1)),
@@ -560,7 +568,7 @@ return (_ctx, _cache) => {
               density: "compact",
               class: "mt-4"
             }, {
-              default: _withCtx(() => [...(_cache[35] || (_cache[35] = [
+              default: _withCtx(() => [...(_cache[38] || (_cache[38] = [
                 _createTextVNode("同一天重复异常只计一天；任何一次成功都会清零，漏测一天重新累计。记录会在重启后保留。", -1)
               ]))]),
               _: 1
@@ -569,8 +577,8 @@ return (_ctx, _cache) => {
             [_vShow, tab.value === 'monitor']
           ]),
           _withDirectives(_createElementVNode("div", null, [
-            _cache[41] || (_cache[41] = _createElementVNode("h3", { class: "mb-2" }, "站点范围", -1)),
-            _cache[42] || (_cache[42] = _createElementVNode("p", { class: "stb-field-note mb-4" }, " 不指定站点时，检测所有已启用站点。登录检查只对 M-Team 站点运行。 ", -1)),
+            _cache[44] || (_cache[44] = _createElementVNode("h3", { class: "mb-2" }, "站点范围", -1)),
+            _cache[45] || (_cache[45] = _createElementVNode("p", { class: "stb-field-note mb-4" }, " 不指定站点时，检测所有已启用站点。登录检查只对 M-Team 站点运行。 ", -1)),
             _createVNode(_component_v_autocomplete, {
               modelValue: draft.site_ids,
               "onUpdate:modelValue": _cache[9] || (_cache[9] = $event => ((draft.site_ids) = $event)),
@@ -613,7 +621,7 @@ return (_ctx, _cache) => {
               "hide-details": ""
             }, null, 8, ["modelValue"]),
             _createVNode(_component_v_divider, { class: "my-6" }),
-            _cache[43] || (_cache[43] = _createElementVNode("h3", { class: "mb-2" }, "缺失种子", -1)),
+            _cache[46] || (_cache[46] = _createElementVNode("h3", { class: "mb-2" }, "种子维护", -1)),
             _createVNode(_component_v_select, {
               modelValue: draft.cleanup_downloader_names,
               "onUpdate:modelValue": _cache[13] || (_cache[13] = $event => ((draft.cleanup_downloader_names) = $event)),
@@ -638,7 +646,7 @@ return (_ctx, _cache) => {
               color: "primary",
               "hide-details": ""
             }, null, 8, ["modelValue"]),
-            _cache[44] || (_cache[44] = _createElementVNode("p", { class: "stb-field-note" }, " 只处理达到全局异常天数阈值的种子，删除前再次核对 missingFiles 状态。 ", -1)),
+            _cache[47] || (_cache[47] = _createElementVNode("p", { class: "stb-field-note" }, " 只处理达到全局异常天数阈值的种子，删除前再次核对 missingFiles 状态。 ", -1)),
             _createVNode(_component_v_switch, {
               modelValue: draft.cleanup_delete_files,
               "onUpdate:modelValue": _cache[15] || (_cache[15] = $event => ((draft.cleanup_delete_files) = $event)),
@@ -654,18 +662,48 @@ return (_ctx, _cache) => {
                   density: "compact",
                   class: "mt-3"
                 }, {
-                  default: _withCtx(() => [...(_cache[40] || (_cache[40] = [
+                  default: _withCtx(() => [...(_cache[43] || (_cache[43] = [
                     _createTextVNode("已开启删除数据文件。手动清理前会再次说明影响范围。", -1)
                   ]))]),
                   _: 1
                 }))
               : _createCommentVNode("", true),
             _createVNode(_component_v_divider, { class: "my-6" }),
-            _cache[45] || (_cache[45] = _createElementVNode("h3", { class: "mb-2" }, "检测条件", -1)),
-            _cache[46] || (_cache[46] = _createElementVNode("p", { class: "stb-field-note mb-4" }, " 这些条件决定单次检测是否异常；连续几天才确认，统一使用“异常确认天数”。 ", -1)),
+            _cache[48] || (_cache[48] = _createElementVNode("h3", { class: "mb-2" }, "长期未启动辅种", -1)),
+            _cache[49] || (_cache[49] = _createElementVNode("p", { class: "stb-field-note mb-4" }, "仅检查带指定完整标签的暂停任务。分类相同但没有该标签的任务不会纳入。", -1)),
+            _createVNode(_component_v_text_field, {
+              modelValue: draft.cleanup_stalled_tag,
+              "onUpdate:modelValue": _cache[16] || (_cache[16] = $event => ((draft.cleanup_stalled_tag) = $event)),
+              label: "必需的辅种标签",
+              variant: "outlined",
+              hint: "默认 keep_iyuu；只匹配标签完整项",
+              "persistent-hint": ""
+            }, null, 8, ["modelValue"]),
+            _createVNode(_component_v_text_field, {
+              modelValue: draft.cleanup_stalled_days,
+              "onUpdate:modelValue": _cache[17] || (_cache[17] = $event => ((draft.cleanup_stalled_days) = $event)),
+              label: "辅种最少添加天数",
+              type: "number",
+              min: "1",
+              max: "365",
+              suffix: "天",
+              variant: "outlined",
+              class: "mt-4"
+            }, null, 8, ["modelValue"]),
+            _createVNode(_component_v_switch, {
+              modelValue: draft.cleanup_stalled_auto,
+              "onUpdate:modelValue": _cache[18] || (_cache[18] = $event => ((draft.cleanup_stalled_auto) = $event)),
+              label: "自动清理已确认的长期未启动辅种",
+              color: "primary",
+              "hide-details": ""
+            }, null, 8, ["modelValue"]),
+            _cache[50] || (_cache[50] = _createElementVNode("p", { class: "stb-field-note" }, "默认关闭。达到全局连续异常确认天数后，复查仍未启动且同路径无正常任务才可清理；始终只删除任务记录，保留数据文件。", -1)),
+            _createVNode(_component_v_divider, { class: "my-6" }),
+            _cache[51] || (_cache[51] = _createElementVNode("h3", { class: "mb-2" }, "检测条件", -1)),
+            _cache[52] || (_cache[52] = _createElementVNode("p", { class: "stb-field-note mb-4" }, " 这些条件决定单次检测是否异常；连续几天才确认，统一使用“异常确认天数”。 ", -1)),
             _createVNode(_component_v_autocomplete, {
               modelValue: draft.mteam_site_ids,
-              "onUpdate:modelValue": _cache[16] || (_cache[16] = $event => ((draft.mteam_site_ids) = $event)),
+              "onUpdate:modelValue": _cache[19] || (_cache[19] = $event => ((draft.mteam_site_ids) = $event)),
               items: (__props.options.sites || []).filter((site) => site.mteam),
               multiple: "",
               clearable: "",
@@ -686,7 +724,7 @@ return (_ctx, _cache) => {
             _createElementVNode("div", _hoisted_10, [
               _createVNode(_component_v_text_field, {
                 modelValue: draft.userdata_stale_days,
-                "onUpdate:modelValue": _cache[17] || (_cache[17] = $event => ((draft.userdata_stale_days) = $event)),
+                "onUpdate:modelValue": _cache[20] || (_cache[20] = $event => ((draft.userdata_stale_days) = $event)),
                 type: "number",
                 min: "1",
                 max: "365",
@@ -696,7 +734,7 @@ return (_ctx, _cache) => {
               }, null, 8, ["modelValue"]),
               _createVNode(_component_v_text_field, {
                 modelValue: draft.mteam_warning_days,
-                "onUpdate:modelValue": _cache[18] || (_cache[18] = $event => ((draft.mteam_warning_days) = $event)),
+                "onUpdate:modelValue": _cache[21] || (_cache[21] = $event => ((draft.mteam_warning_days) = $event)),
                 type: "number",
                 min: "1",
                 max: "365",
@@ -711,21 +749,21 @@ return (_ctx, _cache) => {
           _withDirectives(_createElementVNode("div", null, [
             _createVNode(_component_v_switch, {
               modelValue: draft.enabled,
-              "onUpdate:modelValue": _cache[19] || (_cache[19] = $event => ((draft.enabled) = $event)),
+              "onUpdate:modelValue": _cache[22] || (_cache[22] = $event => ((draft.enabled) = $event)),
               color: "primary",
               label: "启用站点工具箱",
               "hide-details": ""
             }, null, 8, ["modelValue"]),
             _createVNode(_component_v_switch, {
               modelValue: draft.patch_userdata,
-              "onUpdate:modelValue": _cache[20] || (_cache[20] = $event => ((draft.patch_userdata) = $event)),
+              "onUpdate:modelValue": _cache[23] || (_cache[23] = $event => ((draft.patch_userdata) = $event)),
               color: "primary",
               label: "启用用户数据解析规则",
               "hide-details": ""
             }, null, 8, ["modelValue"]),
             _createVNode(_component_v_select, {
               modelValue: draft.error_retention_days,
-              "onUpdate:modelValue": _cache[21] || (_cache[21] = $event => ((draft.error_retention_days) = $event)),
+              "onUpdate:modelValue": _cache[24] || (_cache[24] = $event => ((draft.error_retention_days) = $event)),
               items: [
               { title: '1 天', value: 1 },
               { title: '3 天', value: 3 },
@@ -736,11 +774,11 @@ return (_ctx, _cache) => {
               variant: "outlined",
               class: "mt-5"
             }, null, 8, ["modelValue"]),
-            _cache[47] || (_cache[47] = _createElementVNode("h3", { class: "mb-2" }, "站点适配规则", -1)),
-            _cache[48] || (_cache[48] = _createElementVNode("p", { class: "stb-field-note mb-4" }, " 兼容 JSON、JSON 数组和 domain|base64(JSON)。请勿将账号、Cookie 或密钥写入规则。 ", -1)),
+            _cache[53] || (_cache[53] = _createElementVNode("h3", { class: "mb-2" }, "站点适配规则", -1)),
+            _cache[54] || (_cache[54] = _createElementVNode("p", { class: "stb-field-note mb-4" }, " 兼容 JSON、JSON 数组和 domain|base64(JSON)。请勿将账号、Cookie 或密钥写入规则。 ", -1)),
             _createVNode(_component_v_textarea, {
               modelValue: draft.site_conf,
-              "onUpdate:modelValue": _cache[22] || (_cache[22] = $event => ((draft.site_conf) = $event)),
+              "onUpdate:modelValue": _cache[25] || (_cache[25] = $event => ((draft.site_conf) = $event)),
               label: "规则内容",
               "aria-label": "规则内容",
               variant: "outlined",
@@ -759,7 +797,7 @@ return (_ctx, _cache) => {
             variant: "text",
             onClick: close
           }, {
-            default: _withCtx(() => [...(_cache[49] || (_cache[49] = [
+            default: _withCtx(() => [...(_cache[55] || (_cache[55] = [
               _createTextVNode("取消", -1)
             ]))]),
             _: 1
@@ -772,7 +810,7 @@ return (_ctx, _cache) => {
             loading: __props.saving,
             disabled: __props.busy || __props.saving
           }, {
-            default: _withCtx(() => [...(_cache[50] || (_cache[50] = [
+            default: _withCtx(() => [...(_cache[56] || (_cache[56] = [
               _createTextVNode("保存设置", -1)
             ]))]),
             _: 1
@@ -783,7 +821,7 @@ return (_ctx, _cache) => {
     }),
     _createVNode(_component_v_dialog, {
       modelValue: discard.value,
-      "onUpdate:modelValue": _cache[25] || (_cache[25] = $event => ((discard).value = $event)),
+      "onUpdate:modelValue": _cache[28] || (_cache[28] = $event => ((discard).value = $event)),
       "max-width": "420"
     }, {
       default: _withCtx(() => [
@@ -796,21 +834,21 @@ return (_ctx, _cache) => {
               default: _withCtx(() => [
                 _createVNode(_component_v_spacer),
                 _createVNode(_component_v_btn, {
-                  onClick: _cache[23] || (_cache[23] = $event => (discard.value = false))
+                  onClick: _cache[26] || (_cache[26] = $event => (discard.value = false))
                 }, {
-                  default: _withCtx(() => [...(_cache[51] || (_cache[51] = [
+                  default: _withCtx(() => [...(_cache[57] || (_cache[57] = [
                     _createTextVNode("继续编辑", -1)
                   ]))]),
                   _: 1
                 }),
                 _createVNode(_component_v_btn, {
                   color: "primary",
-                  onClick: _cache[24] || (_cache[24] = $event => {
+                  onClick: _cache[27] || (_cache[27] = $event => {
               discard.value = false;
               emit('close');
             })
                 }, {
-                  default: _withCtx(() => [...(_cache[52] || (_cache[52] = [
+                  default: _withCtx(() => [...(_cache[58] || (_cache[58] = [
                     _createTextVNode("放弃修改", -1)
                   ]))]),
                   _: 1

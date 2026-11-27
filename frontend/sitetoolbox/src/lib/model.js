@@ -1,7 +1,7 @@
 export const MODULES = {
   rss: "RSS 检测",
   userdata: "用户数据",
-  missing: "缺失种子扫描",
+  missing: "缺失种子与未启动辅种",
   mteam: "馒头登录检查",
 };
 export const STATES = {
@@ -39,6 +39,9 @@ export const DEFAULTS = {
   cleanup_downloader_names: [],
   cleanup_delete_files: false,
   cleanup_auto_cleanup: false,
+  cleanup_stalled_tag: "keep_iyuu",
+  cleanup_stalled_days: 7,
+  cleanup_stalled_auto: false,
   error_retention_days: 3,
   mteam_site_ids: [],
   mteam_warning_days: 25,
@@ -118,6 +121,7 @@ export function validateSettings(config) {
     ["timeout", "请求超时", 5, 120],
     ["mteam_warning_days", "登录记录最长间隔", 1, 365],
     ["userdata_stale_days", "数据过期天数", 1, 365],
+    ["cleanup_stalled_days", "辅种最少添加天数", 1, 365],
   ]) {
     const n = Number(config[key]);
     if (!Number.isInteger(n) || n < min || n > max)
@@ -145,6 +149,8 @@ export function validateSettings(config) {
         errors.push("固定时刻需要位于允许执行的时段内");
     }
   }
+  const tag = String(config.cleanup_stalled_tag || "").trim();
+  if (!tag || /[,，]/.test(tag)) errors.push("请填写一个完整的辅种标签，不能包含逗号");
   const rules = String(config.site_conf || "").trim();
   if (rules) {
     try {

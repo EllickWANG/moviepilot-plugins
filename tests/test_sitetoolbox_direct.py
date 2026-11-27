@@ -153,6 +153,44 @@ class MaintenanceDirectTest(unittest.TestCase):
                     pass
             client._http_session.close.assert_called_once()
 
+    def test_stalled_cleanup_rechecks_tag_and_forces_no_file_deletion(self):
+        from test_sitetoolbox_stalled import candidate
+        import time
+        added = time.time() - 9 * 86400
+        self.server.rows = [candidate(added_on=added, last_activity=added),
+                            candidate(hash="tag-removed", tags="PT", added_on=added, last_activity=added)]
+        items = [{"downloader": "qb", "hash": h} for h in ("candidate", "tag-removed")]
+        with patch.object(PLUGIN, "_stalled_policy", return_value={"required_tag": "keep_iyuu", "age_days": 7}):
+            result = PLUGIN._cleanup_missing_torrents_from_preview(items, delete_files=True, kind="stalled")
+        self.assertEqual((result["deleted_count"], result["skipped_count"]), (1, 1))
+        self.assertEqual(self.server.deletions, [{"hashes": ["candidate"], "deleteFiles": ["False"]}])
+        self.assertFalse(result["delete_files"])
+
+    def test_scan_keeps_missing_and_stalled_candidates_separate(self):
+        from test_sitetoolbox_stalled import candidate
+        import time
+        added = time.time() - 9 * 86400
+        self.server.rows.append(candidate(added_on=added, last_activity=added))
+        with patch.object(PLUGIN, "_stalled_policy", return_value={"required_tag": "keep_iyuu", "age_days": 7}):
+            preview = PLUGIN._build_missing_torrent_preview(["qb"])
+        self.assertEqual(preview["total_count"], 1)
+        self.assertEqual(preview["stalled_count"], 1)
+        self.assertEqual(preview["items"][0]["hash"], "missing")
+        self.assertEqual(preview["stalled_items"][0]["hash"], "candidate")
+        self.assertEqual(preview["errors"], [])
+
+    def test_stalled_cleanup_queries_all_tasks_to_protect_new_same_path_peer(self):
+        from test_sitetoolbox_stalled import candidate
+        import time
+        added = time.time() - 9 * 86400
+        self.server.rows = [candidate(added_on=added, last_activity=added),
+                            candidate(hash="new-original", state="stalledUP", progress=1)]
+        with patch.object(Wrapper, "get_torrents", autospec=True, side_effect=lambda server, ids=None: (self.server.rows, False)) as query:
+            result = PLUGIN._cleanup_missing_torrents_from_preview([{"downloader": "qb", "hash": "candidate"}], kind="stalled")
+        self.assertIsNone(query.call_args.kwargs["ids"])
+        self.assertEqual((result["deleted_count"], result["skipped_count"]), (0, 1))
+        self.assertEqual(self.server.deletions, [])
+
 
 if __name__ == "__main__":
     unittest.main()

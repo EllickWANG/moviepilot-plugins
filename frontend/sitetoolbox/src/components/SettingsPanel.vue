@@ -75,9 +75,11 @@ function submit() {
     "timeout",
     "mteam_warning_days",
     "userdata_stale_days",
+    "cleanup_stalled_days",
     "error_retention_days",
   ])
     body[key] = Number(body[key]);
+  body.cleanup_stalled_tag = String(body.cleanup_stalled_tag || "").trim();
   emit("save", body);
 }
 </script>
@@ -271,7 +273,7 @@ function submit() {
             hide-details
           />
           <v-divider class="my-6" />
-          <h3 class="mb-2">缺失种子</h3>
+          <h3 class="mb-2">种子维护</h3>
           <v-select
             v-model="draft.cleanup_downloader_names"
             :items="options.downloaders || []"
@@ -309,6 +311,13 @@ function submit() {
             class="mt-3"
             >已开启删除数据文件。手动清理前会再次说明影响范围。</v-alert
           >
+          <v-divider class="my-6" />
+          <h3 class="mb-2">长期未启动辅种</h3>
+          <p class="stb-field-note mb-4">仅检查带指定完整标签的暂停任务。分类相同但没有该标签的任务不会纳入。</p>
+          <v-text-field v-model="draft.cleanup_stalled_tag" label="必需的辅种标签" variant="outlined" hint="默认 keep_iyuu；只匹配标签完整项" persistent-hint />
+          <v-text-field v-model="draft.cleanup_stalled_days" label="辅种最少添加天数" type="number" min="1" max="365" suffix="天" variant="outlined" class="mt-4" />
+          <v-switch v-model="draft.cleanup_stalled_auto" label="自动清理已确认的长期未启动辅种" color="primary" hide-details />
+          <p class="stb-field-note">默认关闭。达到全局连续异常确认天数后，复查仍未启动且同路径无正常任务才可清理；始终只删除任务记录，保留数据文件。</p>
           <v-divider class="my-6" />
           <h3 class="mb-2">检测条件</h3>
           <p class="stb-field-note mb-4">

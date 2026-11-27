@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 
-MODULES = {"rss": "RSS 检测", "userdata": "用户数据", "missing": "缺失种子扫描", "mteam": "馒头登录检查"}
+MODULES = {"rss": "RSS 检测", "userdata": "用户数据", "missing": "缺失种子与未启动辅种", "mteam": "馒头登录检查"}
 BAD_STATES = {"error", "warning", "offline"}
 
 

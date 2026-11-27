@@ -1,5 +1,5 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { c as createClient, _ as _sfc_main$1 } from './styles-B4AzQwru.js';
+import { c as createClient, _ as _sfc_main$1 } from './styles-BkOea-aU.js';
 
 const {toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,resolveComponent:_resolveComponent,withCtx:_withCtx,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,createVNode:_createVNode,createElementBlock:_createElementBlock} = await importShared('vue');
 

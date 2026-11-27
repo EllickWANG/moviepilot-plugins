@@ -153,7 +153,11 @@ const visibleSites = computed(() =>
   ),
 );
 const missing = computed(() => overview.value?.maintenance?.missing || {});
-const missingItems = computed(() => missing.value.items || []);
+const stalledView = computed(() => maintenanceTab.value === "stalled");
+const torrentTitle = computed(() => stalledView.value ? "长期未启动辅种" : "缺失文件种子");
+const missingItems = computed(() => (stalledView.value ? missing.value.stalled_items : missing.value.items) || []);
+const confirmedCount = computed(() => (stalledView.value ? missing.value.stalled_confirmed_count : missing.value.confirmed_count) || 0);
+const latestCleanup = computed(() => (stalledView.value ? overview.value?.maintenance?.stalled_cleanup : overview.value?.maintenance?.cleanup) || {});
 const runs = computed(() => overview.value?.runs || []);
 watch([query, filter, pageSize], () => {
   page.value = 1;
@@ -330,6 +334,12 @@ function repair(site = null) {
   );
 }
 function cleanup() {
+  if (stalledView.value) {
+    confirm("清理已确认的长期未启动辅种？",
+      `将处理 ${confirmedCount.value} 个已达到连续异常确认天数的任务。文件是否存在尚未确认，因此只删除任务记录、保留所有数据文件；删除前再次核对标签、活动记录和同路径任务。`,
+      () => perform("/cleanup/stalled"), true);
+    return;
+  }
   const count = missing.value.confirmed_count || 0;
   const deleteFiles = Boolean(overview.value?.maintenance?.delete_files);
   confirm(
@@ -753,6 +763,7 @@ onBeforeUnmount(() => {
             <button
               v-for="item in [
                 { key: 'missing', label: '缺失种子' },
+                { key: 'stalled', label: '未启动辅种' },
                 { key: 'rss', label: 'RSS 与登录' },
                 { key: 'rules', label: '适配规则' },
               ]"
@@ -763,13 +774,13 @@ onBeforeUnmount(() => {
               {{ item.label }}
             </button>
           </div>
-          <div v-if="maintenanceTab === 'missing'">
+          <div v-if="['missing', 'stalled'].includes(maintenanceTab)">
             <div class="stb-section-heading">
               <div>
-                <h3>缺失文件种子</h3>
+                <h3>{{ torrentTitle }}</h3>
                 <p>
-                  发现 {{ missing.total_count || 0 }} 个，已确认
-                  {{ missing.confirmed_count || 0 }} 个 · 最近扫描
+                  发现 {{ missingItems.length }} 个，已确认
+                  {{ confirmedCount }} 个 · 最近扫描
                   {{ shortTime(missing.created_at) }}
                 </p>
               </div>
@@ -784,24 +795,31 @@ onBeforeUnmount(() => {
                   color="error"
                   variant="tonal"
                   prepend-icon="mdi-delete-outline"
-                  :disabled="busy || !missing.confirmed_count"
+                  :disabled="busy || !confirmedCount"
                   @click="cleanup"
                   >清理已确认项</v-btn
                 >
               </div>
             </div>
             <v-alert
-              :type="overview.maintenance.delete_files ? 'warning' : 'info'"
+              :type="!stalledView && overview.maintenance.delete_files ? 'warning' : 'info'"
               variant="tonal"
               density="compact"
               class="my-4"
               >{{
-                overview.maintenance.delete_files
+                stalledView
+                  ? "这类任务尚未确认文件是否缺失。清理仅删除任务记录，始终保留数据文件。"
+                  : overview.maintenance.delete_files
                   ? "当前设置会同时删除数据文件。清理前需要再次确认。"
                   : "当前清理仅删除下载器任务，保留数据文件。"
               }}
               只有连续异常达到 {{ threshold }} 天的种子才可清理。</v-alert
             >
+            <p v-if="stalledView" class="stb-field-note mb-4">
+              必须含标签「{{ overview.maintenance.stalled_tag || '未设置' }}」，添加至少 {{ overview.maintenance.stalled_days || 7 }} 天，
+              暂停且进度、已完成数据量、下载量、上传量与做种时间均为 0，添加后从未活动；同路径有正常任务时跳过。
+              自动清理：{{ overview.maintenance.stalled_auto ? '已开启（达到确认天数后仅删除任务）' : '关闭，可手动清理已确认项' }}。
+            </p>
             <v-alert
               v-for="item in missing.errors || []"
               :key="item.downloader"
@@ -831,8 +849,8 @@ onBeforeUnmount(() => {
                   missing.errors?.length
                     ? "部分下载器扫描失败"
                     : missing.created_at
-                      ? "最近扫描未发现缺失文件种子"
-                      : "尚未扫描缺失文件种子"
+                      ? `最近扫描未发现${torrentTitle}`
+                      : `尚未扫描${torrentTitle}`
                 }}
               </h3>
               <p>
@@ -849,6 +867,7 @@ onBeforeUnmount(() => {
                   <tr>
                     <th>种子 / 下载器</th>
                     <th>大小</th>
+                    <th v-if="stalledView">已添加</th>
                     <th>确认状态</th>
                     <th>保存路径</th>
                   </tr>
@@ -865,6 +884,7 @@ onBeforeUnmount(() => {
                       }}</small>
                     </td>
                     <td>{{ sizeText(item.size) }}</td>
+                    <td v-if="stalledView">{{ item.age_days }} 天<small class="stb-block stb-muted">{{ shortTime(item.added_on) }}</small></td>
                     <td>
                       <StateBadge :state="item.monitor?.state" /><small
                         class="stb-block stb-muted"
@@ -878,14 +898,14 @@ onBeforeUnmount(() => {
               </table>
             </div>
             <div
-              v-if="overview.maintenance.cleanup.cleaned_at"
+              v-if="latestCleanup.cleaned_at"
               class="stb-inline-note mt-4"
             >
               <v-icon icon="mdi-history" size="19" />最近清理
-              {{ shortTime(overview.maintenance.cleanup.cleaned_at) }}：删除
-              {{ overview.maintenance.cleanup.deleted_count || 0 }}，跳过
-              {{ overview.maintenance.cleanup.skipped_count || 0 }}，失败
-              {{ overview.maintenance.cleanup.failed_count || 0 }}。
+              {{ shortTime(latestCleanup.cleaned_at) }}：删除
+              {{ latestCleanup.deleted_count || 0 }}，跳过
+              {{ latestCleanup.skipped_count || 0 }}，失败
+              {{ latestCleanup.failed_count || 0 }}。
             </div>
           </div>
           <div v-else-if="maintenanceTab === 'rss'" class="stb-tool-list">
@@ -1150,7 +1170,7 @@ onBeforeUnmount(() => {
         </section>
       </template>
       <footer class="stb-version">
-        站点工具箱 v{{ overview?.plugin_version || "1.4.2"
+        站点工具箱 v{{ overview?.plugin_version || "1.5.0"
         }}<span>所有检测模块共用统一监控计划</span>
       </footer>
     </main>

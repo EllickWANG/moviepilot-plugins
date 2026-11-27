@@ -10,6 +10,17 @@ import {
 import { createClient } from "../src/lib/client.js";
 
 const config = (changes) => ({ ...structuredClone(DEFAULTS), ...changes });
+test("stalled cross-seed settings require one exact tag and bounded age", () => {
+  assert.equal(DEFAULTS.cleanup_stalled_tag, "keep_iyuu");
+  assert.equal(DEFAULTS.cleanup_stalled_auto, false);
+  for (const tag of ["", " ", "keep_iyuu,PT", "keep_iyuu，PT"]) {
+    assert.match(validateSettings(config({ cleanup_stalled_tag: tag })).join(), /辅种标签/);
+  }
+  assert.deepEqual(validateSettings(config({ cleanup_stalled_tag: "自定义辅种", cleanup_stalled_days: 14 })), []);
+  for (const days of [0, 366, 1.5]) {
+    assert.match(validateSettings(config({ cleanup_stalled_days: days })).join(), /最少添加天数/);
+  }
+});
 test("cross-midnight fixed times are accepted only inside the window", () => {
   assert.deepEqual(
     validateSettings(
