@@ -27,6 +27,7 @@ from app.schemas import NotificationType, TorrentInfo, ServiceInfo
 from app.schemas.types import EventType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
+from .diagnostics import diagnose_connection, error_summary, normalize_add_result
 
 lock = threading.Lock()
 
@@ -40,6 +41,7 @@ class BrushConfig:
         self.enabled = config.get("enabled", False)
         self.notify = config.get("notify", True)
         self.onlyonce = config.get("onlyonce", False)
+        self.diagnostic_once = config.get("diagnostic_once", False)
         self.brushsites = config.get("brushsites", [])
         self.downloader = config.get("downloader")
         self.disksize = self.__parse_number(config.get("disksize"))
@@ -264,7 +266,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.7"
+    plugin_version = "4.3.8"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -290,6 +292,8 @@ class FlowBrush(_PluginBase):
     _scheduler = None
     # tabs
     _tabs = None
+    _diagnostic_lock = threading.Lock()
+    _last_diagnostic = 0.0
 
     # endregion
 
@@ -336,6 +340,12 @@ class FlowBrush(_PluginBase):
 
         # 停止现有任务
         self.stop_service()
+
+        # 独立于刷流和删种任务，下载器离线或插件未启用时也可从 Web 发起诊断。
+        if brush_config.diagnostic_once:
+            brush_config.diagnostic_once = False
+            self.__update_config()
+            self.__start_downloader_diagnostic(brush_config.downloader)
 
         # 如果站点都没有配置，则不开启定时刷流服务
         if not brush_config.brushsites:
@@ -416,6 +426,36 @@ class FlowBrush(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         pass
+
+    def __start_downloader_diagnostic(self, name):
+        if not self._diagnostic_lock.acquire(blocking=False):
+            logger.info("[刷流诊断] 已有诊断运行中，请查看本次诊断结果")
+            return
+        if self._last_diagnostic and time.monotonic() - self._last_diagnostic < 60:
+            self._diagnostic_lock.release()
+            logger.info("[刷流诊断] 距上次诊断不足 60 秒，请稍后重试")
+            return
+        self._last_diagnostic = time.monotonic()
+
+        def run():
+            try:
+                logger.info(f"[刷流诊断] 开始只读检查下载器：{name}")
+                service = DownloaderHelper().get_service(name=name) if name else None
+                if not service or not DownloaderHelper().is_downloader("qbittorrent", service=service):
+                    logger.warning("[刷流诊断] 未找到配置的 qBittorrent 下载器")
+                    return
+                conf = getattr(service, "config", None)
+                config = conf.get("config", {}) if isinstance(conf, dict) else getattr(conf, "config", {})
+                report = diagnose_connection(getattr(service.instance, "qbc", None), config or {})
+                logger.info(f"[刷流诊断] 结果：{json.dumps(report, ensure_ascii=False)}")
+                logger.info("[刷流诊断] 完成；HTTP 401/403 表示网络可达但未认证。"
+                            "本次使用新建无认证会话，不代表宿主已有会话或添加种子成功。")
+            except Exception as error:
+                logger.error(f"[刷流诊断] 检查失败：{error_summary(error)}")
+            finally:
+                self._diagnostic_lock.release()
+
+        threading.Thread(target=run, name="flowbrush-diagnostic", daemon=True).start()
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -873,6 +913,15 @@ class FlowBrush(_PluginBase):
                                 ]
                             }
                         ]
+                    },
+                    {
+                        'component': 'VSwitch',
+                        'props': {
+                            'model': 'diagnostic_once',
+                            'label': '仅诊断下载器一次',
+                            'hint': '保存后在插件日志查看“刷流诊断”；只检查连接，不添加或删除种子。原定时任务照常运行。',
+                            'persistent-hint': True,
+                        }
                     },
                     {
                         'component': 'VRow',
@@ -1861,6 +1910,7 @@ class FlowBrush(_PluginBase):
             "enabled": False,
             "notify": True,
             "onlyonce": False,
+            "diagnostic_once": False,
             "clear_task": False,
             "delete_except_tags": f"{settings.TORRENT_TAG},H&R" if settings.TORRENT_TAG else "H&R",
             "except_subscribe": True,
@@ -2139,7 +2189,9 @@ class FlowBrush(_PluginBase):
             if not pre_condition_passed:
                 return False
 
-            logger.debug(f"种子详情：{torrent}")
+            # TorrentInfo 的完整表示包含 Cookie、下载链接和 passkey，不能写入日志。
+            logger.debug(f"种子筛选：站点={torrent.site_name}，大小={torrent.size}，"
+                         f"做种人数={torrent.seeders}，下载倍率={torrent.downloadvolumefactor}")
 
             # 判断能否通过保种体积刷流条件
             size_condition_passed, reason = self.__evaluate_size_condition_for_brush(torrents_size=torrents_size,
@@ -2264,10 +2316,14 @@ class FlowBrush(_PluginBase):
         """
         前置过滤不符合条件的种子
         """
-        reasons = [
-            ("maxdlcount", lambda config: self.__get_downloading_count() >= int(config),
-             lambda config: f"当前同时下载任务数已达到最大值 {config}，暂时停止新增任务")
-        ]
+        brush_config = self.__get_brush_config()
+        if brush_config.maxdlcount:
+            count = self.__get_downloading_count()
+            if count is None:
+                return False, "读取下载任务数失败，无法确认剩余名额；暂停新增任务，可启用“仅诊断下载器一次”排查"
+            if count >= int(brush_config.maxdlcount):
+                return False, f"当前同时下载任务数 {count} 已达到最大值 {brush_config.maxdlcount}，暂时停止新增任务"
+        reasons = []
 
         if include_network_conditions:
             # 获取平均带宽
@@ -3199,6 +3255,7 @@ class FlowBrush(_PluginBase):
         # 创建一个将配置属性名称映射到BrushConfig属性值的字典
         config_mapping = {
             "onlyonce": brush_config.onlyonce,
+            "diagnostic_once": brush_config.diagnostic_once,
             "enabled": brush_config.enabled,
             "notify": brush_config.notify,
             "brushsites": brush_config.brushsites,
@@ -3333,7 +3390,7 @@ class FlowBrush(_PluginBase):
             new_url = str(urlunparse(parsed_url._replace(query=new_query)))
             return new_url
         except Exception as e:
-            logger.error(f"Error while resetting downloader URL for torrent: {torrent_url}. Error: {str(e)}")
+            logger.error(f"重写种子下载地址失败：{error_summary(e)}")
             return torrent_url
 
     def __download(self, torrent: TorrentInfo) -> Optional[str]:
@@ -3371,7 +3428,7 @@ class FlowBrush(_PluginBase):
 
         if brush_config.site_skip_tips:
             torrent_content = self.__reset_download_url(torrent_url=torrent_content, site_id=torrent.site)
-            logger.debug(f"站点 {torrent.site_name} 已启用自动跳过提示，种子下载地址更新为 {torrent_content}")
+            logger.debug(f"站点 {torrent.site_name} 已启用自动跳过提示，种子下载地址已更新")
 
         downloader = self.downloader
         if not downloader:
@@ -3386,28 +3443,59 @@ class FlowBrush(_PluginBase):
             tag = StringUtils.generate_random_str(10)
             # 如果开启代理下载以及种子地址不是磁力地址，则请求种子到内存再传入下载器
             if not torrent_content.startswith("magnet"):
+                started = time.monotonic()
                 response = RequestUtils(cookies=cookies,
                                         proxies=proxies,
                                         ua=torrent.site_ua).get_res(url=torrent_content)
+                logger.info(f"[刷流下载] 种子获取：站点={torrent.site_name}，站点代理={bool(proxies)}，"
+                            f"HTTP状态={getattr(response, 'status_code', None)}，"
+                            f"耗时={time.monotonic() - started:.2f}s")
                 if response and response.ok:
                     torrent_content = response.content
                 else:
                     logger.error("尝试通过MP下载种子失败，继续尝试传递种子地址到下载器进行下载")
             if torrent_content:
-                state = downloader.add_torrent(content=torrent_content,
-                                               download_dir=download_dir,
-                                               cookie=cookies,
-                                               category=brush_config.qb_category,
-                                               tag=["已整理", brush_config.brush_tag, tag],
-                                               upload_limit=up_speed,
-                                               download_limit=down_speed)
+                started = time.monotonic()
+                logger.info(f"[刷流下载] 开始提交：站点={torrent.site_name}，下载器={brush_config.downloader}，"
+                            f"内容类型={'种子文件' if isinstance(torrent_content, bytes) else '链接'}")
+                try:
+                    result = downloader.add_torrent(content=torrent_content,
+                                                    download_dir=download_dir,
+                                                    cookie=cookies,
+                                                    category=brush_config.qb_category,
+                                                    tag=["已整理", brush_config.brush_tag, tag],
+                                                    upload_limit=up_speed,
+                                                    download_limit=down_speed)
+                except Exception as error:
+                    logger.error(f"[刷流下载] 提交异常，耗时={time.monotonic() - started:.2f}s，"
+                                 f"错误={error_summary(error)}")
+                    return None
+                state, hashes = normalize_add_result(result)
+                logger.info(f"[刷流下载] 提交返回：成功={state}，返回类型={type(result).__name__}，"
+                            f"返回Hash数量={len(hashes)}，耗时={time.monotonic() - started:.2f}s")
                 if not state:
+                    logger.error("[刷流下载] 添加请求失败，不再查询 Hash；请检查前面的下载器错误，"
+                                 "或启用“仅诊断下载器一次”")
                     return None
                 else:
+                    if hashes:
+                        # 新版已返回 Hash，无需再依赖随机标签轮询。
+                        try:
+                            downloader.delete_torrents_tag(hashes[0], tag)
+                        except Exception as error:
+                            logger.warning(f"[刷流下载] 临时标签清理失败：{error_summary(error)}")
+                        return hashes[0]
                     # 获取种子Hash
-                    torrent_hash = downloader.get_torrent_id_by_tag(tags=tag)
+                    started = time.monotonic()
+                    try:
+                        torrent_hash = downloader.get_torrent_id_by_tag(tags=tag)
+                    except Exception as error:
+                        logger.error(f"[刷流下载] 查询 Hash 异常：{error_summary(error)}")
+                        return None
                     if not torrent_hash:
-                        logger.error(f"{brush_config.downloader} 获取种子Hash失败，详细信息请查看 README")
+                        logger.error(f"[刷流下载] 添加返回成功，但标签查询未找到 Hash，"
+                                     f"耗时={time.monotonic() - started:.2f}s；"
+                                     "任务可能已存在或查询连接失败，本次不自动重试添加")
                         return None
                     return torrent_hash
             return None
@@ -3816,7 +3904,7 @@ class FlowBrush(_PluginBase):
 
         return ret_info
 
-    def __get_downloading_count(self) -> int:
+    def __get_downloading_count(self) -> Optional[int]:
         """
         获取正在下载的任务数量
         """
@@ -3824,17 +3912,17 @@ class FlowBrush(_PluginBase):
             brush_config = self.__get_brush_config()
             downloader = self.downloader
             if not downloader:
-                return 0
+                return None
 
             torrents = downloader.get_downloading_torrents(tags=brush_config.brush_tag)
             if torrents is None:
                 logger.warning("获取下载数量失败，可能是下载器连接发生异常")
-                return 0
+                return None
 
             return len(torrents)
         except Exception as e:
-            logger.error(f"获取下载数量发生异常: {e}")
-            return 0
+            logger.error(f"获取下载数量发生异常: {error_summary(e)}")
+            return None
 
     @staticmethod
     def __get_pubminutes(pubdate: str) -> float:
