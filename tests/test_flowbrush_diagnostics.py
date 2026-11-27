@@ -14,10 +14,14 @@ PACKAGE = ROOT / "plugins.v2/flowbrush"
 spec = importlib.util.spec_from_file_location("flowbrush_test.diagnostics", PACKAGE / "diagnostics.py")
 DIAG = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(DIAG)
+spec = importlib.util.spec_from_file_location("flowbrush_test.direct_downloader", PACKAGE / "direct_downloader.py")
+DIRECT = importlib.util.module_from_spec(spec)
+with patch.dict(sys.modules, {"flowbrush_test.diagnostics": DIAG}):
+    spec.loader.exec_module(DIRECT)
 
 
 def load_plugin():
-    modules = {"flowbrush_test.diagnostics": DIAG}
+    modules = {"flowbrush_test.diagnostics": DIAG, "flowbrush_test.direct_downloader": DIRECT}
     dependencies = {
         "pytz": {},
         "apscheduler.schedulers.background": {"BackgroundScheduler": Mock()},
@@ -64,7 +68,10 @@ class DownloadTest(unittest.TestCase):
         self.plugin._brush_config = PLUGIN.BrushConfig({"downloader": "test", "maxdlcount": 5})
         self.downloader = Mock()
         self.downloader.is_inactive.return_value = False
-        self.service = types.SimpleNamespace(instance=self.downloader)
+        self.service = types.SimpleNamespace(instance=self.downloader, name="test", config={"config": {}})
+        direct = patch.object(PLUGIN, "direct_service", return_value=self.service)
+        direct.start()
+        self.addCleanup(direct.stop)
         PLUGIN.DownloaderHelper.return_value.get_service.return_value = self.service
         PLUGIN.DownloaderHelper.return_value.is_downloader.return_value = True
         self.torrent = types.SimpleNamespace(enclosure="magnet:?xt=urn:btih:example",
@@ -116,11 +123,32 @@ class DownloadTest(unittest.TestCase):
         self.plugin._diagnostic_lock = threading.Lock()
         self.plugin._last_diagnostic = 0
         with patch.object(PLUGIN, "diagnose_connection", return_value={"read_only": True}) as probe, \
+                patch.object(PLUGIN, "authenticated_probe", return_value={"success": True}), \
                 patch.object(PLUGIN.threading, "Thread") as thread:
             thread.return_value.start.side_effect = lambda: thread.call_args.kwargs["target"]()
             self.plugin._FlowBrush__start_downloader_diagnostic("test")
             self.plugin._FlowBrush__start_downloader_diagnostic("test")
         probe.assert_called_once()
+        self.downloader.add_torrent.assert_not_called()
+
+    def test_service_is_cached_and_rebuilt_when_credentials_change(self):
+        first = self.plugin.service_info
+        self.assertIs(first, self.plugin.service_info)
+        self.assertEqual(PLUGIN.direct_service.call_count, 1)
+        self.service.config["config"]["password"] = "new-password"
+        self.plugin.service_info
+        self.assertEqual(PLUGIN.direct_service.call_count, 2)
+
+    def test_bandwidth_query_uses_plugin_client_not_shared_chain(self):
+        self.plugin.chain = Mock()
+        self.downloader.transfer_info.return_value = {"dl_info_speed": 123, "up_info_speed": 456}
+        self.plugin._FlowBrush__get_downloader_info()
+        self.downloader.transfer_info.assert_called_once()
+        self.plugin.chain.run_module.assert_not_called()
+
+    def test_failed_direct_initialization_cannot_fall_back_to_shared_client(self):
+        PLUGIN.direct_service.side_effect = RuntimeError("failed")
+        self.assertIsNone(self.plugin.downloader)
         self.downloader.add_torrent.assert_not_called()
         self.downloader.delete_torrents.assert_not_called()
         self.downloader.reconnect.assert_not_called()

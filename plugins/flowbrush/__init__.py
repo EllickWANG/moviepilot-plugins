@@ -4,6 +4,7 @@ import random
 import re
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional, Union, Set
 from urllib.parse import urlparse, parse_qs, unquote, parse_qsl, urlencode, urlunparse
@@ -28,6 +29,7 @@ from app.schemas.types import EventType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 from .diagnostics import diagnose_connection, error_summary, normalize_add_result
+from .direct_downloader import direct_service, downloader_config, authenticated_probe
 
 lock = threading.Lock()
 
@@ -266,7 +268,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.8"
+    plugin_version = "4.3.9"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -294,6 +296,10 @@ class FlowBrush(_PluginBase):
     _tabs = None
     _diagnostic_lock = threading.Lock()
     _last_diagnostic = 0.0
+    _direct_service_lock = threading.RLock()
+    _direct_service_cache = None
+    _direct_service_source = None
+    _direct_service_config = None
 
     # endregion
 
@@ -403,6 +409,23 @@ class FlowBrush(_PluginBase):
             self.__log_and_notify_error("站点刷流任务出错，获取下载器实例失败，请检查配置")
             return None
 
+        if DownloaderHelper().is_downloader("qbittorrent", service=service):
+            try:
+                with self._direct_service_lock:
+                    config = downloader_config(service)
+                    source = (id(service.instance), id(getattr(service.instance, "qbc", None)))
+                    if (self._direct_service_cache is None or source != self._direct_service_source
+                            or config != self._direct_service_config):
+                        self._direct_service_cache = direct_service(service)
+                        self._direct_service_source = source
+                        self._direct_service_config = deepcopy(config)
+                        logger.info(f"[刷流连接] 下载器 {service.name} 使用插件独立直连会话，不继承系统代理")
+                    service = self._direct_service_cache
+            except Exception as error:
+                # 直连初始化失败不能悄悄回退到宿主的代理连接。
+                logger.error(f"[刷流连接] 初始化直连会话失败：{error_summary(error)}")
+                return None
+
         if service.instance.is_inactive():
             self.__log_and_notify_error("站点刷流任务出错，下载器未连接")
             return None
@@ -414,7 +437,8 @@ class FlowBrush(_PluginBase):
         """
         下载器实例
         """
-        return self.service_info.instance if self.service_info else None
+        service = self.service_info
+        return service.instance if service else None
 
     def get_state(self) -> bool:
         brush_config = self.__get_brush_config()
@@ -444,12 +468,21 @@ class FlowBrush(_PluginBase):
                 if not service or not DownloaderHelper().is_downloader("qbittorrent", service=service):
                     logger.warning("[刷流诊断] 未找到配置的 qBittorrent 下载器")
                     return
-                conf = getattr(service, "config", None)
-                config = conf.get("config", {}) if isinstance(conf, dict) else getattr(conf, "config", {})
-                report = diagnose_connection(getattr(service.instance, "qbc", None), config or {})
+                private = direct_service(service)
+                client = private.instance.qbc
+                try:
+                    # 仅初始化 Session 设置，不发送网络请求。
+                    client._session
+                    report = diagnose_connection(client, downloader_config(service))
+                    report["connection_mode"] = "plugin_direct"
+                    report["authenticated_read"] = authenticated_probe(service)
+                finally:
+                    session = getattr(client, "_http_session", None)
+                    if session is not None:
+                        session.close()
                 logger.info(f"[刷流诊断] 结果：{json.dumps(report, ensure_ascii=False)}")
                 logger.info("[刷流诊断] 完成；HTTP 401/403 表示网络可达但未认证。"
-                            "本次使用新建无认证会话，不代表宿主已有会话或添加种子成功。")
+                            "authenticated_read 为独立直连会话的认证查询结果，不代表添加种子成功。")
             except Exception as error:
                 logger.error(f"[刷流诊断] 检查失败：{error_summary(error)}")
             finally:
@@ -919,7 +952,7 @@ class FlowBrush(_PluginBase):
                         'props': {
                             'model': 'diagnostic_once',
                             'label': '仅诊断下载器一次',
-                            'hint': '保存后在插件日志查看“刷流诊断”；只检查连接，不添加或删除种子。原定时任务照常运行。',
+                            'hint': 'qB 默认独立直连，不继承系统代理。保存后在插件日志查看“刷流诊断”；仅连接和认证查询，不添加或删除种子。原定时任务照常运行。',
                             'persistent-hint': True,
                         }
                     },
@@ -2063,6 +2096,13 @@ class FlowBrush(_PluginBase):
                 self._scheduler = None
         except Exception as e:
             print(str(e))
+        finally:
+            # 释放插件持有的引用；正在执行的方法仍持有旧封装，完成后由客户端回收会话。
+            # 不关闭或重置 DownloaderHelper 中供其他插件使用的连接。
+            with self._direct_service_lock:
+                self._direct_service_cache = None
+                self._direct_service_source = None
+                self._direct_service_config = None
 
     # region Brush
 
@@ -3886,13 +3926,21 @@ class FlowBrush(_PluginBase):
 
     def __get_downloader_info(self) -> schemas.DownloaderInfo:
         """
-        获取下载器实时信息（所有下载器）
+        获取刷流下载器实时信息；qB 使用同一独立直连封装，避免退回宿主代理链路。
         """
         ret_info = schemas.DownloaderInfo()
 
         downloader = self.downloader
         if not downloader:
             return ret_info
+
+        if DownloaderHelper().is_downloader("qbittorrent", service=self.service_info):
+            info = downloader.transfer_info()
+            if not info:
+                return None
+            return schemas.DownloaderInfo(
+                download_speed=info.get("dl_info_speed", 0), upload_speed=info.get("up_info_speed", 0),
+                download_size=info.get("dl_info_data", 0), upload_size=info.get("up_info_data", 0))
 
         transfer_infos = self.chain.run_module("downloader_info")
         if transfer_infos:
