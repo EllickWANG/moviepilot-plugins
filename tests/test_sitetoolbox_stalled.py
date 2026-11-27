@@ -93,6 +93,27 @@ class StalledMonitorTest(unittest.TestCase):
         response = PLUGIN._api_cleanup_stalled_torrents({"delete_files": True, "confirmed": True})
         self.assertFalse(response.success)
 
+    def test_verified_override_requires_explicit_current_scope(self):
+        self.record(27)
+        for payload in ({"user_verified": True},
+                        {"user_verified": True, "verified_items": [{"hash": "a"}]},
+                        {"user_verified": True, "verified_items": [{"downloader": "qb", "hash": "unknown"}]},
+                        {"user_verified": True, "verified_items": [{"downloader": "other", "hash": "a"}]}):
+            with self.subTest(payload=payload):
+                self.assertFalse(PLUGIN._api_cleanup_stalled_torrents(payload).success)
+
+    def test_verified_override_only_cleans_selected_preview_and_preserves_global_threshold(self):
+        self.record(27)
+        self.plugin._latest_missing_preview["stalled_items"].append({"downloader": "qb", "hash": "unselected"})
+        with patch.object(self.plugin, "_start_background_job", side_effect=lambda key, name, fn: fn()), \
+                patch.object(PLUGIN, "_cleanup_missing_torrents_from_preview", return_value={"deleted_count": 1, "skipped_count": 0, "failed_count": 0}) as cleanup, \
+                patch.object(PLUGIN, "_build_missing_torrent_preview", return_value={"downloaders": ["qb"], "items": [], "stalled_items": [], "errors": []}):
+            PLUGIN._api_cleanup_stalled_torrents({"user_verified": True, "verified_items": [{"downloader": "qb", "hash": "a"}], "delete_files": True})
+            self.assertEqual([row["hash"] for row in cleanup.call_args.args[0]], ["a"])
+            self.assertEqual(cleanup.call_args.kwargs, {"kind": "stalled"})
+            self.assertEqual(self.plugin._rss_failure_days, 3)
+            self.assertTrue(self.plugin._latest_stalled_cleanup["user_verified"])
+
     def test_manual_endpoint_forces_record_only_cleanup(self):
         for day in (27, 28, 29):
             self.record(day)

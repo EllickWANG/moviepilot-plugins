@@ -41,7 +41,7 @@ class sitetoolbox(_PluginBase):
     plugin_name = "站点工具箱"
     plugin_desc = "站点诊断与维护工作台，统一监控计划及连续异常确认，支持 RSS、用户数据、缺失种子和馒头登录检查。"
     plugin_icon = "mdi-toolbox"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "Ellick"
     plugin_order = 40
     auth_level = 1
@@ -1781,15 +1781,34 @@ def _api_cleanup_stalled_torrents(payload: Optional[dict] = Body(default=None)) 
     plugin = sitetoolbox._instance
     if not plugin:
         return schemas.Response(success=False, message="插件未初始化")
-    names = _str_list((payload or {}).get("downloader_names")) or plugin._cleanup_downloader_names
-    items = [item for item in plugin._confirmed_stalled_items(plugin._latest_missing_preview)
-             if item.get("downloader") in names]
+    payload = payload or {}
+    names = _str_list(payload.get("downloader_names")) or plugin._cleanup_downloader_names
+    user_verified = payload.get("user_verified") is True
+    if user_verified:
+        # 人工确认只对明确列出的最近预览项生效，不降低全局阈值，也不接受任意 hash。
+        selected = payload.get("verified_items")
+        if not isinstance(selected, list) or not selected or len(selected) > 1000:
+            return schemas.Response(success=False, message="请提供本次已核实的任务清单")
+        if any(not isinstance(row, dict) or not isinstance(row.get("downloader"), str)
+               or not isinstance(row.get("hash"), str) or not row["hash"] for row in selected):
+            return schemas.Response(success=False, message="已核实任务清单格式错误")
+        keys = {(row["downloader"], row["hash"]) for row in selected}
+        available = {(row["downloader"], row["hash"]): row
+                     for row in plugin._latest_missing_preview.get("stalled_items", [])
+                     if row.get("downloader") in names}
+        if not keys.issubset(available):
+            return schemas.Response(success=False, message="任务清单与最新预览不一致，请重新扫描并核实")
+        items = [available[key] for key in sorted(keys)]
+    else:
+        items = [item for item in plugin._confirmed_stalled_items(plugin._latest_missing_preview)
+                 if item.get("downloader") in names]
     if not items:
         return schemas.Response(success=False, message="没有达到连续异常确认天数的长期未启动辅种")
 
     def worker() -> str:
         # 此接口不接收删除文件参数，未启动不代表磁盘上没有数据。
         result = _cleanup_missing_torrents_from_preview(items, kind="stalled")
+        result["user_verified"] = user_verified
         plugin._save_stalled_cleanup(result)
         plugin._save_missing_preview(_build_missing_torrent_preview(names))
         return (f"未启动辅种清理完成：删除 {result['deleted_count']} 个，"
