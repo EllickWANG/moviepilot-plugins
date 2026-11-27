@@ -53,6 +53,9 @@ class BrushConfig:
         self.maxdlspeed = self.__parse_number(config.get("maxdlspeed"))
         self.maxdlcount = self.__parse_number(config.get("maxdlcount"))
         self.site_cycle_cap = self.__parse_number(config.get("site_cycle_cap"))
+        self.site_download_cap = self.__parse_number(config.get("site_download_cap"))
+        self.min_peers = self.__parse_number(config.get("min_peers"))
+        self.demand_priority = config.get("demand_priority", False)
         self.include = config.get("include")
         self.exclude = config.get("exclude")
         self.size = config.get("size")
@@ -130,7 +133,7 @@ class BrushConfig:
             "site_skip_tips",
             "del_no_free",
             "rss_support",
-            "site_cycle_cap"
+            "site_cycle_cap", "site_download_cap", "min_peers", "demand_priority"
             # 当新增支持字段时，仅在此处添加字段名
         }
         try:
@@ -268,7 +271,7 @@ class FlowBrush(_PluginBase):
     # 插件图标
     plugin_icon = "mdi-brush"
     # 插件版本
-    plugin_version = "4.3.10"
+    plugin_version = "4.4.0"
     # 插件作者
     plugin_author = "Ellick"
     # 作者主页
@@ -1156,6 +1159,23 @@ class FlowBrush(_PluginBase):
                                                     {
                                                         'component': 'VTextField',
                                                         'props': {
+                                                            'model': 'site_download_cap',
+                                                            'label': '单站同时下载上限',
+                                                            'placeholder': '如：2；含等待任务，跨轮累计，已有任务保留'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    "cols": 12,
+                                                    "md": 3
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
                                                             'model': 'disksize',
                                                             'label': '保种体积（GB）',
                                                             'placeholder': '如：500，达到后停止新增任务'
@@ -1405,6 +1425,40 @@ class FlowBrush(_PluginBase):
                                                             'model': 'seeder',
                                                             'label': '做种人数',
                                                             'placeholder': '如：5 或 5-10'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    "cols": 12,
+                                                    "md": 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'min_peers',
+                                                            'label': '最少下载人数',
+                                                            'placeholder': '如：2；需求未知或不足时不下载'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    "cols": 12,
+                                                    "md": 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'demand_priority',
+                                                            'label': '优先有下载需求的种子',
+                                                            'hint': '按下载人数与做种人数之比优先选择'
                                                         }
                                                     }
                                                 ]
@@ -2188,6 +2242,18 @@ class FlowBrush(_PluginBase):
 
         # 根据rss_support配置决定使用browse还是rss方法获取种子
         brush_config = self.__get_brush_config(sitename=siteinfo.name)
+        site_download_cap = int(brush_config.site_download_cap or 0)
+        site_downloading = 0
+        if site_download_cap > 0:
+            site_downloading = self.__get_site_downloading_count(siteinfo.name, torrent_tasks)
+            if site_downloading is None:
+                logger.warning("读取单站下载配额失败，暂停本轮新增")
+                return False
+            if site_downloading >= site_download_cap:
+                logger.info(f"站点 {siteinfo.name} 同时下载 {site_downloading} 个，"
+                            f"达到单站上限 {site_download_cap}，切换下一站点")
+                return True
+
         if brush_config.rss_support:
             torrents = TorrentsChain().rss(domain=siteinfo.domain)
         else:
@@ -2206,8 +2272,9 @@ class FlowBrush(_PluginBase):
         if brush_config.except_subscribe:
             torrents = self.__filter_torrents_contains_subscribe(torrents=torrents, subscribe_titles=subscribe_titles)
 
-        # 按发布日期降序排列
-        torrents.sort(key=lambda x: x.pubdate or '', reverse=True)
+        # 可选按供需比排序，同分时优先新种；默认维持按发布时间排序
+        torrents.sort(key=self.__demand_sort_key if brush_config.demand_priority
+                      else lambda x: x.pubdate or '', reverse=True)
 
         torrents_size = self.__calculate_seeding_torrents_size(torrent_tasks=torrent_tasks)
 
@@ -2219,6 +2286,9 @@ class FlowBrush(_PluginBase):
 
         # 过滤种子
         for torrent in torrents:
+            if site_download_cap > 0 and site_downloading + site_added_count >= site_download_cap:
+                logger.info(f"站点 {siteinfo.name} 达到单站同时下载上限 {site_download_cap}，切换下一站点")
+                return True
             if site_cycle_cap and site_added_count >= site_cycle_cap:
                 logger.info(f"站点 {siteinfo.name} 本轮已新增 {site_added_count} 个刷流任务，"
                             f"达到单站每轮上限 {site_cycle_cap}，切换下一站点")
@@ -2452,6 +2522,9 @@ class FlowBrush(_PluginBase):
                 logger.warning(f"排除规则正则表达式错误: {brush_config.exclude}")
                 return False, "排除规则正则表达式错误"
 
+        if brush_config.min_peers and self.__demand_count(getattr(torrent, "peers", None)) < brush_config.min_peers:
+            return False, f"下载需求不足或未知，至少需要 {brush_config.min_peers} 个下载者"
+
         # 种子大小（GB）
         if brush_config.size:
             sizes = [float(size) * 1024 ** 3 for size in brush_config.size.split("-")]
@@ -2480,7 +2553,11 @@ class FlowBrush(_PluginBase):
         # e.g.2: 用户UTC，站点UTC+8，timezone_offset应为-8，种子在UTC 0:00/UTC+8 8:00发布：
         #        1:17 - 8:00 - (-8:00) = 1:17；1小时17分为正确的发布时间与当前的时间差
         # timezone_offset为后加功能，默认为0，方便后续更多与时间相关的功能开发，之前在单独站点配置中使用pubtime计算过时区偏移的用户也不受影响
-        pubdate_minutes = self.__get_pubminutes(torrent.pubdate) - brush_config.timezone_offset
+        pubdate_minutes = self.__get_pubminutes(torrent.pubdate)
+        if brush_config.pubtime and pubdate_minutes is None:
+            return False, "发布时间未知，无法确认种子新鲜度"
+        if pubdate_minutes is not None:
+            pubdate_minutes -= brush_config.timezone_offset
         # 已支持独立站点配置，取消单独适配站点时区逻辑，可通过配置项「pubtime」自行适配
         # pubdate_minutes = self.__adjust_site_pubminutes(pubdate_minutes, torrent)
         if brush_config.pubtime:
@@ -3239,6 +3316,8 @@ class FlowBrush(_PluginBase):
             "maxdlspeed": "总下载带宽",
             "maxdlcount": "同时下载任务数",
             "site_cycle_cap": "单站每轮新增上限",
+            "site_download_cap": "单站同时下载上限",
+            "min_peers": "最少下载人数",
             "seed_time": "做种时间",
             "hr_seed_time": "H&R做种时间",
             "seed_ratio": "分享率",
@@ -3307,6 +3386,9 @@ class FlowBrush(_PluginBase):
             "maxdlspeed": brush_config.maxdlspeed,
             "maxdlcount": brush_config.maxdlcount,
             "site_cycle_cap": brush_config.site_cycle_cap,
+            "site_download_cap": brush_config.site_download_cap,
+            "min_peers": brush_config.min_peers,
+            "demand_priority": brush_config.demand_priority,
             "include": brush_config.include,
             "exclude": brush_config.exclude,
             "size": brush_config.size,
@@ -3955,6 +4037,48 @@ class FlowBrush(_PluginBase):
 
         return ret_info
 
+    @staticmethod
+    def __demand_count(value) -> int:
+        # Site parsers normally return integers; do not treat missing/invalid data as demand.
+        try:
+            if isinstance(value, bool):
+                return 0
+            number = float(value)
+            return int(number) if number >= 0 and number.is_integer() else 0
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @classmethod
+    def __demand_sort_key(cls, torrent):
+        peers = cls.__demand_count(getattr(torrent, "peers", None))
+        seeds = cls.__demand_count(getattr(torrent, "seeders", None))
+        return peers / max(seeds, 1), peers, getattr(torrent, "pubdate", None) or ""
+
+    def __get_site_downloading_count(self, site_name: str, torrent_tasks: dict) -> Optional[int]:
+        try:
+            downloader = self.downloader
+            if not downloader:
+                return None
+            torrents = downloader.get_downloading_torrents(tags=self.__get_brush_config().brush_tag)
+            if torrents is None:
+                return None
+            count = 0
+            for torrent in torrents:
+                task = torrent_tasks.get(self.__get_hash(torrent), {})
+                owner = task.get("site_name")
+                if not owner:
+                    tags = torrent.get("tags", "") if isinstance(torrent, dict) else getattr(torrent, "labels", [])
+                    tags = tags.split(",") if isinstance(tags, str) else tags or []
+                    owners = {tag.strip()[3:] for tag in tags if isinstance(tag, str) and tag.strip().startswith("站点/")}
+                    owner = next(iter(owners)) if len(owners) == 1 else None
+                # Unattributed in-progress brush tasks reserve a slot at every site.
+                if not owner or owner == site_name:
+                    count += 1
+            return count
+        except Exception as err:
+            logger.warning(f"读取单站下载配额失败: {error_summary(err)}")
+            return None
+
     def __get_downloading_count(self) -> Optional[int]:
         """
         获取正在下载的任务数量
@@ -3976,20 +4100,20 @@ class FlowBrush(_PluginBase):
             return None
 
     @staticmethod
-    def __get_pubminutes(pubdate: str) -> float:
+    def __get_pubminutes(pubdate: str) -> Optional[float]:
         """
         将字符串转换为时间，并计算与当前时间差）（分钟）
         """
         try:
             if not pubdate:
-                return 0
+                return None
             pubdate = pubdate.replace("T", " ").replace("Z", "")
             pubdate = datetime.strptime(pubdate, "%Y-%m-%d %H:%M:%S")
             now = datetime.now()
             return (now - pubdate).total_seconds() // 60
         except Exception as e:
             logger.error(f"发布时间 {pubdate} 获取分钟失败，错误详情: {e}")
-            return 0
+            return None
 
     @staticmethod
     def __adjust_site_pubminutes(pub_minutes: float, torrent: TorrentInfo) -> float:
